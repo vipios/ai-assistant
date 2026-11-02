@@ -351,7 +351,7 @@ final class OpenAIClient {
     func summarize(_ compactSource: [ChatMessage], completion: @escaping (String?) -> Void) {
         guard !compactSource.isEmpty else { completion(nil); return }
         // 2026-11-02 通用接口：统一解析（完整端点原样用，纯主机补 /v1）
-        guard let url = URL(string: ModelConfig.resolveEndpoint(config.baseURL, apiProtocol: "OpenAI Chat Completions")) else { completion(nil); return }
+        guard let url = URL(string: ModelConfig.resolveEndpoint(config.effectiveBaseURL, apiProtocol: "OpenAI Chat Completions")) else { completion(nil); return }
         // v7.3.0-scalpel：摘要模板升级 9 节（对齐 Claude Code BASE_COMPACT_PROMPT——
         // 保留的不只是"说了什么"还有"为什么"：意图、概念、文件、错误、路径、原文、待办、进行中、下一步）
         let summarySystem = "You are a conversation compression engine. Below is an old conversation between an AI assistant and the user (user questions, assistant replies, tool calls and results). Compress it into a structured Markdown summary so the assistant can seamlessly continue in later turns. The input may BEGIN with a previously generated summary of this same conversation — if so, MERGE it with the new messages below into ONE updated summary (keep earlier context that is still relevant, integrate the new state; do not duplicate or drop it). MUST include these 9 sections:\n1. Request & intent: user's core request, success criteria, constraints;\n2. Key technical concepts: domain details, technical constraints, commitments;\n3. Files & code: changed/generated files or artifacts with paths, key code sections;\n4. Errors & fixes: resolved errors, failed approaches, important decisions;\n5. Approaches: problem-solving strategies tried or chosen;\n6. User messages VERBATIM: quote every user message exactly as written, in order;\n7. Pending tasks: todos, blockers, priorities;\n8. Work in progress: current state — what's done vs in-flight;\n9. Next step: the exact next action to take.\nOutput only the summary body — no pleasantries, no restating the original conversation."
@@ -495,8 +495,12 @@ final class OpenAIClient {
     /// v7.1.107：fallback 链单层执行——当前模型失败且可切换时递归到下一层。
     /// 安全闸：已产出内容（流式吐字）或用户取消的失败不切换（避免重复输出/打断用户）；
     /// 工具调用在失败时尚未执行，重发无副作用风险。
+    ///
+    /// 2026-11-03：新增 `baseRetried`——同一模型最多试两个接口地址（在家 / 在外）各一次，
+    /// 防止「主地址连通性差」时在两个地址之间来回打转。
     private func attemptSend(chain: [ModelConfig], index: Int,
                              messages: [ChatMessage], tools: [[String: Any]]? = nil,
+                             baseRetried: Bool = false,
                              onStatus: ((String) -> Void)? = nil, onDelta: ((String) -> Void)? = nil,
                              onThinking: ((String) -> Void)? = nil,
                              completion: @escaping (Result<ChatResult, Error>) -> Void) {
@@ -506,7 +510,9 @@ final class OpenAIClient {
             return
         }
         let cfg = chain[index]
-        let client = index == 0 ? self : OpenAIClient(cfg)
+        // 2026-11-03：重试（换备用接口）时必须重建 client —— index==0 时复用 self，
+        // 而 self 是拿旧地址构造的，不重建等于拿同一个连不上的地址再发一遍。
+        let client = (index == 0 && !baseRetried) ? self : OpenAIClient(cfg)
         var producedOutput = false
         let wrappedDelta: ((String) -> Void)?
         if let onDelta = onDelta {
@@ -523,6 +529,26 @@ final class OpenAIClient {
                 completion(.success(r))
             case .failure(let err):
                 let nsErr = err as NSError
+                // 2026-11-03：先试「同一模型的备用接口地址」，再退到下一个模型。
+                //
+                // 为什么不直接跳下一个模型：在家地址连不上（换了 WiFi、路由器改网段、
+                // 内网 IP 变了）是最常见的失败，换个模型用同一个连不上的地址毫无意义。
+                // 先把地址翻到备用（在外面用的那个）重发一次，往往直接就通了，
+                // 用户也不用察觉「切过模型」。
+                let canRetryOtherBase = !producedOutput
+                    && nsErr.code != -999
+                    && Self.isFallbackableError(nsErr)
+                    && !cfg.backupBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !baseRetried
+                if canRetryOtherBase {
+                    BaseURLRouter.shared.markFailed(base: cfg.effectiveBaseURL, config: cfg)
+                    NetworkLog.shared.log("\(cfg.name) 接口地址失败 (code \(nsErr.code)) → 切备用接口重试")
+                    onStatus?("⚠️ 当前接口连不上，切到备用接口重试…")
+                    self?.attemptSend(chain: chain, index: index, messages: messages, tools: tools,
+                                      baseRetried: true,
+                                      onStatus: onStatus, onDelta: onDelta, onThinking: onThinking, completion: completion)
+                    return
+                }
                 let canFallback = !producedOutput
                     && nsErr.code != -999
                     && Self.isFallbackableError(nsErr)
@@ -745,7 +771,7 @@ final class OpenAIClient {
 
         // 2026-11-02 通用接口：统一解析
         let endpoint = "/chat/completions"
-        guard let url = URL(string: ModelConfig.resolveEndpoint(config.baseURL, apiProtocol: "OpenAI Chat Completions")) else {
+        guard let url = URL(string: ModelConfig.resolveEndpoint(config.effectiveBaseURL, apiProtocol: "OpenAI Chat Completions")) else {
             completion(.failure(NSError(domain: "OpenAIClient", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid baseURL"])))
             return
         }
@@ -1280,7 +1306,7 @@ final class OpenAIClient {
     /// v2.9.48：加自动重试 (最多3次，指数退避 1s/2s）——网络错误/5xx/解析failed自动重试，不再需要手动点"继续"。
     private func performResponses(messages: [ChatMessage], tools: [[String: Any]]?, onStatus: ((String) -> Void)?, onThinking: ((String) -> Void)? = nil, completion: @escaping (Result<ChatResult, Error>) -> Void) {
         // 2026-11-02 通用接口：统一解析
-        guard let url = URL(string: ModelConfig.resolveEndpoint(config.baseURL, apiProtocol: "OpenAI Responses")) else {
+        guard let url = URL(string: ModelConfig.resolveEndpoint(config.effectiveBaseURL, apiProtocol: "OpenAI Responses")) else {
             completion(.failure(NSError(domain: "OpenAIClient", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid baseURL"])))
             return
         }
@@ -1678,7 +1704,7 @@ final class OpenAIClient {
                                onThinking: ((String) -> Void)? = nil,
                                completion: @escaping (Result<ChatResult, Error>) -> Void) {
         // 2026-11-02 通用接口：用户若已填完整 Gemini 端点（…:generateContent）→ 直接改写为流式版，不再拼
-        let rawBase = config.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawBase = config.effectiveBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let encModel = config.model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? config.model
         var urlStr: String
         if rawBase.lowercased().contains(":generatecontent") {
@@ -1935,7 +1961,7 @@ final class OpenAIClient {
     /// 返回 nil → BackgroundLLM 跳过 → 由 fix72 回前台自动重试兜底。
     func makeBackgroundRequest(messages: [ChatMessage], tools: [[String: Any]]?) -> URLRequest? {
         if config.apiProtocol == "OpenAI Responses" {
-            guard let url = URL(string: ModelConfig.resolveEndpoint(config.baseURL, apiProtocol: "OpenAI Responses")) else { return nil }
+            guard let url = URL(string: ModelConfig.resolveEndpoint(config.effectiveBaseURL, apiProtocol: "OpenAI Responses")) else { return nil }
             var request = URLRequest(url: url, timeoutInterval: 120)
             setHTTPMethod("POST", on: &request)
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1957,7 +1983,7 @@ final class OpenAIClient {
             return request
         }
         // OpenAI Chat（默认）——chat/completions 非流式（该路径无 stream 字段）
-        guard let url = URL(string: ModelConfig.resolveEndpoint(config.baseURL, apiProtocol: "OpenAI Chat Completions")) else { return nil }
+        guard let url = URL(string: ModelConfig.resolveEndpoint(config.effectiveBaseURL, apiProtocol: "OpenAI Chat Completions")) else { return nil }
         var request = URLRequest(url: url, timeoutInterval: 120)
         setHTTPMethod("POST", on: &request)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1975,7 +2001,7 @@ final class OpenAIClient {
 
     private func performAnthropic(messages: [ChatMessage], tools: [[String: Any]]? = nil, completion: @escaping (Result<ChatResult, Error>) -> Void) {
         // 2026-11-02 通用接口：统一解析（用户填完整 /messages 端点则原样用）
-        guard let url = URL(string: ModelConfig.resolveEndpoint(config.baseURL, apiProtocol: "Anthropic Messages")) else {
+        guard let url = URL(string: ModelConfig.resolveEndpoint(config.effectiveBaseURL, apiProtocol: "Anthropic Messages")) else {
             completion(.failure(NSError(domain: "OpenAIClient", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid baseURL"])))
             return
         }
@@ -2250,7 +2276,7 @@ final class OpenAIClient {
             return
         }
         // 2026-11-02 通用接口：统一解析
-        guard let url = URL(string: ModelConfig.resolveEndpoint(config.baseURL, apiProtocol: "OpenAI Responses")) else {
+        guard let url = URL(string: ModelConfig.resolveEndpoint(config.effectiveBaseURL, apiProtocol: "OpenAI Responses")) else {
             completion(.failure(NSError(domain: "OpenAIClient", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid baseURL"])))
             return
         }
