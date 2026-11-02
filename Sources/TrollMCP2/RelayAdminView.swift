@@ -127,8 +127,11 @@ struct RelayAdminView: View {
                     Button(L10n.t("i18n_1512")) { presentationMode.wrappedValue.dismiss() }
                         .font(.footnote)
                 }
-                if isUnlocked {
-                    ToolbarItemGroup(placement: .navigationBarTrailing) {
+                // 2026-11-02：iOS 15 的 ToolbarContentBuilder 不支持 `if`（报 buildIf is only
+                // available in iOS 16.0 or newer）。改为始终声明 ToolbarItemGroup，内部用
+                // ViewBuilder 的 if 控制（内容层支持条件，container 层不支持）。
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    if isUnlocked {
                         // 手动刷新（每次进入已自动刷新，这里给个显式入口）
                         Button(action: { reloadToken += 1 }) {
                             Image(systemName: "arrow.clockwise")
