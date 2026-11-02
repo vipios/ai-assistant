@@ -1,0 +1,4 @@
+module TrollRuntime {
+    header "wrapper.h"
+    export *
+}
