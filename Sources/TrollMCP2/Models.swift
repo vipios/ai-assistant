@@ -12,12 +12,30 @@ struct ModelConfig: Codable, Identifiable, Hashable {
     var provider: String          // openai / deepseek / anthropic / custom
     var apiProtocol: String       // OpenAI Chat Completions / OpenAI Responses / Anthropic / Custom
     var baseURL: String           // https://api.openai.com/v1
+    /// 2026-11-03：备用接口地址——「在外面」时自动改用它。
+    ///
+    /// 用户诉求原话：「第一个填写在家时候的接口，第二个填写在外面时候的接口，
+    /// 然后能自动判定咱们在家还是在外面，在家就用接口地址，在外就用备用接口地址」。
+    ///
+    /// 空串 = 未启用双通道（老配置全部是这个值，行为与改前完全一致）。
+    /// 判定逻辑见 BaseURLRouter：网段 → 后台探测 → 失败回切，三层。
+    var backupBaseURL: String = ""
     var apiKey: String
     var model: String             // gpt-4o-mini
     var authMethod: String        // Bearer / API Key / Body api_key / Body token / Query token / None
     var isDefault: Bool = false
     var temperature: Double = 0.2   // v6.1.5-14bj：执行任务型AI标准(参考Claude Agent SDK默认0/代码工具类0.1-0.3)，原0.7偏高输出飘
     var maxTokens: Int = 16384      // v6.1.5-14bj：Agent场景需大输出(BytePlus官方推荐≥128000, 手机端取16384平衡; 原2048会截断长任务)
+    /// 2026-11-03：**真正该用的接口地址**——双通道自动切换的落点。
+    ///
+    /// 所有「发请求 / 拼端点 / 拉模型列表」的地方都必须读这个，
+    /// 不能读 `baseURL`（那是配置里填的「在家地址」原值）。
+    ///
+    /// 没填备用地址时它就是 `baseURL`，行为与改前完全一致。
+    var effectiveBaseURL: String {
+        BaseURLRouter.shared.base(for: self)
+    }
+
     /// v7.1.107：备用模型组（fallback 链）——主模型请求失败（网络/超时/鉴权/熔断/5xx，
     /// 且未产出任何内容）时，OpenAIClient 自动按序切换到备用模型重发同一请求
     /// （对齐 OpenMinis ModelGroupRouter fallback 思想，自实现不搬码）。空数组=不启用。
@@ -93,7 +111,8 @@ struct ModelConfig: Codable, Identifiable, Hashable {
     }
 
     init(id: UUID = UUID(), name: String, provider: String, apiProtocol: String = "OpenAI Chat Completions",
-         baseURL: String, apiKey: String, model: String, authMethod: String = "Bearer",
+         baseURL: String, backupBaseURL: String = "", apiKey: String, model: String,
+         authMethod: String = "Bearer",
          isDefault: Bool = false, temperature: Double = 0.2, maxTokens: Int = 16384, compatLevel: Int = 0,
          contextTokens: Int = 128000, group: String = "default", paramAliases: [String: String] = [:],
          fallbackIDs: [UUID] = [], protocolAutoFixEnabled: Bool = true, compatMaxLevel: Int = 5,
@@ -103,6 +122,7 @@ struct ModelConfig: Codable, Identifiable, Hashable {
         self.provider = provider
         self.apiProtocol = apiProtocol
         self.baseURL = baseURL
+        self.backupBaseURL = backupBaseURL
         self.apiKey = apiKey
         self.model = model
         self.authMethod = authMethod
@@ -128,6 +148,8 @@ struct ModelConfig: Codable, Identifiable, Hashable {
         // v2.9.2：OpenAI Completions (旧版文本补全）已移除，旧配置迁移到 Chat Completions
         apiProtocol = decodedProtocol == "OpenAI Completions" ? "OpenAI Chat Completions" : decodedProtocol
         baseURL = try c.decode(String.self, forKey: .baseURL)
+        // 2026-11-03：旧配置没有这个键 → 默认空串（= 不启用双通道）
+        backupBaseURL = (try? c.decode(String.self, forKey: .backupBaseURL)) ?? ""
         apiKey = try c.decode(String.self, forKey: .apiKey)
         model = try c.decode(String.self, forKey: .model)
         let decodedAuthMethod = (try? c.decode(String.self, forKey: .authMethod)) ?? "Bearer"
@@ -799,7 +821,8 @@ final class ModelAPIClient {
 
     func fetchModelList(config: ModelConfig, completion: @escaping (ModelListResult) -> Void) {
         // 2026-11-02 通用接口：自动剥端点后缀 + 纯主机补 /v1，用户填什么形式都能拉列表
-        let urlStr = ModelConfig.modelsEndpoint(config.baseURL)
+        // 2026-11-03：改用 effectiveBaseURL —— 在家/在外自动选接口，测试连接和真实请求走同一条
+        let urlStr = ModelConfig.modelsEndpoint(config.effectiveBaseURL)
         guard let url = URL(string: urlStr) else {
             completion(.failure("Invalid Base URL"))
             return
@@ -828,8 +851,8 @@ final class ModelAPIClient {
     func testConnection(config: ModelConfig, completion: @escaping (Result<String, Error>) -> Void) {
         // 2026-11-02 通用接口：填完整端点则原样用；否则按协议拼接（纯主机自动补 /v1）
         // 协议以「端点能看出来的」为准——用户填 /responses 就按 Responses 发体
-        let proto = ModelConfig.impliedProtocol(from: config.baseURL) ?? config.apiProtocol
-        let urlStr = ModelConfig.resolveEndpoint(config.baseURL, apiProtocol: proto)
+        let proto = ModelConfig.impliedProtocol(from: config.effectiveBaseURL) ?? config.apiProtocol
+        let urlStr = ModelConfig.resolveEndpoint(config.effectiveBaseURL, apiProtocol: proto)
         guard let url = URL(string: urlStr) else {
             completion(.failure(NSError(domain: "ModelAPIClient", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid Base URL"])))
             return
@@ -891,8 +914,8 @@ final class ModelAPIClient {
                   timeout: TimeInterval = 90,
                   completion: @escaping (Result<String, Error>) -> Void) {
         // 2026-11-02 通用接口：与 testConnection 同一套端点解析
-        let proto = ModelConfig.impliedProtocol(from: config.baseURL) ?? config.apiProtocol
-        let urlStr = ModelConfig.resolveEndpoint(config.baseURL, apiProtocol: proto)
+        let proto = ModelConfig.impliedProtocol(from: config.effectiveBaseURL) ?? config.apiProtocol
+        let urlStr = ModelConfig.resolveEndpoint(config.effectiveBaseURL, apiProtocol: proto)
         guard let url = URL(string: urlStr) else {
             completion(.failure(NSError(domain: "ModelAPIClient", code: 0,
                                         userInfo: [NSLocalizedDescriptionKey: "Invalid Base URL"])))
