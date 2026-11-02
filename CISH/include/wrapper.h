@@ -1,0 +1,59 @@
+#ifndef CISH_WRAPPER_H
+#define CISH_WRAPPER_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/// 初始化 iSH 内核：挂载 fakefs rootfs、成为 init 进程、创建设备节点、挂载 /proc。
+/// @param data_path fakefs 的 data 目录绝对路径（Documents/alpine-rootfs/data）
+/// @return 0 成功，负数为 iSH 错误码
+int cish_boot(const char *data_path);
+
+/// 内核是否已 boot
+int cish_is_booted(void);
+
+/// v7.0.4: 自动启用 JIT（ptrace attach/detach 自己——TrollStore 环境内核放行 JIT，免手动/免闪切）。
+/// 成功返回 0；失败（EPERM 等）返回负值——Swift 侧 fallback 到 apple-magnifier URL。
+int troll_self_enable_jit(void);
+
+/// v7.0.4.3: JIT 有效性探测——mmap(MAP_JIT) 实测内核是否已放行可执行内存。
+/// 返回 1 = JIT 可用（无需 TrollStore URL，免闪切）；0 = 未放行（需 URL 兜底）。
+int troll_jit_probe(void);
+
+/// 把 iOS 真实目录 bind-mount 进 Alpine（fakefs_bind_mount 包装）。
+/// 挂载后 Alpine 通过 linux_path 直接读写 host_path（iOS 真实文件，双向直通）。
+/// @param linux_path Alpine 侧挂载点（如 "/ios_documents"）
+/// @param host_path  iOS 真实目录绝对路径（如 "/var/mobile/Documents"）
+/// @param read_only  1 = 只读（挂载点下拒绝写），0 = 可读写
+/// @return 0 成功，负数为错误码
+int cish_bind_mount(const char *linux_path, const char *host_path, int read_only);
+
+/// 卸载一个 bind mount
+int cish_bind_unmount(const char *linux_path);
+
+/// 启动一个 guest 进程（串行语义：同一时刻全局只有一个 notify 接收者）。
+/// @param path     guest 可执行文件（如 /bin/sh）
+/// @param argv_buf NUL 分隔的参数字符串、末尾双 NUL（含 argv[0]）
+/// @param envp_buf NUL 分隔的环境变量、末尾双 NUL；传 NULL 用内置默认环境
+/// @param argc     argv_buf 中参数个数
+/// @param stdin_fd guest stdin 对应的 host fd（-1 = /dev/null）
+/// @param out_fd   guest stdout 对应的 host fd（-1 = 忽略）
+/// @param err_fd   guest stderr 对应的 host fd（-1 = 忽略）
+/// @param notify_fd 退出通知管道写端（guest 退出时写 8 字节：int32 pid + int32 code）
+/// @return guest pid（>0 成功），负数为错误码
+long cish_spawn(const char *path, const char *argv_buf, const char *envp_buf,
+                int argc, int stdin_fd, int out_fd, int err_fd, int notify_fd);
+
+/// 向 guest 进程发信号
+int cish_kill(long pid, int sig);
+
+/// 向命令进程组统一发信号（匹配 pgid 或根 pid 的后代）。调用方先 SIGTERM 再 SIGKILL。
+int cish_killpg(long pid, int sig);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
