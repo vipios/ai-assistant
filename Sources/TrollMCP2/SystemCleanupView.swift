@@ -1,0 +1,486 @@
+import SwiftUI
+
+// v2.9.128：系统清理页（对齐 Fuck 工具箱系统清理界面）
+// 存储使用卡片 + 缓存占用分类 + 快速/高级清理 Tab + 10 项开关 + 一键清理
+
+// MARK: - 数据层
+
+struct SystemCleanupItem: Identifiable {
+    let id: String
+    let label: String
+    let detail: String
+    let paths: [String]     // 要清空的目录（root 权限）
+    let risk: Risk
+    var size: Int = 0
+    enum Risk { case safe, warn }
+}
+
+enum SystemCleanupEngine {
+    // MARK: 存储信息
+    static func storageInfo() -> [String: Any] {
+        let fm = FileManager.default
+        var total: Int64 = 0, free: Int64 = 0
+        if let attrs = try? fm.attributesOfFileSystem(forPath: NSHomeDirectory()) {
+            total = (attrs[.systemSize] as? NSNumber)?.int64Value ?? 0
+            free = (attrs[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
+        }
+        let used = max(0, total - free)
+        let percent = total > 0 ? Int(Double(used) / Double(total) * 100) : 0
+        let model = UIDevice.current.model
+        let name = UIDevice.current.name
+        let sys = UIDevice.current.systemName + " " + UIDevice.current.systemVersion
+        let troll = DeviceProbe.shared.lastReport?.trollStore ?? false
+        return [
+            "total": total, "free": free, "used": used,
+            "total_readable": AppCacheScanner.humanSize(Int(total)),
+            "free_readable": AppCacheScanner.humanSize(Int(free)),
+            "used_percent": percent,
+            "model": "\(name) · \(model)",
+            "system": sys,
+            "trollstore": troll
+        ]
+    }
+
+    /// 所有用户 App 数据容器路径
+    private static func allContainers() -> [String] {
+        AppCatalog.list().compactMap { AppCatalog.lookupContainer(bundleId: $0.bundleId) }
+    }
+
+    /// 扫描一个目录的"内容"大小（返回目录内文件总和）
+    static func dirSize(_ p: String) -> Int {
+        AppCacheScanner.directorySize(URL(fileURLWithPath: p))
+    }
+
+    /// 聚合扫描所有 App 容器的子目录大小
+    private static func aggregateAppDirs(_ sub: String) -> Int {
+        var total = 0
+        for c in allContainers() {
+            total += dirSize(c + "/" + sub)
+        }
+        return total
+    }
+
+    // MARK: 快速清理 10 项
+    static func quickItems() -> [SystemCleanupItem] {
+        var items: [SystemCleanupItem] = []
+        let appCache = aggregateAppDirs("Library/Caches") + aggregateAppDirs("tmp")
+        let appLogs = aggregateAppDirs("Library/Logs")
+        let snapshots = dirSize("/var/mobile/Library/SplashBoard/Snapshots")
+
+        items.append(SystemCleanupItem(id: "app_cache", label: L10n.t("i18n_574"),
+            detail: L10n.t("i18n_1132"), paths: [], risk: .safe, size: appCache))
+        items.append(SystemCleanupItem(id: "app_logs", label: L10n.t("i18n_575"),
+            detail: L10n.t("i18n_1133"), paths: [], risk: .safe, size: appLogs))
+        items.append(SystemCleanupItem(id: "sys_cache", label: L10n.t("i18n_576"),
+            detail: "/var/mobile/Library/Caches", paths: ["/var/mobile/Library/Caches"], risk: .safe,
+            size: dirSize("/var/mobile/Library/Caches")))
+        items.append(SystemCleanupItem(id: "sys_logs", label: L10n.t("i18n_577"),
+            detail: "/var/mobile/Library/Logs", paths: ["/var/mobile/Library/Logs"], risk: .safe,
+            size: dirSize("/var/mobile/Library/Logs")))
+        items.append(SystemCleanupItem(id: "sys_tmp", label: L10n.t("i18n_578"),
+            detail: "/tmp + /var/tmp", paths: ["/tmp", "/var/tmp"], risk: .safe,
+            size: dirSize("/tmp") + dirSize("/var/tmp")))
+        items.append(SystemCleanupItem(id: "photo_cache", label: L10n.t("i18n_579"),
+            detail: L10n.t("i18n_580"),
+            paths: ["/var/mobile/Media/PhotoData/Thumbnails", "/var/mobile/Media/DCIM/Apple/Thumbs"],
+            risk: .safe, size: dirSize("/var/mobile/Media/PhotoData/Thumbnails") + dirSize("/var/mobile/Media/DCIM/Apple/Thumbs")))
+        items.append(SystemCleanupItem(id: "downloads", label: L10n.t("i18n_621"),
+            detail: "/var/mobile/Media/Downloads", paths: ["/var/mobile/Media/Downloads"], risk: .warn,
+            size: dirSize("/var/mobile/Media/Downloads")))
+        items.append(SystemCleanupItem(id: "snapshots", label: L10n.t("i18n_582"),
+            detail: L10n.t("i18n_1134"), paths: ["/var/mobile/Library/SplashBoard/Snapshots"],
+            risk: .safe, size: snapshots))
+        items.append(SystemCleanupItem(id: "trash", label: L10n.t("i18n_583"),
+            detail: "/var/mobile/.Trash", paths: ["/var/mobile/.Trash"], risk: .warn,
+            size: dirSize("/var/mobile/.Trash")))
+        items.append(SystemCleanupItem(id: "ota", label: L10n.t("i18n_584"),
+            detail: L10n.t("i18n_585"),
+            paths: ["/var/mobile/Library/SoftwareUpdate", "/var/mobile/Library/Assets/com_apple_MobileAsset_SoftwareUpdate"],
+            risk: .warn, size: dirSize("/var/mobile/Library/SoftwareUpdate") + dirSize("/var/mobile/Library/Assets/com_apple_MobileAsset_SoftwareUpdate")))
+        return items
+    }
+
+    // MARK: 高级清理
+    static func advancedItems() -> [SystemCleanupItem] {
+        var items: [SystemCleanupItem] = []
+        let webkit = aggregateAppDirs("Library/WebKit")
+        let http = aggregateAppDirs("Library/HTTPStorages")
+        let safari = dirSize("/var/mobile/Library/Caches/com.apple.mobilesafari")
+
+        items.append(SystemCleanupItem(id: "webkit", label: L10n.t("i18n_1135"),
+            detail: L10n.t("i18n_1136"), paths: [], risk: .safe, size: webkit))
+        // v2.9.314：http_storage 已移除——清所有 App 的 Cookie/登录态太危险
+        // items.append(SystemCleanupItem(id: "http_storage", ...))
+        items.append(SystemCleanupItem(id: "safari", label: L10n.t("i18n_1137"),
+            detail: L10n.t("i18n_586"),
+            paths: ["/var/mobile/Library/Caches/com.apple.mobilesafari"], risk: .safe, size: safari))
+        return items
+    }
+
+    // MARK: 执行清理
+    /// 返回 (成功项, 释放字节, 失败明细)
+    static func execute(_ items: [SystemCleanupItem], selected: Set<String>) -> (Int, Int, [String]) {
+        var freed = 0
+        var failed: [String] = []
+        var ok = 0
+        let im = InjectionManager.shared
+        for item in items where selected.contains(item.id) {
+            var itemFreed = 0
+            var itemFailed = false
+            // 聚合类（App 容器子目录）单独处理
+            if item.id == "app_cache" || item.id == "app_logs" || item.id == "webkit" || item.id == "http_storage" {
+                var sub: String
+                switch item.id {
+                case "app_cache": sub = "Library/Caches"  // 再加 tmp
+                case "app_logs": sub = "Library/Logs"
+                case "webkit": sub = "Library/WebKit"
+                default: sub = "Library/HTTPStorages"
+                }
+                for c in allContainers() {
+                    let base = c + "/" + sub
+                    itemFreed += clearDirContents(base, im: im, &itemFailed)
+                    if item.id == "app_cache" {
+                        itemFreed += clearDirContents(c + "/tmp", im: im, &itemFailed)
+                    }
+                }
+            } else {
+                for p in item.paths {
+                    itemFreed += clearDirContents(p, im: im, &itemFailed)
+                }
+            }
+            if itemFailed { failed.append(item.label) } else { ok += 1 }
+            freed += itemFreed
+        }
+        return (ok, freed, failed)
+    }
+
+    private static func clearDirContents(_ path: String, im: InjectionManager, _ failed: inout Bool) -> Int {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else { return 0 }
+        let before = dirSize(path)
+        guard before > 0 else { return 0 }
+        // v2.9.313：只删目录里的内容，不删目录本身——
+        // 之前 rm -rf 整个目录再重建，会破坏 PhotoData/Caches 等系统目录的
+        // 权限和结构，导致照片缩略图丢失、App 权限异常。
+        // 改成遍历子项逐个删除，保留目录本身和权限。
+        let (c, _) = im.runAsRoot("bash", args: ["-c", "find '\(path)' -mindepth 1 -maxdepth 1 -exec rm -rf {} +"])
+        if c != 0 {
+            failed = true
+            return 0
+        }
+        return before
+    }
+}
+
+// MARK: - UI
+
+struct SystemCleanupView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var storage: [String: Any] = [:]
+    @State private var quickItems: [SystemCleanupItem] = []
+    @State private var advancedItems: [SystemCleanupItem] = []
+    @State private var selected = Set<String>()
+    @State private var scanning = false
+    @State private var running = false
+    @State private var toast: String?
+    @State private var mode: Mode = .quick
+
+    enum Mode { case quick, advanced }
+
+    private var allItems: [SystemCleanupItem] {
+        mode == .quick ? quickItems : advancedItems
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+
+            ScrollView {
+                VStack(spacing: 14) {
+                    storageCard
+                    categorySummary
+                    modePicker
+                    itemList
+                    cleanButton
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 20)
+            }
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle(L10n.t("ui_121"))
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarItems(leading: Button(L10n.t("ui_177")) {
+            dismiss()
+        })
+        .overlay(alignment: .bottom) { toastView }
+        .onAppear { if quickItems.isEmpty { startScan() } }
+    }
+
+    // MARK: 头部（大标题 + 右上快速清理）
+    private var header: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(LinearGradient(colors: [.tmCyan, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 46, height: 46)
+                Image(systemName: "externaldrive.fill.badge.timemachine")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(.white)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(L10n.t("ui_121"))
+                    .font(.title3).fontWeight(.bold)
+                Text(L10n.t("ui_19"))
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Spacer()
+            Button(action: { quickCleanAll() }) {
+                Text(L10n.t("ui_58"))
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 14).padding(.vertical, 7)
+                    .background(Color.tmCyan)
+                    .foregroundColor(.white)
+                    .clipShape(Capsule())
+            }
+            .disabled(running || quickItems.isEmpty)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    // MARK: 存储使用卡片
+    private var storageCard: some View {
+        HStack(spacing: 16) {
+            // 环形进度
+            ZStack {
+                Circle()
+                    .stroke(Color(.tertiarySystemFill), lineWidth: 7)
+                Circle()
+                    .trim(from: 0, to: CGFloat((storage["used_percent"] as? Int ?? 0)) / 100.0)
+                    .stroke(
+                        LinearGradient(colors: [.tmCyan, .blue], startPoint: .top, endPoint: .bottom),
+                        style: StrokeStyle(lineWidth: 7, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(-90))
+                VStack(spacing: 0) {
+                    Text("\(storage["used_percent"] as? Int ?? 0)%")
+                        .font(.system(size: 20, weight: .bold))
+                    Text(L10n.t("ui_54"))
+                        .font(.system(size: 10)).foregroundColor(.secondary)
+                }
+            }
+            .frame(width: 76, height: 76)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(storage["model"] as? String ?? "—")
+                    .font(.subheadline.weight(.semibold))
+                Text(L10n.t("i18n_587", storage["used_readable"] as? String ?? "—", storage["total_readable"] as? String ?? "—"))
+                    .font(.caption).foregroundColor(.secondary)
+                Text(storage["system"] as? String ?? "—")
+                    .font(.caption).foregroundColor(.secondary)
+                if storage["trollstore"] as? Bool == true {
+                    Text(L10n.t("ui_9"))
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 8).padding(.vertical, 2)
+                        .background(Color.tmCyan.opacity(0.14))
+                        .foregroundColor(.tmCyan)
+                        .clipShape(Capsule())
+                }
+            }
+            Spacer()
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(.secondarySystemGroupedBackground))
+        )
+    }
+
+    // MARK: 缓存占用汇总（6 类）
+    private var categorySummary: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(L10n.t("ui_124")).font(.subheadline.bold())
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                summaryCell(L10n.t("i18n_588"), quickItems.first(where: { $0.id == "sys_cache" })?.size ?? 0, "internaldrive")
+                summaryCell(L10n.t("i18n_589"), quickItems.first(where: { $0.id == "app_cache" })?.size ?? 0, "app.fill")
+                summaryCell(L10n.t("i18n_579"), quickItems.first(where: { $0.id == "photo_cache" })?.size ?? 0, "photo.fill")
+                summaryCell(L10n.t("i18n_635"), quickItems.first(where: { $0.id == "sys_tmp" })?.size ?? 0, "clock.fill")
+                summaryCell(L10n.t("i18n_591"), (quickItems.first(where: { $0.id == "sys_logs" })?.size ?? 0) + (quickItems.first(where: { $0.id == "app_logs" })?.size ?? 0), "doc.text.fill")
+                summaryCell(L10n.t("i18n_621"), quickItems.first(where: { $0.id == "downloads" })?.size ?? 0, "arrow.down.circle.fill")
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 16).fill(Color(.secondarySystemGroupedBackground)))
+    }
+
+    private func summaryCell(_ label: String, _ bytes: Int, _ icon: String) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 15)).foregroundColor(.tmCyan)
+            Text(AppCacheScanner.humanSize(bytes))
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(label).font(.system(size: 10)).foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(Color(.tertiarySystemGroupedBackground))
+        .cornerRadius(10)
+    }
+
+    // MARK: 快速/高级 Tab
+    private var modePicker: some View {
+        HStack(spacing: 0) {
+            ForEach([(Mode.quick, L10n.t("ui_58")), (Mode.advanced, L10n.t("i18n_592"))], id: \.0) { m, label in
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { mode = m }
+                } label: {
+                    Text(label)
+                        .font(.subheadline.weight(mode == m ? .semibold : .regular))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                        .background(mode == m ? Color.tmCyan : Color.clear)
+                        .foregroundColor(mode == m ? .white : .primary)
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+        }
+        .padding(3)
+        .background(Color(.secondarySystemGroupedBackground))
+        .clipShape(Capsule())
+    }
+
+    // MARK: 清理项开关列表
+    private var itemList: some View {
+        VStack(spacing: 8) {
+            ForEach(allItems) { item in
+                Button {
+                    toggle(item)
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: item.risk == .safe ? "checkmark.shield" : "exclamationmark.triangle")
+                            .font(.system(size: 16))
+                            .foregroundColor(item.risk == .safe ? .green : .orange)
+                            .frame(width: 24)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.label).font(.subheadline)
+                            Text(item.detail)
+                                .font(.caption2).foregroundColor(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                        Text(AppCacheScanner.humanSize(item.size))
+                            .font(.caption.weight(.medium))
+                            .foregroundColor(.secondary)
+                        Image(systemName: selected.contains(item.id) ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 22))
+                            .foregroundColor(selected.contains(item.id) ? .tmCyan : .secondary)
+                    }
+                    .padding(12)
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+        }
+    }
+
+    // MARK: 开始清理按钮
+    private var cleanButton: some View {
+        Button {
+            runClean()
+        } label: {
+            HStack {
+                Spacer()
+                if running {
+                    ProgressView().tint(.white)
+                } else {
+                    Label(L10n.t("i18n_593", selected.count), systemImage: "trash.fill")
+                }
+                Spacer()
+            }
+            .font(.headline)
+            .foregroundColor(.white)
+            .padding(.vertical, 13)
+            .background(selected.isEmpty ? Color.gray : Color.red)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+        }
+        .disabled(running || selected.isEmpty)
+    }
+
+    // MARK: 行为
+    private func toggle(_ item: SystemCleanupItem) {
+        if selected.contains(item.id) { selected.remove(item.id) }
+        else {
+            if item.risk == .warn {
+                toast = L10n.t("i18n_594", item.label)
+            }
+            selected.insert(item.id)
+        }
+    }
+
+    private func startScan() {
+        scanning = true
+        storage = SystemCleanupEngine.storageInfo()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let quick = SystemCleanupEngine.quickItems()
+            let adv = SystemCleanupEngine.advancedItems()
+            DispatchQueue.main.async {
+                quickItems = quick
+                advancedItems = adv
+                // 默认全选安全项
+                selected = Set(quick.filter { $0.risk == .safe }.map { $0.id })
+                scanning = false
+                toast = L10n.t("i18n_595", AppCacheScanner.humanSize((quick + adv).reduce(0) { $0 + $1.size }))
+            }
+        }
+    }
+
+    private func quickCleanAll() {
+        // 右上角快速清理：全选快速安全项直接执行
+        selected = Set(quickItems.filter { $0.risk == .safe }.map { $0.id })
+        runClean()
+    }
+
+    private func runClean() {
+        guard !selected.isEmpty else { return }
+        running = true
+        let items = quickItems + advancedItems
+        let sel = selected
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (ok, freed, failed) = SystemCleanupEngine.execute(items, selected: sel)
+            DispatchQueue.main.async {
+                running = false
+                toast = L10n.t("i18n_596", ok, AppCacheScanner.humanSize(freed)) + (failed.isEmpty ? "" : L10n.t("i18n_597", failed.joined(separator: "、")))
+                // 重新扫描 + 更新存储
+                storage = SystemCleanupEngine.storageInfo()
+                let quick = SystemCleanupEngine.quickItems()
+                let adv = SystemCleanupEngine.advancedItems()
+                quickItems = quick
+                advancedItems = adv
+                selected = Set(quick.filter { $0.risk == .safe }.map { $0.id })
+            }
+        }
+    }
+
+    private var toastView: some View {
+        Group {
+            if let toast = toast {
+                Text(toast)
+                    .font(.caption)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(Color(.systemGray5).opacity(0.95))
+                    .clipShape(Capsule())
+                    .padding(.bottom, 14)
+                    .transition(.opacity)
+                    .onAppear {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) {
+                            withAnimation { self.toast = nil }
+                        }
+                    }
+            }
+        }
+    }
+}
+

@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.trollagent.refresh</string>
+	</array>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>TrollAgent</string>
+	<key>CFBundleExecutable</key>
+	<string>TrollAgent</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon60x60</string>
+				<string>AppIcon1024x1024</string>
+			</array>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+		</dict>
+	</dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.trollagent.app</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>TrollAgent</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>7.1.286</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>dev.trollmcp2.app.deeplink</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>trollagent</string>
+				<string>apple-magnifier</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>491</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>weixin</string>
+		<string>snssdk1128</string>
+		<string>App-prefs</string>
+		<string>trollagent</string>
+		<string>apple-magnifier</string>
+		<string>trollstore</string>
+		<string>wechat</string>
+		<string>mqq</string>
+		<string>sinaweibo</string>
+		<string>taobao</string>
+		<string>openapp.jdmobile</string>
+		<string>imean</string>
+		<string>baidumap</string>
+		<string>amapuri</string>
+		<string>qqmusic</string>
+		<string>cloudmusic</string>
+		<string>douban</string>
+		<string>zhihu</string>
+		<string>bilibili</string>
+		<string>kwai</string>
+		<string>xiaohongshu</string>
+		<string>youku</string>
+		<string>iqiyi</string>
+		<string>alipay</string>
+		<string>tmall</string>
+		<string>dianping</string>
+		<string>meituan</string>
+		<string>eleme</string>
+		<string>jdpay</string>
+		<string>unionpay</string>
+		<string>youtube</string>
+		<string>whatsapp</string>
+		<string>telegram</string>
+		<string>twitter</string>
+		<string>instagram</string>
+	</array>
+	<key>MinimumOSVersion</key>
+	<string>14.0</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSAllowsArbitraryLoadsInWebContent</key>
+		<true/>
+	</dict>
+	<key>NSCalendarsUsageDescription</key>
+	<string>TrollAgent 需要访问日历以支持日历事件工具</string>
+	<key>NSCameraUsageDescription</key>
+	<string>TrollAgent 需要相机以支持扫码功能</string>
+	<key>NSContactsUsageDescription</key>
+	<string>TrollAgent 需要访问通讯录以支持联系人搜索工具</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>TrollAgent 需要访问局域网设备（N1 路由/手机/工作区），用于远程终端与文件传输。</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>TrollAgent 需要位置信息以支持定位工具</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>TrollAgent 需要麦克风权限用于按住说话（语音对话）。</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>TrollAgent 需要相册以选择待识别的图片</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>TrollAgent 需要访问提醒事项以创建提醒</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>TrollAgent 需要屏幕录制权限以支持 AI 控制 App 时的屏幕截图验证</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>TrollAgent 需要语音识别权限用于把说的话转成文字。</string>
+	<key>TSRootBinaries</key>
+	<array>
+		<string>bin/insert_dylib</string>
+		<string>bin/ldid</string>
+		<string>bin/cp</string>
+		<string>bin/cp-15</string>
+		<string>bin/mv</string>
+		<string>bin/mv-15</string>
+		<string>bin/rm</string>
+		<string>bin/chown</string>
+		<string>bin/mkdir</string>
+		<string>bin/ct_bypass</string>
+		<string>bin/install_name_tool</string>
+		<string>bin/optool</string>
+		<string>bin/opainject</string>
+		<string>bin/python3</string>
+		<string>bin/lua</string>
+		<string>bin/node</string>
+		<string>bin/r2</string>
+		<string>bin/cstool</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+		<string>processing</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UIRequiresFullScreen</key>
+	<true/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+</dict>
+</plist>

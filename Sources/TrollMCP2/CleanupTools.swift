@@ -1,0 +1,104 @@
+import Foundation
+import UIKit
+
+// v2.9.128：清理中心工具集 (对齐 Fuck 工具箱"清理类"能力 + AI 清理亮点）
+// 聚合已有能力：缓存清理 / keychain / 广告符 / 数据容器 / 标识符
+// 分层：scan (分析可清理项）→ execute (按项执行）→ ai (AI 全自动清理+验证报告）
+
+struct CleanupItem {
+    let id: String          // cache / keychain / adid / container / idfv
+    let label: String       // 显示名
+    let detail: String      // 说明
+    let bytes: Int          // 预估释放
+    let risk: Risk          // 影响分级
+    enum Risk: String { case safe, warn, danger, error }
+    let affected: String    // 影响描述 (登录态/广告符/数据）
+}
+
+/// 清理项扫描器 (内部复用现有工具实现）
+final class CleanupScanner {
+    static func scan(bundleId: String) -> [CleanupItem] {
+        var items: [CleanupItem] = []
+        guard let app = AppCatalog.find(bundleId), let container = AppCatalog.lookupContainer(bundleId: app.bundleId) else {
+            return []   // 调用方处理"未找到/容器不可访问"
+        }
+
+        // 1. 缓存 + tmp (安全）
+        let caches = URL(fileURLWithPath: container).appendingPathComponent("Library/Caches")
+        let tmp = URL(fileURLWithPath: container).appendingPathComponent("tmp")
+        let cacheBytes = AppCacheScanner.directorySize(caches) + AppCacheScanner.directorySize(tmp)
+        if cacheBytes > 0 {
+            items.append(CleanupItem(id: "cache", label: "clean caches and temp files",
+                                     detail: "Library/Caches + tmp (\(AppCacheScanner.humanSize(cacheBytes)))",
+                                     bytes: cacheBytes, risk: .safe, affected: "no impact, regenerated on next launch"))
+        } else {
+            items.append(CleanupItem(id: "cache", label: "clean caches and temp files",
+                                     detail: "No cache to clean (0 B)",
+                                     bytes: 0, risk: .safe, affected: "No effect"))
+        }
+
+        // 2. 钥匙串 (警告——清登录态）
+        items.append(CleanupItem(id: "keychain", label: "Clear keychain (login state/tokens)",
+                                 detail: "Delete this app's passwords/tokens/keys by keychain-access-groups",
+                                 bytes: 0, risk: .warn, affected: "Clears the app's login state, needs re-login"))
+
+        // 3. 广告标识符 (警告——IDFA）
+        items.append(CleanupItem(id: "adid", label: "Reset advertising identifier (IDFA)",
+                                 detail: "Tries to reset via a private API; on iOS 14+ only hints when restricted by the system",
+                                 bytes: 0, risk: .warn, affected: "Ad identifier changes, game user-acquisition/ad tracking may reset"))
+
+        // 4. 数据容器 (危险——整体重置，可恢复）
+        items.append(CleanupItem(id: "container", label: "Reset data container (reset app data, restorable)",
+                                 detail: "Rename container as backup → kill the process → system rebuilds an empty container; restorable from backup",
+                                 bytes: 0, risk: .danger, affected: "Wipes all local data (incl. unsynced saves); backup kept, restorable"))
+
+        // 5. 标识符 (只读提示）
+        let idfv = UIDevice.current.identifierForVendor?.uuidString ?? "N/A"
+        items.append(CleanupItem(id: "idfv", label: "Identifier (IDFV)",
+                                 detail: "System \(idfv.prefix(8))…; no public refresh API, decided by the system after deleting the app",
+                                 bytes: 0, risk: .safe, affected: "Read-only info, no action"))
+
+        return items
+    }
+
+    /// 按项执行 (复用现有工具，统一 AuditLog）
+    static func execute(bundleId: String, itemIds: [String], dryRun: Bool = false) -> [[String: Any]] {
+        var results: [[String: Any]] = []
+        for id in itemIds {
+            var r: [String: Any] = ["item": id]
+            switch id {
+            case "cache":
+                if let out = try? AppCacheClearTool().invoke(["bundle_id": bundleId, "dry_run": dryRun]) {
+                    r["ok"] = true; r["result"] = out
+                } else { r["ok"] = false; r["error"] = "cache cleanup failed" }
+            case "keychain":
+                if dryRun {
+                    r["ok"] = true; r["result"] = ["dry_run": true, "note": "will delete all keychain entries of this App"]
+                } else if let out = try? KeychainWipeTool().invoke(["bundle_id": bundleId]) {
+                    r["ok"] = true; r["result"] = out
+                } else { r["ok"] = false; r["error"] = "keychain cleanup failed" }
+            case "adid":
+                if dryRun {
+                    r["ok"] = true; r["result"] = ["dry_run": true, "note": "will try to refresh IDFA"]
+                } else if let out = try? AdvertisingTool().invoke(["action": "reset"]) {
+                    r["ok"] = true; r["result"] = out
+                } else { r["ok"] = false; r["error"] = "IDFA refresh failed" }
+            case "container":
+                if dryRun {
+                    r["ok"] = true; r["result"] = ["dry_run": true, "note": "will backup container and reset (restorable)"]
+                } else if let out = try? RefreshContainerTool().invoke(["bundle_id": bundleId, "restore": false]) {
+                    r["ok"] = true; r["result"] = out
+                } else { r["ok"] = false; r["error"] = "container reset failed" }
+            case "idfv":
+                r["ok"] = true; r["result"] = ["note": "IDFV has no public refresh API, skipped"]
+            default:
+                r["ok"] = false; r["error"] = "unknown cleanup item \(id)"
+            }
+            results.append(r)
+        }
+        return results
+    }
+}
+
+
+
