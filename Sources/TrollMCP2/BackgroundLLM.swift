@@ -69,7 +69,7 @@ final class BackgroundLLM: NSObject, URLSessionDownloadDelegate {
         lock.lock(); defer { lock.unlock() }
         guard !isHandoffInFlight,
               !sessionInvalidating,
-              allowsNonStreaming(baseURL: config.baseURL),
+              allowsNonStreaming(baseURL: config.effectiveBaseURL),
               let session = backgroundSession else { return false }
         // 请求构建复用 OpenAIClient（body/鉴权/参数别名同源）
         let client = OpenAIClient(config)
