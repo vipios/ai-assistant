@@ -26,8 +26,10 @@ struct MessageNavigator: View {
     @State private var highlightId: UUID?
 
     /// 用户发言列表（保持时间顺序）
+    /// 注意：`ChatMessage.role` 是 **String**（取值 "user"/"assistant"/"tool"），不是枚举，
+    /// 这里必须写 `== "user"`；写成 `.user` 会编译报 cannot convert 'String' to 'Morphology'。
     private var userMessages: [ChatMessage] {
-        messages.filter { !$0.isTool && $0.role == .user }
+        messages.filter { !$0.isTool && $0.role == "user" }
     }
 
     var body: some View {
