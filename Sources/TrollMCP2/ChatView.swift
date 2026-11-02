@@ -671,6 +671,19 @@ struct ChatView: View {
                 // （不再依赖 preference 的 onPreferenceChange——其到达顺序与更新时机在 iOS 16 不可靠）
                 // v7.4.0-fix73d：悬浮滚动按钮（对齐 Minis 显示矩阵：顶部只显 down、中间 up+down、底部全隐）
                 floatingButtons(proxy)
+                // 2026-11-02：右侧消息导航条——点竖条弹出「我说过的话」列表，点条目跳回当时对话
+                // 外层给满屏 frame 只为把竖条定位到右侧垂直居中；命中区域只由竖条自身
+                // 的 contentShape 决定，不会吃掉聊天区滑动/点击。
+                MessageNavigator(
+                    messages: store.currentMessages,
+                    onJump: { id in
+                        withAnimation(.easeInOut(duration: 0.28)) {
+                            proxy.scrollTo(id, anchor: .center)
+                        }
+                    }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                .allowsHitTesting(true)
             }
             .onChange(of: store.currentMessages.count) { _ in
                 // v7.4.0-fix73f-6：只在"已处于底部附近"时自动滚到底——否则用户在
