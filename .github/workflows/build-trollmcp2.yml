@@ -802,11 +802,10 @@ jobs:
     # 2026-11-02：默认不跑原生工具链——属「有就带上、没有也出包」的可选件，
     # 但 native-python 要编 120 分钟的 iOS Python 且占 macOS 并发（免费账号上限 5），
     # 挂在自动流程上会把 build 挤掉。需要时手动 Run workflow 勾 native=true。
-    if: vars.NATIVE_BUILD == 'true'
     # 2026-11-02：串行排队，避免超出 macOS 并发上限
     needs: native-wheels
-    # 上游 wheels 被 skip（python 失败）时也要跑，否则整条链断在这里
-    if: always()
+    # 需要原生工具时才跑；上游 wheels 被 skip 时也要继续，否则整条链断在这里
+    if: always() && vars.NATIVE_BUILD == 'true'
     timeout-minutes: 10
     continue-on-error: true
     steps:
@@ -837,11 +836,10 @@ jobs:
     # 2026-11-02：默认不跑原生工具链——属「有就带上、没有也出包」的可选件，
     # 但 native-python 要编 120 分钟的 iOS Python 且占 macOS 并发（免费账号上限 5），
     # 挂在自动流程上会把 build 挤掉。需要时手动 Run workflow 勾 native=true。
-    if: vars.NATIVE_BUILD == 'true'
     # 2026-11-02：串行排队，避免超出 macOS 并发上限
     needs: native-nmap
-    if: always()
-    # 2026-11-02：可选依赖——失败不该拖垮出包（macOS 并发上限 5，6 job 并行会被拒）
+    # 需要原生工具时才跑；且失败不该拖垮出包
+    if: always() && vars.NATIVE_BUILD == 'true'
     continue-on-error: true
     timeout-minutes: 90
     steps:
@@ -872,11 +870,10 @@ jobs:
     # 2026-11-02：默认不跑原生工具链——属「有就带上、没有也出包」的可选件，
     # 但 native-python 要编 120 分钟的 iOS Python 且占 macOS 并发（免费账号上限 5），
     # 挂在自动流程上会把 build 挤掉。需要时手动 Run workflow 勾 native=true。
-    if: vars.NATIVE_BUILD == 'true'
     # 2026-11-02：串行排队，避免超出 macOS 并发上限
     needs: native-llvm
-    if: always()
-    # 2026-11-02：可选依赖——失败不该拖垮出包（macOS 并发上限 5，6 job 并行会被拒）
+    # 需要原生工具时才跑；且失败不该拖垮出包
+    if: always() && vars.NATIVE_BUILD == 'true'
     continue-on-error: true
     timeout-minutes: 30
     steps:
