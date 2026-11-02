@@ -8,6 +8,11 @@ permissions:
 
 on:
   workflow_dispatch:
+    inputs:
+      native:
+        description: '同时构建原生工具链（nmap/llvm/node/python，很慢，通常不需要）'
+        required: false
+        default: 'false'
   push:
     branches: [main]
 
@@ -18,7 +23,11 @@ jobs:
     # 等它确保 python artifact 就位，build 才能真正集成（此前并行时 download 拿不到→python 被跳过）
     # v4.4.6-fix3u: needs native-nmap（continue-on-error job，失败不阻塞出包）
     # v4.4.8-fix3w: needs native-llvm（LLVM 单工具 + jtool2；下载 continue-on-error，失败不出这些工具但出包）
-    needs: [native-python, native-wheels, native-nmap, native-llvm, native-node]
+    # 2026-11-02：**解除对 native 链的依赖**。
+    # 原因：native-python 要编译 iOS Python，timeout 120 分钟，把它当前置会让每次出包
+    # 都干等两小时甚至直接失败（免费账号 macOS 并发只有 5）。而 build 里下载这些产物
+    # 本来就全带 continue-on-error（有就用、没有也出包），所以直接并行启动最稳。
+    # 需要原生工具时再手动单独跑那几个 job。
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -378,6 +387,12 @@ jobs:
   # （Python.framework + stdlib 打进 .app + ShellTool 路由 python3 → 原生 CLI）。
   native-python:
     runs-on: macos-latest
+    # 2026-11-02：默认不跑原生工具链——属「有就带上、没有也出包」的可选件，
+    # 但 native-python 要编 120 分钟的 iOS Python 且占 macOS 并发（免费账号上限 5），
+    # 挂在自动流程上会把 build 挤掉。需要时手动 Run workflow 勾 native=true。
+    if: github.event.inputs.native == 'true'
+    # 2026-11-02：可选依赖——失败不该拖垮出包（macOS 并发上限 5，6 job 并行会被拒）
+    continue-on-error: true
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -468,6 +483,8 @@ jobs:
   native-wheels:
     runs-on: macos-latest
     needs: native-python
+    # 2026-11-02：python 失败时这步没意义，但也不要显示成"调用失败"，直接 skip
+    if: always() && needs.native-python.result == 'success'
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -785,6 +802,14 @@ jobs:
   # 不再跑失败的源码编译; job 保留 continue-on-error 防意外。
   native-nmap:
     runs-on: macos-latest
+    # 2026-11-02：默认不跑原生工具链——属「有就带上、没有也出包」的可选件，
+    # 但 native-python 要编 120 分钟的 iOS Python 且占 macOS 并发（免费账号上限 5），
+    # 挂在自动流程上会把 build 挤掉。需要时手动 Run workflow 勾 native=true。
+    if: github.event.inputs.native == 'true'
+    # 2026-11-02：串行排队，避免超出 macOS 并发上限
+    needs: native-wheels
+    # 上游 wheels 被 skip（python 失败）时也要跑，否则整条链断在这里
+    if: always()
     timeout-minutes: 10
     continue-on-error: true
     steps:
@@ -812,6 +837,15 @@ jobs:
   # 只产 jtool2（newosxbook prebuilt universal binary，lipo 提 arm64 切片，Mach-O 解析专长 Alpine 无替代）。
   native-llvm:
     runs-on: macos-latest
+    # 2026-11-02：默认不跑原生工具链——属「有就带上、没有也出包」的可选件，
+    # 但 native-python 要编 120 分钟的 iOS Python 且占 macOS 并发（免费账号上限 5），
+    # 挂在自动流程上会把 build 挤掉。需要时手动 Run workflow 勾 native=true。
+    if: github.event.inputs.native == 'true'
+    # 2026-11-02：串行排队，避免超出 macOS 并发上限
+    needs: native-nmap
+    if: always()
+    # 2026-11-02：可选依赖——失败不该拖垮出包（macOS 并发上限 5，6 job 并行会被拒）
+    continue-on-error: true
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -838,6 +872,15 @@ jobs:
   #（AI 重 node 任务选择：构建/打包工具芯片直跑；轻量 JS 用统一环境 Alpine nodejs）。
   native-node:
     runs-on: macos-latest
+    # 2026-11-02：默认不跑原生工具链——属「有就带上、没有也出包」的可选件，
+    # 但 native-python 要编 120 分钟的 iOS Python 且占 macOS 并发（免费账号上限 5），
+    # 挂在自动流程上会把 build 挤掉。需要时手动 Run workflow 勾 native=true。
+    if: github.event.inputs.native == 'true'
+    # 2026-11-02：串行排队，避免超出 macOS 并发上限
+    needs: native-llvm
+    if: always()
+    # 2026-11-02：可选依赖——失败不该拖垮出包（macOS 并发上限 5，6 job 并行会被拒）
+    continue-on-error: true
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
