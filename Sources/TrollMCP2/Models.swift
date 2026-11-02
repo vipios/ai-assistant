@@ -1340,10 +1340,13 @@ final class ConversationStore: ObservableObject {
     /// 避免流式回调把内容写回已删除的消息。
     @discardableResult
     func withdrawMessage(id: UUID) -> String? {
-        // 撤回即意味着不想再要这一轮的回复——先停掉在途请求
-        if isLoading { cancelCurrent() }
-        guard let idx = activeConvIndex,
+        // ⚠️ 必须用 selectedIndex（用户当前看的会话），不能用 activeConvIndex——
+        // 后者指向"上次发起请求的会话"且 requestSessionId 不清空，用户切换会话后
+        // 它仍停在旧会话，拿它删消息会删错会话（而且是删到底，破坏性极大）。
+        guard let idx = selectedIndex,
               let ci = conversations[idx].messages.firstIndex(where: { $0.id == id }) else { return nil }
+        // 撤回即意味着不想再要这一轮的回复——先停掉在途请求
+        if isLoading && requestSessionId == conversations[idx].id { cancelCurrent() }
         let convId = conversations[idx].id
         let text = conversations[idx].messages[ci].content
         // 连同该条之后的所有消息一起删除（工具卡/助手回复/后续问答都属这一轮下游）
