@@ -495,6 +495,8 @@ struct ModelEditorView: View {
     @State private var provider: String
     @State private var apiProtocol: String
     @State private var baseURL: String
+    /// 2026-11-03：备用接口地址（在外面时用）——空 = 不启用双通道
+    @State private var backupBaseURL: String
     @State private var apiKey: String
     @State private var model: String
     @State private var authMethod: String
@@ -533,6 +535,7 @@ struct ModelEditorView: View {
         _provider = State(initialValue: config?.provider ?? (p?.provider ?? "custom"))
         _apiProtocol = State(initialValue: config?.apiProtocol ?? (p?.protocol ?? "OpenAI Chat Completions"))
         _baseURL = State(initialValue: config?.baseURL ?? (p?.baseURL ?? ""))
+        _backupBaseURL = State(initialValue: config?.backupBaseURL ?? "")
         _apiKey = State(initialValue: config?.apiKey ?? "")
         _model = State(initialValue: config?.model ?? (p?.model ?? ""))
         _authMethod = State(initialValue: config?.authMethod ?? (p?.auth ?? "Bearer"))
@@ -559,14 +562,41 @@ struct ModelEditorView: View {
 
                 // 2026-11-02 按用户要求重排：接口地址 → API Key（带测试连接）→ 模型名称（点击弹出选择）
                 Section(header: sectionHeader(L10n.t("i18n_1106"))) {
-                    editorRow("接口地址", text: $baseURL, placeholder: "http://192.168.1.88:8080")
+                    // 2026-11-03 用户要求：接口地址下面加一个「备用接口」。
+                    //   上面这条 = 在家用的接口；下面那条 = 在外面用的接口。
+                    //   在家/在外自动判定，不用手动切（判定见 BaseURLRouter）。
+                    editorRow("接口地址", text: $baseURL, placeholder: "在家用这个，如 http://192.168.1.88:8080")
+
+                    HStack {
+                        Text("备用接口")
+                            .foregroundColor(.primary)
+                        Spacer()
+                        TextField("选填 · 在外面时用这个", text: $backupBaseURL)
+                            .multilineTextAlignment(.trailing)
+                            .autocapitalization(.none)
+                            .disableAutocorrection(true)
+                    }
+
+                    // 当前实际在用哪一条 —— 让用户一眼看到自动判定的结果，
+                    // 免得「我填了备用怎么没生效」这种疑问。
+                    if !backupBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.caption2)
+                            Text(activeRouteNote)
+                                .font(.caption2)
+                                .lineLimit(2)
+                        }
+                        .foregroundColor(.secondary)
+                    }
 
                     // 2026-11-02 通用接口：实时回显最终请求地址，填什么形式都能用
-                    if !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    // 2026-11-03：回显的是**真正会用的那条**（自动判定后的），不是干巴巴的原值
+                    if !effectivePreviewEndpoint.isEmpty {
                         HStack(spacing: 4) {
                             Image(systemName: "arrow.turn.down.right")
                                 .font(.caption2)
-                            Text("实际请求：\(ModelConfig.resolveEndpoint(baseURL, apiProtocol: apiProtocol))")
+                            Text("实际请求：\(effectivePreviewEndpoint)")
                                 .font(.caption2)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
@@ -877,6 +907,43 @@ struct ModelEditorView: View {
             .foregroundColor(.secondary)
     }
 
+    /// 2026-11-03：当前「自动判定」会走哪一条接口——直接说人话，不用用户猜。
+    ///
+    /// 只看网段（同步、零成本），和真正发请求时的第一层判定完全一致，
+    /// 所以这里显示什么，手上这条消息大概率就走什么。
+    private var activeRouteNote: String {
+        let home = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !home.isEmpty else { return "备用接口已填，但主接口为空，会直接用备用接口" }
+        switch BaseURLRouter.shared.lanVerdict(homeBase: home) {
+        case .home:
+            return "当前判定：在家 → 用上面的接口地址"
+        case .away:
+            return "当前判定：在外面 → 用下面的备用接口"
+        case .unknown:
+            return "主接口不是内网地址，看不出在家还是在外 → 先试主接口，连不上自动换备用"
+        }
+    }
+
+    /// 「实际请求」那一行要显示的地址：自动判定后会用的那条，再解析成完整端点。
+    private var effectivePreviewEndpoint: String {
+        let picked = pickedBaseForPreview
+        guard !picked.isEmpty else { return "" }
+        return ModelConfig.resolveEndpoint(picked, apiProtocol: apiProtocol)
+    }
+
+    /// 按当前输入框内容推断会用哪一条（不写缓存、不影响真实判定）。
+    private var pickedBaseForPreview: String {
+        let home = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let away = backupBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !away.isEmpty else { return home }
+        guard !home.isEmpty else { return away }
+        switch BaseURLRouter.shared.lanVerdict(homeBase: home) {
+        case .home:    return home
+        case .away:    return away
+        case .unknown: return home
+        }
+    }
+
     // MARK: - 操作
 
     private func applyPreset(at index: Int) {
@@ -907,6 +974,7 @@ struct ModelEditorView: View {
             provider: provider,
             apiProtocol: apiProtocol,
             baseURL: baseURL,
+            backupBaseURL: backupBaseURL.trimmingCharacters(in: .whitespacesAndNewlines),
             apiKey: apiKey,
             model: model,
             authMethod: authMethod,
@@ -1027,7 +1095,8 @@ struct ModelEditorView: View {
     /// v7.1.95：轻量测试连接（GET {base}/models 测连通+延迟）——saveAndTest 与 speedTestOnly 共用
     private func speedTestCore(config: ModelConfig) {
         // 2026-11-02 通用接口：自动剥端点后缀 + 纯主机补 /v1（与主流程同一套解析）
-        guard let url = URL(string: ModelConfig.modelsEndpoint(config.baseURL)) else {
+        // 2026-11-03：用 effectiveBaseURL，「测试连接」测的就是真正会用的那条接口
+        guard let url = URL(string: ModelConfig.modelsEndpoint(config.effectiveBaseURL)) else {
             isTesting = false
             testStatus = L10n.t("i18n_1103")
             testColor = .red
