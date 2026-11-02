@@ -99,20 +99,25 @@ final class CopyableUITextView: UITextView {
     // MARK: - iOS 16+：往系统编辑菜单追加一项
 
     /// 正确签名（编译器提示 expected 'for:suggestedActions:' 得出）：
-    ///   `func editMenu(for textRange: UITextRange, suggestedActions: [UIMenuElement]) -> UIMenu`
-    /// 返回**非可选** UIMenu（旧代码按 `(for:in:) -> UIMenu?` 写，两处都错）：
-    ///   · 方法名参数标签错 → "method does not override any method from its superclass"
+    ///   `func editMenu(for textRange: UITextRange, suggestedActions: [UIMenuElement]) -> UIMenu?`
+    /// 三个易错点（都实际踩过）：
+    ///   · 方法名参数标签错（写成 for:in:）→ "method does not override any method from its superclass"
     ///   · 第二参类型错（CGRect vs [UIMenuElement]）→ 不能把 rect 传进来
+    ///   · super 的返回值是 **UIMenu?**，必须解包才能调 replacingChildren / children
     @available(iOS 16.0, *)
-    override func editMenu(for textRange: UITextRange, suggestedActions: [UIMenuElement]) -> UIMenu {
+    override func editMenu(for textRange: UITextRange, suggestedActions: [UIMenuElement]) -> UIMenu? {
         let base = super.editMenu(for: textRange, suggestedActions: suggestedActions)
         guard hasCustomItem, let handler = onCopyAll else { return base }
         let title = copyAllTitle
         let copyAll = UIAction(title: title, image: UIImage(systemName: "doc.on.doc")) { _ in
             handler()
         }
+        // 系统菜单为 nil（无可选内容）时，用 suggestedActions 兜底，仍能给出「复制全文」
+        guard let baseMenu = base else {
+            return UIMenu(children: suggestedActions + [copyAll])
+        }
         // 系统菜单项全部保留（拷贝/查询/翻译），只在末尾追加「复制全文」
-        return base.replacingChildren(base.children + [copyAll])
+        return baseMenu.replacingChildren(baseMenu.children + [copyAll])
     }
 
     // MARK: - iOS 15：旧菜单机制
