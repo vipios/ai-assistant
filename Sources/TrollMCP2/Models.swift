@@ -1334,6 +1334,27 @@ final class ConversationStore: ObservableObject {
         return true
     }
 
+    /// 2026-11-02：撤回某条用户消息——删除该条及其之后的全部消息，返回被撤回的原文（供回填输入框）。
+    /// 关键约束（用户明确要求）：撤回**不触发任何重新生成**，仅做删除 + 回填，
+    /// 必须等用户下一条指令才会再次请求模型。若撤回时仍有请求在跑，先 cancelCurrent() 强停，
+    /// 避免流式回调把内容写回已删除的消息。
+    @discardableResult
+    func withdrawMessage(id: UUID) -> String? {
+        // 撤回即意味着不想再要这一轮的回复——先停掉在途请求
+        if isLoading { cancelCurrent() }
+        guard let idx = activeConvIndex,
+              let ci = conversations[idx].messages.firstIndex(where: { $0.id == id }) else { return nil }
+        let convId = conversations[idx].id
+        let text = conversations[idx].messages[ci].content
+        // 连同该条之后的所有消息一起删除（工具卡/助手回复/后续问答都属这一轮下游）
+        conversations[idx].messages.removeSubrange(ci..<conversations[idx].messages.count)
+        conversations[idx].updatedAt = Date()
+        // 整会话重写落盘（removeSubrange 属中间修改，不能走尾部追加增量）
+        dirtySessions.insert(convId)
+        flush()
+        return text
+    }
+
     /// v3.1.70：删除活动请求会话内的消息 (无活动请求时用当前选中会话）
     func removeMessage(id: UUID) {
         guard let idx = activeConvIndex,

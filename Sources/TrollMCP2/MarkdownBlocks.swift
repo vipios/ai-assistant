@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// v7.1.109-minis：AI 正文 Markdown 块渲染（对齐 OpenMinis SelectableMarkdownView 能力子集——
 /// 用户要求"AI 能输出表格展示、命令行文本展示"）。
@@ -358,37 +359,51 @@ enum LinkExtractor {
 }
 
 /// 链接卡：点击开内置浏览器（对齐 Minis LinkPreviewView 的"点击 → 应用内打开"）
+/// 2026-11-02：右侧增加「一键复制链接」按钮——AI 回复里的链接以前只能点开、无法复制地址。
 struct LinkCardView: View {
     let url: URL
 
     var body: some View {
-        Button {
-            BrowserManager.shared.open(url.absoluteString)
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "link")
-                    .font(.system(size: 12))
-                    .foregroundColor(.blue)
-                Text(url.host ?? url.absoluteString)
-                    // v7.1.109-peers：链接卡字体 12→13pt（用户反馈链接文字较小）
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.blue)
-                    .lineLimit(1)
-                Text(url.absoluteString)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                Spacer()
-                Image(systemName: "arrow.up.right")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
+        HStack(spacing: 6) {
+            Button {
+                BrowserManager.shared.open(url.absoluteString)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "link")
+                        .font(.system(size: 12))
+                        .foregroundColor(.blue)
+                    Text(url.host ?? url.absoluteString)
+                        // v7.1.109-peers：链接卡字体 12→13pt（用户反馈链接文字较小）
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.blue)
+                        .lineLimit(1)
+                    Text(url.absoluteString)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(Color.blue.opacity(0.08))
-            .cornerRadius(8)
+            .buttonStyle(.plain)
+            // 一键复制链接地址
+            Button {
+                UIPasteboard.general.string = url.absoluteString
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Color.blue.opacity(0.08))
+        .cornerRadius(8)
     }
 }
 
@@ -399,6 +414,13 @@ struct MarkdownBlocksView: View {
     let coloredBody: (String) -> AttributedString
     /// v7.2.2：本条回复的联网搜索次数（assistant.toolCalls 里 web_search/web_fetch 计数）——"已联网搜索 N 次"
     var webSearchCount: Int = 0
+    /// 2026-11-02：正文 → NSAttributedString 构建器（ChatView 的 attributedBody，
+    /// 保留 **加粗** / `代码` 橙色；不能走 NSAttributedString(AttributedString) 桥接，那样会丢样式）
+    var nsBody: ((String) -> NSAttributedString)? = nil
+    /// 2026-11-02：长按菜单「复制全文」标题（空 = 不注入该菜单项）
+    var copyAllTitle: String = ""
+    /// 点「复制全文」回调（由 ChatView 写剪贴板）
+    var onCopyAll: (() -> Void)? = nil
     /// v7.2.2：资料折叠条展开态（"已参考 N 篇资料"点击展开来源列表）
     @State private var sourcesExpanded = false
 
@@ -462,9 +484,22 @@ struct MarkdownBlocksView: View {
                         // v7.1.109-peers：正文剥离来源行（[1]: URL），避免原文里露出一长串 URL；
                         // 来源 URL 也不重复渲染链接卡（Sources 卡统一呈现）
                         let cleanBody = CitationExtractor.stripSourceLines(t)
-                        Text(coloredBody(cleanBody))
-                            .font(.body)
-                            .textSelection(.enabled)
+                        // 2026-11-02：正文改用 UITextView（SelectableText）——长按系统菜单里
+                        // 多一项「复制全文」，同时保留拖手柄划词与「拷贝」部分文字。
+                        // 仍走 coloredBody 保持 **加粗** / `代码` 橙色高亮样式。
+                        if let nsBody = nsBody {
+                            SelectableText(
+                                attributed: nsBody(cleanBody),
+                                textColor: .label,
+                                fontSize: 17,
+                                copyAllTitle: copyAllTitle.isEmpty ? nil : copyAllTitle,
+                                onCopyAll: onCopyAll
+                            )
+                        } else {
+                            Text(coloredBody(cleanBody))
+                                .font(.body)
+                                .textSelection(.enabled)
+                        }
                         let links = LinkExtractor.extractLinks(from: cleanBody)
                         if !links.isEmpty {
                             ForEach(links, id: \.self) { LinkCardView(url: $0) }

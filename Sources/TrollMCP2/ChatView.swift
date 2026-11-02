@@ -42,6 +42,8 @@ struct ChatView: View {
     @State private var attachExpanded = false
     // 2026-11-02：中转站后台（附件栏入口）——呈现样式对齐「文件」选择器的 formSheet 卡片效果
     @State private var showRelayAdmin = false
+    // 2026-11-02：路由器控制（附件栏入口）——中转站重启 / 路由器重启
+    @State private var showRouterControl = false
 
     // v2.9.9：多模态图片（data URL）。选择相册图片后转 base64 暂存，发送时随消息传给模型
     @State private var pendingImages: [String] = []
@@ -350,6 +352,16 @@ struct ChatView: View {
                 RelayAdminView()
             }
         }
+        // 2026-11-02：路由器控制——中转站重启 / 路由器重启（各带确认取消）
+        .sheet(isPresented: $showRouterControl) {
+            if #available(iOS 16.0, *) {
+                RouterControlView()
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+            } else {
+                RouterControlView()
+            }
+        }
         // v6.1.5-14bm：/tools → 工具中心（三层工具总览，给用户看）
         .sheet(isPresented: $showToolCenter) {
             ToolCenterView()
@@ -587,6 +599,7 @@ struct ChatView: View {
                                     onToggleSelect: { toggleSelect(msg.id) },
                                     onCopy: { copyMessage(msg) },
                                     onShare: { shareMessage(msg) },
+                                    onWithdraw: { withdraw(msg) },
                                     onOpenSubAgent: { tid, fallback in
                                         subAgentDetailTaskID = tid
                                         subAgentDetailFallback = fallback
@@ -994,59 +1007,84 @@ struct ChatView: View {
     /// v3.3.4：+ 展开的快捷附件行（应用 / 相册 / 文件 / 浏览器），对齐微信式附件栏
     /// v3.4.2：从左屏幕边缘到右屏幕边缘均匀分布——四格等宽、间隙一致（含两侧边缘间隙）
     private var attachQuickRow: some View {
-        // 2026-11-02：新增「中转站」后共 5 个入口，改成每行 4 格的网格
-        // （保持原有 4 格等宽几何不变，第 5 个入口自然换到第二行，不会挤成一团）
-        LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4),
-            spacing: 14
-        ) {
-            attachQuickButton("apps.iphone", L10n.t("i18n_1046")) {
+        // 2026-11-02（用户要求「展示成一排」）：改成单行横向均分——6 个入口排一排不折行。
+        // 用 GeometryReader 按屏幕宽度算每格宽度，格子间距固定 8，两侧各留 12 边距，
+        // 这样 6 个图标在任意机型上都是等宽等距、整体居中，不会因为 flex 分配出现左右不匀。
+        GeometryReader { geo in
+            let count: CGFloat = 6
+            let sideInset: CGFloat = 12
+            let gap: CGFloat = 8
+            // 可用宽度扣掉两侧边距与 5 个间隙，再均分给 6 格
+            let tile = max(40, (geo.size.width - sideInset * 2 - gap * (count - 1)) / count)
+            HStack(spacing: gap) {
+            attachQuickButton("apps.iphone", L10n.t("i18n_1046"), tileWidth: tile) {
                 withAnimation { attachExpanded = false }
                 attachmentSheet = .appPicker
             }
-            attachQuickButton("photo.on.rectangle", L10n.t("i18n_1047")) {
+            attachQuickButton("photo.on.rectangle", L10n.t("i18n_1047"), tileWidth: tile) {
                 withAnimation { attachExpanded = false }
                 attachmentSheet = .photoPicker
             }
-            attachQuickButton("folder", L10n.t("i18n_1048")) {
+            attachQuickButton("folder", L10n.t("i18n_1048"), tileWidth: tile) {
                 withAnimation { attachExpanded = false }
                 // v3.3.4：快捷行直接弹 UIKit 文档选择器（无需半屏面板中转）
                 Self.presentDocumentPicker { urls in
                     handlePickedFiles(urls)
                 }
             }
-            attachQuickButton("globe", L10n.t("i18n_1049")) {
+            attachQuickButton("globe", L10n.t("i18n_1049"), tileWidth: tile) {
                 withAnimation { attachExpanded = false }
                 attachmentSheet = nil
                 FloatingBrowser.shared.show()
             }
-            // 2026-11-02：新增「中转站」入口——打开中转站后台（首次输一次密码，之后免密直达）
-            attachQuickButton("server.rack", L10n.t("i18n_1510")) {
+            // 2026-11-02（用户指定顺序）：浏览器之后依次是 中转站 → 路由器。
+            // 图标沿用本行原版规格（SF Symbols / 22pt / 蓝色 / 52×52 圆角瓦片），不另配色。
+            // 「中转站」：打开中转站后台（首次输一次密码，之后免密直达）
+            attachQuickButton("server.rack", L10n.t("i18n_1510"), tileWidth: tile) {
                 withAnimation { attachExpanded = false }
                 beginRelayAdmin()
             }
+            // 「路由器」：弹出中转站重启 / 路由器重启（各带确认框）
+            attachQuickButton("wifi.router", L10n.t("i18n_1535"), tileWidth: tile) {
+                withAnimation { attachExpanded = false }
+                beginRouterControl()
+            }
+            }
+            .frame(width: geo.size.width, alignment: .center)
         }
-        .padding(.horizontal, 12)
+        .frame(height: 78)
         // v3.4.8：附件行与输入框之间留出明显间隔（参考图）
         .padding(.top, 10)
         .padding(.bottom, 6)
         .frame(maxWidth: .infinity)
     }
 
-    private func attachQuickButton(_ icon: String, _ label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    /// v3.4.8：方形圆角瓦片（相机/图片/文件/浏览器 那一套样式）。
+    /// 2026-11-02：新增 tileWidth 参数——6 个入口排一排时，格子比原来 4 格窄，
+    /// 瓦片尺寸跟着收（图标与圆角按比例缩），保证「一排排得下、彼此间距一样」。
+    /// 不传时保持原版 52×52，4 格场景视觉完全不变。
+    private func attachQuickButton(_ icon: String, _ label: String,
+                                   tileWidth: CGFloat? = nil,
+                                   action: @escaping () -> Void) -> some View {
+        let w = tileWidth ?? 52
+        // 图标随瓦片等比缩：52 → 22pt，44 → 19pt
+        let iconSize = max(17, (w / 52) * 22)
+        let radius = max(10, (w / 52) * 14)
+        return Button(action: action) {
             VStack(spacing: 6) {
-                // v3.4.8：方形圆角瓦片（参考图：相机/图片/文件/打电话样式），不再是圆形
                 Image(systemName: icon)
-                    .font(.system(size: 22, weight: .medium))
+                    .font(.system(size: iconSize, weight: .medium))
                     .foregroundColor(.blue)
-                    .frame(width: 52, height: 52)
+                    .frame(width: w, height: w)
                     .background(Color.blue.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
                 Text(label)
-                    .font(.caption)
+                    .font(.system(size: 10))
                     .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
             }
+            .frame(width: w)
         }
         .buttonStyle(PlainButtonStyle())
     }
@@ -1246,6 +1284,13 @@ struct ChatView: View {
         }
     }
 
+    /// 2026-11-02：打开路由器控制面板（同样的 0.25s 延迟，避开附件栏收起动画）
+    private func beginRouterControl() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            showRouterControl = true
+        }
+    }
+
     /// 选择完成：复制到工作区 uploads/（asCopy 已复制进沙盒，这里再落到 uploads 统一管理 + 防重名）
     private func handlePickedFiles(_ urls: [URL]) {
         for u in urls {
@@ -1304,6 +1349,23 @@ struct ChatView: View {
                 self.showToast(msg)
             }
         }
+    }
+
+    /// 2026-11-02：撤回自己发的一条消息。
+    /// 行为（用户明确要求）：删除该条 + 它之后的所有对话，文字回填输入框；
+    /// **绝不自动重新请求模型**——必须等用户下一条指令才回复。
+    private func withdraw(_ m: ChatMessage) {
+        let text = store.withdrawMessage(id: m.id)
+        guard let text else { return }
+        // 回填输入框（若输入框已有草稿则拼在后面，不吞掉用户正在写的内容）
+        if inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            inputText = text
+        } else {
+            inputText = text + "\n" + inputText
+        }
+        // 撤回后不再朗读上一轮内容（避免"撤回了还在念"）
+        TTSService.shared.stop()
+        showToast(L10n.t("i18n_1533"))
     }
 
     private func shareMessage(_ m: ChatMessage) {
@@ -1514,6 +1576,7 @@ struct ChatView: View {
                             onToggleSelect: { toggleSelect(msg.id) },
                             onCopy: { copyMessage(msg) },
                             onShare: { shareMessage(msg) },
+                            onWithdraw: { withdraw(msg) },
                             onOpenSubAgent: { tid, fallback in
                                 subAgentDetailTaskID = tid
                                 subAgentDetailFallback = fallback
@@ -1952,6 +2015,8 @@ struct MessageBubble: View {
     var onToggleSelect: (() -> Void)? = nil
     var onCopy: (() -> Void)? = nil
     var onShare: (() -> Void)? = nil
+    /// 2026-11-02：撤回（仅用户消息）——删除本条及其后全部消息，文字回填输入框，不触发重新生成
+    var onWithdraw: (() -> Void)? = nil
     // fix73j：子代理完成卡点击回调（taskID + 消息内摘要 JSON fallback）
     var onOpenSubAgent: ((String, String?) -> Void)? = nil
     // v3.4.5：当前正在流式生成的 AI 消息 → 打字机逐字显示
@@ -2242,9 +2307,27 @@ struct MessageBubble: View {
         // 代码块黑底从 fence 出现即渲染并随打字增长、表格在分隔行打全后渲染完整行；
         // 未闭合的 fence/表格自动回退纯文本。用户消息保持纯文本。
         if isUser {
-            Text(AttributedString(shown))
-                .font(.body)
-                .textSelection(.enabled)
+            // 2026-11-02：用户消息也换成 UITextView（SelectableText）——长按系统菜单里多一项
+            // 「复制全文」，同时保留拖手柄划词。打字机阶段仍用轻量 Text 避免高频刷新闪跳。
+            if isStreaming || (forceType && !Self.doneTyping(for: message.id)) {
+                Text(AttributedString(shown))
+                    .font(.body)
+                    .textSelection(.enabled)
+            } else {
+                SelectableText(
+                    attributed: NSAttributedString(
+                        string: shown,
+                        attributes: [
+                            .font: UIFont.systemFont(ofSize: 17),
+                            .foregroundColor: UIColor.white
+                        ]
+                    ),
+                    textColor: .white,
+                    fontSize: 17,
+                    copyAllTitle: L10n.t("i18n_1530"),
+                    onCopyAll: { onCopy?() }
+                )
+            }
         } else {
             // v7.2.3-fix18：正文 block 化——文本/工具强隔离（对齐 OpenMinis block 模型）。
             // 模型误输出 DSML/antml 文本调用时，剥出工具段渲染为内联胶囊，
@@ -2256,6 +2339,9 @@ struct MessageBubble: View {
                         MarkdownBlocksView(
                             text: block.text,
                             coloredBody: { self.coloredBody($0) },
+                            nsBody: { self.attributedBody($0) },
+                            copyAllTitle: L10n.t("i18n_1530"),
+                            onCopyAll: { onCopy?() },
                             // v7.2.2：联网计数——本条 assistant 消息的 toolCalls 里 web_search/web_fetch 次数
                             // v7.2.3-fix：shell_exec 里的 curl 拉取也算联网
                             webSearchCount: (message.toolCalls ?? []).filter {
@@ -2723,6 +2809,18 @@ struct MessageBubble: View {
         return ms
     }
 
+    /// 2026-11-02：气泡下方小图标按钮（统一尺寸/命中域，保证朗读·复制·撤回视觉对齐）
+    private func bubbleAction(icon: String, tint: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundColor(tint)
+                .frame(width: 30, height: 30)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
     private var textBubble: some View {
         VStack(alignment: isUser ? .trailing : .leading, spacing: 2) {
             // v2.9.10：消息内图片缩略图（用户选择相册图片后，气泡里直接显示图片）
@@ -2786,26 +2884,39 @@ struct MessageBubble: View {
                     // v4.4.18：朗读喇叭按钮（assistant 消息）——点一下朗读这条全文；长按仍保留选字复制
                     // v7.1.40：正在播这条时再点 = 停止（关闭声音）
                     // v7.1.43：与顶部全局开关解耦——顶部管自动朗读，气泡管手动点读（点读/再点停），互不影响
-                    if !isUser && !message.isTool {
-                        HStack(spacing: 6) {
-                            let isSpeakingThis = TTSService.shared.speakingId == message.id.uuidString
-                            Button(action: {
-                                if isSpeakingThis {
-                                    TTSService.shared.stop()
-                                } else {
-                                    TTSService.shared.speakForced(id: message.id.uuidString, message.content)
+                    // 2026-11-02：气泡下方常驻操作条（用户要求"气泡下方常驻小图标"）——
+                    // assistant：朗读 / 复制；user：复制 / 撤回。长按选字仍走 SelectableText 系统菜单，
+                    // 两者互不抢占（本行只在气泡外部下方，不在文字层上）。
+                    if !message.isTool {
+                        HStack(spacing: 16) {
+                            if isUser {
+                                bubbleAction(icon: "doc.on.doc", tint: .secondary) {
+                                    onCopy?()
                                 }
-                            }) {
-                                Image(systemName: isSpeakingThis ? "speaker.wave.2.fill" : "speaker.wave.2")
-                                    .font(.system(size: 18, weight: .medium))
-                                    .foregroundColor(isSpeakingThis ? .tmCyan : .secondary)
-                                    .padding(.vertical, 6)
-                                    .contentShape(Rectangle())
+                                bubbleAction(icon: "arrow.uturn.backward", tint: .secondary) {
+                                    onWithdraw?()
+                                }
+                                Spacer(minLength: 0)
+                            } else {
+                                let isSpeakingThis = TTSService.shared.speakingId == message.id.uuidString
+                                bubbleAction(
+                                    icon: isSpeakingThis ? "speaker.wave.2.fill" : "speaker.wave.2",
+                                    tint: isSpeakingThis ? .tmCyan : .secondary
+                                ) {
+                                    if isSpeakingThis {
+                                        TTSService.shared.stop()
+                                    } else {
+                                        TTSService.shared.speakForced(id: message.id.uuidString, message.content)
+                                    }
+                                }
+                                bubbleAction(icon: "doc.on.doc", tint: .secondary) {
+                                    onCopy?()
+                                }
+                                Spacer(minLength: 0)
                             }
-                            .buttonStyle(.plain)
-                            Spacer()
                         }
-                        .padding(.horizontal, 10)
+                        .padding(.horizontal, 4)
+                        .padding(.top, 2)
                         .padding(.bottom, 4)
                     }
                 }
