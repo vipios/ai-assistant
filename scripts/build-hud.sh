@@ -8,6 +8,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# 2026-11-02：缓存命中就直接跳过。
+# 为什么需要这段：CI 上把 hud-stage 做了 actions/cache，缓存恢复时 libHUD.a 已经在，
+# 但脚本原来会无条件重编一遍（40 秒白费）。这里对齐 build-openssl.sh 的写法。
+# 强制重编：删掉 hud-stage/lib/libHUD.a 再跑，或改 HUD/ 下任意源文件（CI key 会变）。
+if [ "${FORCE_HUD_REBUILD:-0}" != "1" ] && [ -f "hud-stage/lib/libHUD.a" ]; then
+    echo ">>> HUD cache hit, skip ($(du -h hud-stage/lib/libHUD.a | cut -f1))"
+    exit 0
+fi
+
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 echo ">>> HUD: compiling libHUD.a (sdk=$SDK)"
 
