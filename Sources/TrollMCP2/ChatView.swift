@@ -2352,16 +2352,18 @@ struct MessageBubble: View {
                         MarkdownBlocksView(
                             text: block.text,
                             coloredBody: { self.coloredBody($0) },
-                            nsBody: { self.attributedBody($0) },
-                            copyAllTitle: L10n.t("i18n_1530"),
-                            onCopyAll: { onCopy?() },
                             // v7.2.2：联网计数——本条 assistant 消息的 toolCalls 里 web_search/web_fetch 次数
                             // v7.2.3-fix：shell_exec 里的 curl 拉取也算联网
+                            // 2026-11-02：必须放在 nsBody 之前——结构体成员顺序即参数顺序，否则编译报
+                            // "argument 'webSearchCount' must precede argument 'nsBody'"
                             webSearchCount: (message.toolCalls ?? []).filter {
                                 $0.name.contains("web_search") || $0.name.contains("web.search")
                                     || $0.name.contains("web_fetch") || $0.name.contains("web.fetch")
                                     || Self.toolCallIsCurlFetch($0)
-                            }.count
+                            }.count,
+                            nsBody: { self.attributedBody($0) },
+                            copyAllTitle: L10n.t("i18n_1530"),
+                            onCopyAll: { onCopy?() }
                         )
                             // v7.2.2：引用角标 [N] 可点击 → 来源卡浮层（拦截 minis://source?n= 链接）
                             .environment(\.openURL, OpenURLAction { url in
