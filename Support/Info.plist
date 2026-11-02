@@ -9,7 +9,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>zh_CN</string>
 	<key>CFBundleDisplayName</key>
-	<string>TrollAgent</string>
+	<string>ai全能助手</string>
 	<key>CFBundleExecutable</key>
 	<string>TrollAgent</string>
 	<key>CFBundleIcons</key>
@@ -30,11 +30,11 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>TrollAgent</string>
+	<string>ai全能助手</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>7.1.286</string>
+	<string>1.0.0</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -48,7 +48,7 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>491</string>
+	<string>1</string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>weixin</string>
@@ -97,25 +97,25 @@
 		<true/>
 	</dict>
 	<key>NSCalendarsUsageDescription</key>
-	<string>TrollAgent 需要访问日历以支持日历事件工具</string>
+	<string>全能AI助手 需要访问日历以支持日历事件工具</string>
 	<key>NSCameraUsageDescription</key>
-	<string>TrollAgent 需要相机以支持扫码功能</string>
+	<string>全能AI助手 需要相机以支持扫码功能</string>
 	<key>NSContactsUsageDescription</key>
-	<string>TrollAgent 需要访问通讯录以支持联系人搜索工具</string>
+	<string>全能AI助手 需要访问通讯录以支持联系人搜索工具</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>TrollAgent 需要访问局域网设备（N1 路由/手机/工作区），用于远程终端与文件传输。</string>
+	<string>全能AI助手 需要访问局域网设备（N1 路由/手机/工作区），用于远程终端与文件传输。</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>TrollAgent 需要位置信息以支持定位工具</string>
+	<string>全能AI助手 需要位置信息以支持定位工具</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>TrollAgent 需要麦克风权限用于按住说话（语音对话）。</string>
+	<string>全能AI助手 需要麦克风权限用于按住说话（语音对话）。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>TrollAgent 需要相册以选择待识别的图片</string>
+	<string>全能AI助手 需要相册以选择待识别的图片</string>
 	<key>NSRemindersUsageDescription</key>
-	<string>TrollAgent 需要访问提醒事项以创建提醒</string>
+	<string>全能AI助手 需要访问提醒事项以创建提醒</string>
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>TrollAgent 需要屏幕录制权限以支持 AI 控制 App 时的屏幕截图验证</string>
+	<string>全能AI助手 需要屏幕录制权限以支持 AI 控制 App 时的屏幕截图验证</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>TrollAgent 需要语音识别权限用于把说的话转成文字。</string>
+	<string>全能AI助手 需要语音识别权限用于把说的话转成文字。</string>
 	<key>TSRootBinaries</key>
 	<array>
 		<string>bin/insert_dylib</string>

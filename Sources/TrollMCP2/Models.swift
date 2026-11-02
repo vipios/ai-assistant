@@ -358,7 +358,7 @@ extension ModelConfig {
         ("OpenAI", "openai", "OpenAI Chat Completions", "https://api.openai.com/v1", "gpt-4o-mini", "Bearer"),
         ("DeepSeek", "deepseek", "OpenAI Chat Completions", "https://api.deepseek.com", "deepseek-chat", "Bearer"),
         ("Anthropic", "anthropic", "Anthropic Messages", "https://api.anthropic.com/v1", "claude-3-5-sonnet-20240620", "API Key"),
-        ("Botcf", "custom", "OpenAI Responses", "https://botcf.com/v1", "gpt-5.6-terra", "Bearer"),
+        // 2026-11-02 按用户要求：移除 Botcf 预设项（作者自用中转站，与推荐横幅一并删除）
         // v4.4.17：扩充主流 OpenAI 兼容预设 (GLM/Kimi/Qwen/MiniMax/阶跃/豆包)。模型名可在模型管理页改。
         ("智谱GLM", "zhipu", "OpenAI Chat Completions", "https://open.bigmodel.cn/api/paas/v4", "glm-4.5", "Bearer"),
         ("Kimi(Moonshot)", "moonshot", "OpenAI Chat Completions", "https://api.moonshot.cn/v1", "kimi-k3", "Bearer"),
@@ -381,6 +381,8 @@ extension ModelConfig {
     /// 用户已填 v1/含版本路径(如 /api/paas/v4、/compatible-mode/v1) 则不重复补。
     /// Anthropic(/anthropic) 与自定义端点不自动补。
     static func normalizeBaseURL(_ base: String) -> String {
+        // 2026-11-02 通用接口：用户已填完整端点（…/chat/completions 等）→ 一律不动
+        if hasExplicitEndpoint(base) { return base }
         let trimmed = base.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: trimmed) else { return base }
         let path = url.path
@@ -389,6 +391,93 @@ extension ModelConfig {
             return trimmed + "/v1"
         }
         return base
+    }
+
+    // MARK: - 2026-11-02 通用接口解析（不强制 /v1 结尾，也允许直接填完整端点）
+
+    /// 已知的协议端点后缀。用户 baseURL 以这些结尾时视为「完整端点」，原样使用不再拼接。
+    static let knownEndpointSuffixes = ["/chat/completions", "/completions", "/responses", "/messages"]
+
+    /// 归一化用于判定的字符串：去空白、去末尾斜杠、转小写。
+    /// 用户手打时经常多一个尾部 "/"（…/chat/completions/），不处理会被判成「非完整端点」
+    /// 再被二次拼接成 …/chat/completions/chat/completions。
+    private static func endpointKey(_ base: String) -> String {
+        base.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            .lowercased()
+    }
+
+    /// baseURL 是否已是完整端点（决定了「拼接」还是「原样用」）
+    static func hasExplicitEndpoint(_ base: String) -> Bool {
+        let key = endpointKey(base)
+        guard !key.isEmpty else { return false }
+        if knownEndpointSuffixes.contains(where: { key.hasSuffix($0) }) { return true }
+        if key.contains(":generatecontent") { return true }        // Gemini 原生
+        return false
+    }
+
+    /// 从完整端点反推协议——用户既然填了 /responses，就按 Responses 发，不再按下拉框猜。
+    /// 返回 nil 表示「看不出来」，尊重用户当前选择。
+    static func impliedProtocol(from base: String) -> String? {
+        let key = endpointKey(base)
+        guard hasExplicitEndpoint(key) else { return nil }
+        if key.hasSuffix("/chat/completions") || key.hasSuffix("/completions") { return "OpenAI Chat Completions" }
+        if key.hasSuffix("/responses") { return "OpenAI Responses" }
+        if key.hasSuffix("/messages") { return "Anthropic Messages" }
+        if key.contains(":generatecontent") { return "Gemini" }
+        return nil
+    }
+
+    /// 剥掉端点后缀，得到「接口基址」——用于拼 /models、或在协议变更后重拼端点。
+    static func endpointBase(_ base: String) -> String {
+        var s = base.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !s.isEmpty else { return s }
+        let low = s.lowercased()
+        for suf in knownEndpointSuffixes where low.hasSuffix(suf) {
+            s = String(s.dropLast(suf.count))
+            break
+        }
+        // Gemini 原生：…/v1beta/models/gemini-2.5-pro:generateContent → …/v1beta
+        if s.lowercased().contains(":generatecontent"),
+           let r = s.range(of: "/models/", options: .backwards) {
+            s = String(s[..<r.lowerBound])
+        }
+        return s.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    /// 解析最终请求 URL——三种写法全部兼容：
+    ///   http://host:8080                          → …/v1/chat/completions（纯主机补 /v1）
+    ///   http://host:8080/v1 或 …/api/v3           → 直接拼协议端点（尊重自定义前缀）
+    ///   http://host:8080/v1/chat/completions      → 原样使用，不再二次拼接
+    /// 注意：Gemini 原生端点含模型名（/models/{model}:generateContent），由 performGemini 自行构造，
+    /// 这里只服务于「测试连接/内部轻调用」这类通用路径（Gemini 走默认 chat/completions 探测，与改前一致）。
+    static func resolveEndpoint(_ base: String, apiProtocol: String) -> String {
+        let raw = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 空串 → 返回空，由调用方 URL(string:) 判失败（避免拼出 "v1/chat/completions" 这种脏串）
+        guard !raw.isEmpty else { return "" }
+        // 1) 已含完整端点 → 原样用（顺手去掉用户多打的尾部斜杠）
+        if hasExplicitEndpoint(raw) {
+            return raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        }
+        // 2) 未含 → 先按老规则补 /v1（纯主机），再拼协议端点
+        let b = normalizeBaseURL(raw).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        switch apiProtocol {
+        case "Anthropic Messages":      return b + "/messages"
+        case "OpenAI Responses":        return b + "/responses"
+        default:                        return b + "/chat/completions"
+        }
+    }
+
+    /// 拉模型列表用的 URL——自动剥掉端点后缀再拼 /models
+    static func modelsEndpoint(_ base: String) -> String {
+        let stripped = endpointBase(base)
+        guard !stripped.isEmpty else { return "" }
+        let trimmed = stripped.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: trimmed) else { return trimmed + "/models" }
+        let path = url.path
+        if path.isEmpty || path == "/" { return trimmed + "/v1/models" }   // 纯主机 → /v1/models
+        return trimmed + "/models"
     }
 
     /// 推理系列模型 (GPT-5.x / o1 / o3 / o4）不接受 temperature 参数，
@@ -618,7 +707,7 @@ final class ModelStore: ObservableObject {
             }
         }
         let payload: [String: Any] = [
-            "app": "TrollAgent", "type": "model_configs", "version": 1,
+            "app": "All-in-One AI Assistant", "type": "model_configs", "version": 1,
             "exportedAt": Int(Date().timeIntervalSince1970),
             "configs": items
         ]
@@ -709,8 +798,9 @@ final class ModelAPIClient {
     static let shared = ModelAPIClient()
 
     func fetchModelList(config: ModelConfig, completion: @escaping (ModelListResult) -> Void) {
-        let base = config.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard let url = URL(string: base + "/models") else {
+        // 2026-11-02 通用接口：自动剥端点后缀 + 纯主机补 /v1，用户填什么形式都能拉列表
+        let urlStr = ModelConfig.modelsEndpoint(config.baseURL)
+        guard let url = URL(string: urlStr) else {
             completion(.failure("Invalid Base URL"))
             return
         }
@@ -736,17 +826,11 @@ final class ModelAPIClient {
     }
 
     func testConnection(config: ModelConfig, completion: @escaping (Result<String, Error>) -> Void) {
-        let base = config.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        // v2.9.0：支持 Responses API 协议
-        let endpoint: String
-        if config.apiProtocol == "Anthropic Messages" {
-            endpoint = "/messages"
-        } else if config.apiProtocol == "OpenAI Responses" {
-            endpoint = "/responses"
-        } else {
-            endpoint = "/chat/completions"
-        }
-        guard let url = URL(string: base + endpoint) else {
+        // 2026-11-02 通用接口：填完整端点则原样用；否则按协议拼接（纯主机自动补 /v1）
+        // 协议以「端点能看出来的」为准——用户填 /responses 就按 Responses 发体
+        let proto = ModelConfig.impliedProtocol(from: config.baseURL) ?? config.apiProtocol
+        let urlStr = ModelConfig.resolveEndpoint(config.baseURL, apiProtocol: proto)
+        guard let url = URL(string: urlStr) else {
             completion(.failure(NSError(domain: "ModelAPIClient", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid Base URL"])))
             return
         }
@@ -759,14 +843,14 @@ final class ModelAPIClient {
         // 旧版发送 max_completion_tokens=8，推理模型 (gpt-5.x 默认 medium 推理）
         // 的推理 token 预算远超 8，会直接报参数错误，导致误判为连接failed。
         let body: [String: Any]
-        if config.apiProtocol == "Anthropic Messages" {
+        if proto == "Anthropic Messages" {
             // Anthropic 协议要求必须传 max_tokens
             body = [
                 "model": config.model,
                 "max_tokens": 64,
                 "messages": [["role": "user", "content": "hi"]]
             ]
-        } else if config.apiProtocol == "OpenAI Responses" {
+        } else if proto == "OpenAI Responses" {
             body = [
                 "model": config.model,
                 "input": [["role": "user", "content": "hi"]]
@@ -806,16 +890,10 @@ final class ModelAPIClient {
     func sendChat(config: ModelConfig, messages: [[String: Any]],
                   timeout: TimeInterval = 90,
                   completion: @escaping (Result<String, Error>) -> Void) {
-        let base = config.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let endpoint: String
-        if config.apiProtocol == "Anthropic Messages" {
-            endpoint = "/messages"
-        } else if config.apiProtocol == "OpenAI Responses" {
-            endpoint = "/responses"
-        } else {
-            endpoint = "/chat/completions"
-        }
-        guard let url = URL(string: base + endpoint) else {
+        // 2026-11-02 通用接口：与 testConnection 同一套端点解析
+        let proto = ModelConfig.impliedProtocol(from: config.baseURL) ?? config.apiProtocol
+        let urlStr = ModelConfig.resolveEndpoint(config.baseURL, apiProtocol: proto)
+        guard let url = URL(string: urlStr) else {
             completion(.failure(NSError(domain: "ModelAPIClient", code: 0,
                                         userInfo: [NSLocalizedDescriptionKey: "Invalid Base URL"])))
             return
@@ -826,9 +904,9 @@ final class ModelAPIClient {
         applyAuth(config: config, to: &request)
 
         let body: [String: Any]
-        if config.apiProtocol == "Anthropic Messages" {
+        if proto == "Anthropic Messages" {
             body = ["model": config.model, "max_tokens": 4096, "messages": messages]
-        } else if config.apiProtocol == "OpenAI Responses" {
+        } else if proto == "OpenAI Responses" {
             var msgs: [[String: Any]] = []
             for m in messages {
                 msgs.append([
@@ -2631,7 +2709,7 @@ final class ConversationStore: ObservableObject {
         var appVer = ""
         if let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String { appVer = v }
         var parts = ["[Current env] device: \(device)\(os.isEmpty ? "" : " · \(os)")"]
-        if !appVer.isEmpty { parts.append("App: TrollAgent \(appVer)") }
+        if !appVer.isEmpty { parts.append("App: All-in-One AI Assistant \(appVer)") }
         parts.append("Workspace: \(Workspace.root.path)")
         if let idx = ConversationStore.shared.selectedIndex,
            idx < ConversationStore.shared.conversations.count {

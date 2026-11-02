@@ -10,6 +10,8 @@ struct ChatView: View {
     @ObservedObject private var store = ConversationStore.shared
     @ObservedObject private var modelStore = ModelStore.shared
     @ObservedObject private var tts = TTSService.shared
+    // 2026-11-02：语音输入（复用 GirlVoice 的 SFSpeechRecognizer 实现，不另造一套）
+    @ObservedObject private var voice = GirlVoice.shared
 
     @State private var inputText = ""
     @State private var inputHeight: CGFloat = 36
@@ -22,6 +24,8 @@ struct ChatView: View {
     // v3.1.25：思考模型总开关——关闭时完全不思考，直接回复（reasoning_effort=none）
     @AppStorage("chat_think_enabled") private var thinkEnabled = true
     @State private var keyboardHeight: CGFloat = 0   // v2.9.234：键盘高度(消息列表跟随上移)
+    // 2026-11-02：语音录入时的呼吸动画相位（仅控制麦克风按钮透明度）
+    @State private var micPulse = false
     @State private var attachmentSheet: AttachmentSheet?
     // fix73j：子代理详情 sheet——点主会话"子代理完成卡"进入独立轨迹界面
     @State private var subAgentDetailTaskID: String?
@@ -36,6 +40,8 @@ struct ChatView: View {
     @State private var showTerminal = false  // v7.0.4：终端按钮 → 简易终端
     // v3.3.4：输入框 + 号展开"应用/相册/文件/浏览器"快捷行（点 + 变 x 收起）
     @State private var attachExpanded = false
+    // 2026-11-02：中转站后台（附件栏入口）——呈现样式对齐「文件」选择器的 formSheet 卡片效果
+    @State private var showRelayAdmin = false
 
     // v2.9.9：多模态图片（data URL）。选择相册图片后转 base64 暂存，发送时随消息传给模型
     @State private var pendingImages: [String] = []
@@ -83,10 +89,13 @@ struct ChatView: View {
                                 Image(systemName: "circle.fill")
                                     .font(.system(size: 7))
                                     .foregroundColor(.green)
-                                Text(modelStore.defaultConfig?.name ?? L10n.t("i18n_1032"))
+                                // 2026-11-02 按用户要求：顶栏显示模型名（不是供应商名）
+                                Text(modelStore.defaultConfig?.model ?? L10n.t("i18n_1032"))
                                     .font(.caption2)
                                     .fontWeight(.medium)
                                     .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
                                 Image(systemName: "chevron.down")
                                     .font(.system(size: 9, weight: .semibold))
                                     .foregroundColor(.secondary)
@@ -124,13 +133,16 @@ struct ChatView: View {
                                 .disabled(selectedIds.isEmpty)
                         }
                     } else {
-                        HStack(spacing: 14) {
+                        // 2026-11-02 按用户要求重排顶栏：喇叭 → 终端 → 勾选
+                        // 三个图标统一 18pt 字号 + 24×24 命中框，保证视觉尺寸与基线和喇叭一致
+                        HStack(spacing: 12) {
                             // v4.4.18：全局朗读开关——开着时 AI 流式回复自动朗读
                             // v7.2.4：长按弹音色切换（萝莉/猫娘御姐/兔娘）；点按仍切换开关。HUD 角色音色固定，聊天界面独立可改。
                             Button(action: { withAnimation { tts.speakerEnabled.toggle() } }) {
                                 Image(systemName: tts.speakerEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")   // v6.1.5-14bg：关闭态用带斜杠喇叭（标准静音图标），不再普通喇叭灰显
                                     .font(.system(size: 18, weight: .semibold))
                                     .foregroundColor(tts.speakerEnabled ? .tmCyan : .secondary)
+                                    .frame(width: 24, height: 24)
                             }
                             .simultaneousGesture(LongPressGesture().onEnded { _ in showVoicePicker = true })
                             .confirmationDialog("音色：\(tts.voicePreset.displayName)", isPresented: $showVoicePicker, titleVisibility: .visible) {
@@ -141,10 +153,20 @@ struct ChatView: View {
                                 Button("压缩当前会话") { compactNow() }
                                 Button("取消", role: .cancel) {}
                             }
+                            // 终端：从输入框移到顶栏，占「喇叭与勾选之间」的位置
+                            Button(action: { showTerminal = true }) {
+                                Image(systemName: "terminal")
+                                    .font(.system(size: 18, weight: .semibold))
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 24, height: 24)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(PlainButtonStyle())
                             // 勾选/选择按钮
                             Button(action: enterSelection) {
                                 Image(systemName: "checkmark.circle")
                                     .font(.system(size: 18, weight: .semibold))
+                                    .frame(width: 24, height: 24)
                             }
                             .disabled(store.currentMessages.isEmpty)
                         }
@@ -287,7 +309,8 @@ struct ChatView: View {
         }
         // v2.9.36：聊天框切换上游模型（点"当前模型"弹出，老 MCP 风格半屏）
         .sheet(isPresented: $showModelPicker) {
-            // 老 MCP 半屏；presentationDetents 需 iOS16+
+            // 2026-11-02：弹窗改为「模型列表为主」——高度从固定 360 提到中档位（约屏高 55%），
+            // 模型多时可直接滚动；用户也可下拉放大到全屏。
             if #available(iOS 16.0, *) {
                 ChatModelPickerSheet { cfg in
                     // 点选即切换默认模型
@@ -297,7 +320,8 @@ struct ChatView: View {
                     showModelPicker = false
                     showToast(L10n.t("i18n_1033", cfg.name))
                 }
-                .sheetDetentsHeight(360)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
             } else {
                 ChatModelPickerSheet { cfg in
                     var c = cfg
@@ -315,6 +339,16 @@ struct ChatView: View {
         // v7.0.4：聊天框终端按钮 → 简易终端（统一环境 shell.exec）
         .sheet(isPresented: $showTerminal) {
             TerminalView()
+        }
+        // 2026-11-02：中转站后台——呈现样式对齐「文件」选择器（formSheet 卡片效果 + 大高度）
+        .sheet(isPresented: $showRelayAdmin) {
+            if #available(iOS 16.0, *) {
+                RelayAdminView()
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+            } else {
+                RelayAdminView()
+            }
         }
         // v6.1.5-14bm：/tools → 工具中心（三层工具总览，给用户看）
         .sheet(isPresented: $showToolCenter) {
@@ -782,18 +816,42 @@ struct ChatView: View {
                 .padding(.top, 8)
                 .padding(.bottom, 16)
 
-            // v3.0.83：输入栏 —— 终端键 + 输入框 + +号 + 发送键 统一放进同一个大圆角框
+            // v3.0.83：输入栏 —— 语音 + 输入框 + +号 + 发送键 统一放进同一个大圆角框
+            // 2026-11-02 按用户要求：原「终端」按钮位置改为「语音输入」（终端已移到顶栏）
             HStack(spacing: 6) {
                 Button(action: {
-                    showTerminal = true   // v7.0.4：打开简易终端（原为远程终端设置页）
+                    // 语音输入：点一下开始听，再点一下结束并填入输入框
+                    if voice.isListening {
+                        voice.stop()
+                    } else {
+                        // GirlVoice 是单例，GirlCompanion 也用它——每次开录前重新挂回调，
+                        // 确保识别结果进的是当前输入框（而不是被小女孩页面的回调抢走）。
+                        voice.onFinalText = { text in
+                            let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !t.isEmpty else { return }
+                            if inputText.isEmpty { inputText = t }
+                            else { inputText += (inputText.hasSuffix(" ") ? "" : " ") + t }
+                        }
+                        voice.onPermissionDenied = { showToast("语音权限未开启，请到设置中允许麦克风与语音识别") }
+                        voice.start()
+                    }
                 }) {
-                    Image(systemName: "terminal")
+                    Image(systemName: voice.isListening ? "waveform" : "mic.fill")
                         .font(.system(size: 15, weight: .semibold))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(voice.isListening ? .red : .secondary)
                         .frame(width: 32, height: 32)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(PlainButtonStyle())
+                // 2026-11-02：录音中图标呼吸提示（只作用于这个按钮，不进全局动画）
+                .opacity(voice.isListening ? (micPulse ? 0.45 : 1.0) : 1.0)
+                .onChange(of: voice.isListening) { listening in
+                    micPulse = false
+                    guard listening else { return }
+                    withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
+                        micPulse = true
+                    }
+                }
 
                 ChatInputTextView(text: $inputText, onSend: { send() }, height: $inputHeight)
                     .frame(maxWidth: .infinity)
@@ -936,17 +994,20 @@ struct ChatView: View {
     /// v3.3.4：+ 展开的快捷附件行（应用 / 相册 / 文件 / 浏览器），对齐微信式附件栏
     /// v3.4.2：从左屏幕边缘到右屏幕边缘均匀分布——四格等宽、间隙一致（含两侧边缘间隙）
     private var attachQuickRow: some View {
-        HStack(spacing: 12) {
+        // 2026-11-02：新增「中转站」后共 5 个入口，改成每行 4 格的网格
+        // （保持原有 4 格等宽几何不变，第 5 个入口自然换到第二行，不会挤成一团）
+        LazyVGrid(
+            columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4),
+            spacing: 14
+        ) {
             attachQuickButton("apps.iphone", L10n.t("i18n_1046")) {
                 withAnimation { attachExpanded = false }
                 attachmentSheet = .appPicker
             }
-            .frame(maxWidth: .infinity)
             attachQuickButton("photo.on.rectangle", L10n.t("i18n_1047")) {
                 withAnimation { attachExpanded = false }
                 attachmentSheet = .photoPicker
             }
-            .frame(maxWidth: .infinity)
             attachQuickButton("folder", L10n.t("i18n_1048")) {
                 withAnimation { attachExpanded = false }
                 // v3.3.4：快捷行直接弹 UIKit 文档选择器（无需半屏面板中转）
@@ -954,13 +1015,16 @@ struct ChatView: View {
                     handlePickedFiles(urls)
                 }
             }
-            .frame(maxWidth: .infinity)
             attachQuickButton("globe", L10n.t("i18n_1049")) {
                 withAnimation { attachExpanded = false }
                 attachmentSheet = nil
                 FloatingBrowser.shared.show()
             }
-            .frame(maxWidth: .infinity)
+            // 2026-11-02：新增「中转站」入口——打开中转站后台（首次输一次密码，之后免密直达）
+            attachQuickButton("server.rack", L10n.t("i18n_1510")) {
+                withAnimation { attachExpanded = false }
+                beginRelayAdmin()
+            }
         }
         .padding(.horizontal, 12)
         // v3.4.8：附件行与输入框之间留出明显间隔（参考图）
@@ -1171,6 +1235,15 @@ struct ChatView: View {
             vc = presented
         }
         return vc
+    }
+
+    /// 2026-11-02：打开中转站后台。
+    /// 附件栏收起有 0.2s 动画，立刻 present sheet 会被收尾逻辑顶掉（同「文件」入口踩过的坑），
+    /// 所以等动画结束再弹。
+    private func beginRelayAdmin() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            showRelayAdmin = true
+        }
     }
 
     /// 选择完成：复制到工作区 uploads/（asCopy 已复制进沙盒，这里再落到 uploads 统一管理 + 防重名）
@@ -1526,114 +1599,64 @@ struct QuickTabButton: View {
 }
 
 // v2.9.36：聊天框"当前模型"点击弹出的上游模型选择（老 MCP 风格半屏）
+// 2026-11-02 按用户要求重构：
+//  1) 弹窗默认直接展示「当前选中供应商」的全部模型，点模型即切换
+//  2) 「在设置中管理模型」改为「选择模型供应商」——进入供应商列表，
+//     点某供应商 → 该供应商模型列表（本弹窗）→ 再点模型 → 回聊天页
 struct ChatModelPickerSheet: View {
     @ObservedObject private var modelStore = ModelStore.shared
     let onSelect: (ModelConfig) -> Void
     // v7.1.95：首页切换模型弹窗直接获取上游模型并切换（用户要求）
     @State private var fetchedModels: [String] = []
-    @State private var showingUpstreamModelPicker = false
     @State private var isFetchingModels = false
     @State private var fetchError = ""
+    @State private var query = ""
+    // 2026-11-02：供应商切换页（true = 显示供应商列表；false = 显示模型列表）
+    @State private var showingSupplierList = false
+    // 2026-11-02：当前正在浏览其模型列表的配置（nil = 用默认配置）
+    @State private var browsingConfigID: UUID?
+
+    /// 当前浏览的供应商配置：优先用户在本弹窗里选的，否则用默认配置
+    private var activeConfig: ModelConfig? {
+        if let id = browsingConfigID,
+           let c = modelStore.configs.first(where: { $0.id == id }) { return c }
+        return modelStore.defaultConfig ?? modelStore.configs.first
+    }
+
+    /// 该供应商可选的模型名：上游拉取结果优先；未拉取则只显示当前配置里的那一个
+    private var modelOptions: [String] {
+        var list = fetchedModels
+        if let cur = activeConfig?.model, !cur.isEmpty, !list.contains(cur) {
+            list.insert(cur, at: 0)
+        }
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return list }
+        return list.filter { $0.localizedCaseInsensitiveContains(q) }
+    }
 
     var body: some View {
         CompatNav {
-            List {
-                Section(header: SettingSectionHeader(title: L10n.t("i18n_1069"))) {
-                    ForEach(modelStore.configs) { cfg in
-                        Button(action: { onSelect(cfg) }) {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(cfg.name)
-                                        .font(.body)
-                                        .foregroundColor(.primary)
-                                    Text("\(cfg.model) · \(cfg.provider)")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                        .lineLimit(1)
-                                }
-                                // v7.4.0-fix73d：视觉能力标注——首页切换弹窗对齐配置列表
-                                if cfg.supportsVision {
-                                    Image(systemName: "photo")
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .foregroundColor(.blue)
-                                        .accessibilityLabel("Vision")
-                                }
-                                Spacer()
-                                if cfg.isDefault {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundColor(.blue)
-                                }
-                            }
-                        }
-                    }
-                }
-                // v7.1.95：直接获取当前默认配置的上游模型列表并切换（用户要求：
-                // '获取上游模型可以在首页顶部切换模型里点击就能获取上游模型进行切换'）
-                if let cfg = modelStore.defaultConfig {
-                    Section {
-                        Button(action: {
-                            isFetchingModels = true
-                            fetchError = ""
-                            ModelAPIClient.shared.fetchModelList(config: cfg) { result in
-                                isFetchingModels = false
-                                switch result {
-                                case .success(let models):
-                                    fetchedModels = models
-                                    if models.isEmpty {
-                                        fetchError = L10n.t("i18n_428")
-                                    } else {
-                                        showingUpstreamModelPicker = true
-                                    }
-                                case .failure(let error):
-                                    fetchError = error
-                                }
-                            }
-                        }) {
-                            HStack(spacing: 12) {
-                                Image(systemName: "arrow.down.circle")
-                                    .font(.system(size: 18))
-                                    .foregroundColor(.blue)
-                                Text(L10n.t("ui_128"))
-                                    .foregroundColor(.blue)
-                                Spacer()
-                                if isFetchingModels { ProgressView() }
-                            }
-                            .font(.footnote)
-                        }
-                        .disabled(isFetchingModels)
-                        if !fetchError.isEmpty {
-                            Text(fetchError)
-                                .font(.caption)
-                                .foregroundColor(.red)
-                        }
-                    }
-                    .sheet(isPresented: $showingUpstreamModelPicker) {
-                        ModelPickerSheet(models: fetchedModels, selected: Binding(
-                            get: { modelStore.defaultConfig?.model ?? "" },
-                            set: { newModel in
-                                if var c = modelStore.defaultConfig {
-                                    c.model = newModel
-                                    modelStore.update(c)   // 保持默认 + 同步共享文件（HUD 语音同用）
-                                    onSelect(c)            // 外层关 sheet + toast 提示已切换
-                                }
-                            }
-                        ))
-                    }
-                }
-                Section {
-                    // v7.1.97：弹窗内直接 push 模型 API 页（原"开设置再跳"链路：
-                    // 半屏 sheet 挂着 → 根 fullScreenCover 排队延迟呈现 + 0.25s 跳转延迟
-                    // ——用户实测'点了半天才跳过去'。push 零切换零延迟，返回回弹窗）
-                    NavigationLink(destination: ModelsView()) {
-                        Label(L10n.t("i18n_1070"), systemImage: "gearshape.fill")
-                            .font(.footnote)
-                    }
+            Group {
+                if showingSupplierList {
+                    supplierListView
+                } else {
+                    modelListView
                 }
             }
-            .listStyle(.insetGrouped)
-            .navigationTitle(L10n.t("i18n_1064"))
+            .navigationTitle(showingSupplierList ? L10n.t("i18n_1070") : L10n.t("i18n_1064"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if showingSupplierList {
+                        Button(action: { showingSupplierList = false }) {
+                            HStack(spacing: 2) {
+                                Image(systemName: "chevron.left")
+                                Text(L10n.t("i18n_1501"))
+                            }
+                            .font(.footnote)
+                        }
+                    }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button(L10n.t("i18n_1180")) { }
                         .hidden()
@@ -1641,6 +1664,209 @@ struct ChatModelPickerSheet: View {
             }
         }
         .navigationViewStyle(.stack)
+    }
+
+    // MARK: - 模型列表页（本弹窗主界面）
+
+    private var modelListView: some View {
+        List {
+            // 当前供应商抬头
+            if let cfg = activeConfig {
+                Section {
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(cfg.name)
+                                .font(.body.weight(.medium))
+                            Text("\(cfg.model) · \(cfg.provider)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                        if modelStore.defaultConfig?.id == cfg.id {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.blue)
+                        }
+                    }
+                } header: {
+                    SettingSectionHeader(title: L10n.t("i18n_1069"))
+                }
+            }
+
+            // 模型列表：点即切换（供应商已定，只换 model）
+            Section {
+                // 2026-11-02：模型可能几十个，加搜索框快速筛
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.secondary)
+                    TextField("搜索模型", text: $query)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                    if !query.isEmpty {
+                        Button(action: { query = "" }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                if modelOptions.isEmpty {
+                    Text(isFetchingModels ? L10n.t("i18n_1504") : L10n.t("i18n_1505"))
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(modelOptions, id: \.self) { m in
+                        Button(action: { pickModel(m) }) {
+                            HStack(spacing: 10) {
+                                Image(systemName: activeConfig?.model == m ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(activeConfig?.model == m ? .blue : Color.secondary.opacity(0.45))
+                                Text(m)
+                                    .font(.system(.body, design: .monospaced))
+                                    .foregroundColor(.primary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                if ModelConfig.modelSupportsVision(m) {
+                                    Image(systemName: "photo")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundColor(.blue)
+                                }
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                // 拉取上游模型
+                if let cfg = activeConfig {
+                    Button(action: { fetchModels(for: cfg) }) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "arrow.down.circle")
+                                .font(.system(size: 18))
+                                .foregroundColor(.blue)
+                            Text(L10n.t("ui_128"))
+                                .foregroundColor(.blue)
+                            Spacer()
+                            if isFetchingModels { ProgressView() }
+                        }
+                        .font(.footnote)
+                    }
+                    .disabled(isFetchingModels)
+                    if !fetchError.isEmpty {
+                        Text(fetchError)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                    }
+                }
+            }
+
+            // 「选择模型供应商」——进入供应商列表（原「在设置中管理模型」）
+            Section {
+                Button(action: { showingSupplierList = true }) {
+                    HStack {
+                        Image(systemName: "square.stack.3d.up.fill")
+                            .font(.system(size: 15))
+                            .foregroundColor(.blue)
+                        Text(L10n.t("i18n_1070"))
+                            .foregroundColor(.primary)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .listStyle(.insetGrouped)
+    }
+
+    // MARK: - 供应商列表页
+
+    private var supplierListView: some View {
+        List {
+            Section {
+                ForEach(modelStore.configs) { cfg in
+                    Button(action: {
+                        // 选中供应商 → 回到模型列表页，并拉取该供应商模型
+                        // 2026-11-02：先清上一家缓存再赋值/拉取——清空必须同步做在原地，
+                        // 放 onChange 会与网络回调竞态（可能把刚拉到的列表清掉）
+                        fetchedModels = []
+                        fetchError = ""
+                        query = ""
+                        browsingConfigID = cfg.id
+                        showingSupplierList = false
+                        fetchModels(for: cfg)
+                    }) {
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(cfg.name)
+                                    .font(.body)
+                                    .foregroundColor(.primary)
+                                Text("\(cfg.model) · \(cfg.provider)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
+                            if cfg.supportsVision {
+                                Image(systemName: "photo")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundColor(.blue)
+                            }
+                            Spacer()
+                            if modelStore.defaultConfig?.id == cfg.id {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.blue)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            } header: {
+                SettingSectionHeader(title: L10n.t("i18n_1502", modelStore.configs.count))
+            }
+
+            Section {
+                // 仍保留直达完整管理页的入口（新增/删除/改 Key 等）
+                NavigationLink(destination: ModelsView()) {
+                    Label(L10n.t("i18n_1503"), systemImage: "gearshape.fill")
+                        .font(.footnote)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+    }
+
+    // MARK: - 动作
+
+    /// 选定模型：写回该供应商配置并设为默认，然后关闭弹窗回聊天页
+    private func pickModel(_ m: String) {
+        guard var c = activeConfig else { return }
+        c.model = m
+        c.isDefault = true
+        modelStore.update(c)   // 保持默认 + 同步共享文件（HUD 语音同用）
+        onSelect(c)            // 外层关 sheet + toast 提示已切换
+    }
+
+    private func fetchModels(for cfg: ModelConfig) {
+        isFetchingModels = true
+        fetchError = ""
+        ModelAPIClient.shared.fetchModelList(config: cfg) { result in
+            isFetchingModels = false
+            switch result {
+            case .success(let models):
+                fetchedModels = models
+                if models.isEmpty {
+                    fetchError = L10n.t("i18n_428")
+                }
+            case .failure(let error):
+                fetchError = error
+            }
+        }
     }
 }
 

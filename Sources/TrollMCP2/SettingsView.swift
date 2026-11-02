@@ -298,11 +298,8 @@ struct SettingsView: View {
 
         // 关于
         let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
+        // 2026-11-02 按用户要求：关于分组移除「关于作者」，保留「语言」「检查更新」「版本」
         var aboutItems: [SettingsItem] = [
-            SettingsItem(title: L10n.t("about_title"),
-                         subtitle: L10n.t("i18n_1165"),
-                         icon: "person.crop.circle.fill", color: .blue,
-                         destination: AnyView(AboutAuthorView())),
             SettingsItem(title: L10n.t("row_lang"),
                          subtitle: LanguageManager.shared.language.displayName,
                          icon: "globe", color: .purple,

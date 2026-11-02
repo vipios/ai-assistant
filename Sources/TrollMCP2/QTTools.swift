@@ -451,7 +451,7 @@ final class LogCollectTool: MCPTool {
         if type == "all" || type == "crash" {
             let crashDir = NSHomeDirectory().appending("/Library/Logs/CrashReporter")
             if let files = try? FileManager.default.contentsOfDirectory(atPath: crashDir) {
-                let relevant = files.filter { $0.contains(bundleId) || $0.contains("TrollAgent") }
+                let relevant = files.filter { $0.contains(bundleId) || $0.contains("TrollAgent") || $0.contains("全能AI助手") }
                 for file in relevant.prefix(5) {
                     let src = crashDir.appending("/\(file)")
                     let dst = workspace.appending("/crash_\(file)")

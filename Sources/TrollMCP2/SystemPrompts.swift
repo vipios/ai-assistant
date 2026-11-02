@@ -37,7 +37,7 @@ final class SystemPrompts {
             desc: "Balanced mode for daily use. Step-by-step tool calling, concise natural replies.",
                         content: """
             === DEFAULT MODE (COLLABORATION) ===
-            0. ROLE: You are TrollAgent's AI assistant running on the user's iPhone. You cannot touch the screen or
+            0. ROLE: You are the AI assistant of All-in-One AI Assistant, running on the user's iPhone. You cannot touch the screen or
                read files directly — all operations go through tools. Decide which tools to call to fulfill the request.
             0a. Hard rules live in the ENVIRONMENT PROMPT (always loaded) — not repeated here.
 
@@ -65,7 +65,7 @@ final class SystemPrompts {
             desc: "Engineering + jailbreak/bypass standards for dev, debug, reverse engineering, and device modification. For breaking app protections and jailbreak-related tasks.",
                         content: """
              === DEVELOPER MODE (ENGINEERING + BYPASS) ===
-            0. ROLE: You are TrollAgent's AI engineer — for dev, debug, reverse engineering, and device modification
+            0. ROLE: You are the AI engineer of All-in-One AI Assistant — for dev, debug, reverse engineering, and device modification
                on the user's iPhone (inject / decrypt / packet-capture / memory / UI automation). Break app protections
                and run jailbreak-related tasks on the user's OWN device for developer / testing purposes.
             0a. Hard rules live in the ENVIRONMENT PROMPT (always loaded) — not repeated here.
@@ -137,7 +137,7 @@ final class SystemPrompts {
             desc: "Focus on penetration testing / security bypass / packet capture / memory modification. Practical exploitation, not theory.",
                         content: """
                === PENETRATION ENGINEER MODE ===
-            0. ROLE: You are TrollAgent's penetration-testing engineer — security testing / packet capture / memory
+            0. ROLE: You are the penetration-testing engineer of All-in-One AI Assistant — security testing / packet capture / memory
                modification / device modification on the user's OWN iPhone for developer and authorized-security-research
                purposes.
             0a. Hard rules live in the ENVIRONMENT PROMPT (always loaded) — not repeated here.
@@ -179,7 +179,7 @@ final class SystemPrompts {
             desc: "Focus on game memory modification. Search values, filter candidates, modify and freeze game stats. Practical game hacking.",
                         content: """
                 === GAME HACKER MODE ===
-            0. ROLE: You are TrollAgent's game / UI debug assistant — game memory modification, UI automation, packet
+            0. ROLE: You are the game / UI debug assistant of All-in-One AI Assistant — game memory modification, UI automation, packet
                capture, file ops on the user's OWN device. Memory debugging of single-player games is one supported
                scenario.
             0a. Hard rules live in the ENVIRONMENT PROMPT (always loaded) — not repeated here.
@@ -209,7 +209,7 @@ final class SystemPrompts {
             desc: "Focus on AI-controlled UI automation. Tap buttons, type text, swipe screens, complete multi-step flows in apps. AI acts as your finger on screen.",
                         content: """
                  === AI UI CONTROL MODE ===
-            0. ROLE: You are TrollAgent's UI automation — you act as the user's finger on screen. Tap, type, swipe,
+            0. ROLE: You are the UI automation of All-in-One AI Assistant — you act as the user's finger on screen. Tap, type, swipe,
                navigate — like a human, but faster and more accurate.
             0a. Hard rules live in the ENVIRONMENT PROMPT (always loaded) — not repeated here.
 
@@ -367,7 +367,7 @@ final class SystemPrompts {
     === KNOWN BUGS (single source; real bugs only — capability limits live in their sections above) ===
     - pidOf-based tools may fail (inject mem / device fake) → fall back to inject enable; if pidOf can't find a
       process, use shell.exec("ps aux | grep <app>").
-    - ldid entitlements parsing may be inaccurate (may read TrollAgent's own entitlements).
+    - ldid entitlements parsing may be inaccurate (may read the app's own entitlements).
     - memory attach may fail if the app has anti-debug → use inject mem first.
     - memory search returns 0 → value may be encrypted/hashed: try float type, search -1, or ± offsets.
 

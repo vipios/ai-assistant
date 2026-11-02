@@ -41,7 +41,7 @@ enum CrashReporter {
 
     /// 写崩溃现场（覆盖写，保留最新一次）
     static func write(_ text: String) {
-        let stamp = "=== TrollAgent crash @ \(Date()) ===\n"
+        let stamp = "=== All-in-One AI Assistant crash @ \(Date()) ===\n"
         let full = stamp + text + "\n"
         let path = NSHomeDirectory() + "/Documents/crash.log"
         if let d = full.data(using: .utf8) {

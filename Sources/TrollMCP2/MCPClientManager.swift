@@ -83,7 +83,7 @@ final class MCPClientManager: ObservableObject {
         guard let initResult = rpc(url: cfg.url, method: "initialize", params: [
             "protocolVersion": "2025-06-18",
             "capabilities": ["tools": [:] as [String: Any]],
-            "clientInfo": ["name": "TrollAgent", "version": "7.1.75"]
+            "clientInfo": ["name": "All-in-One AI Assistant", "version": "7.1.75"]
         ]) else { return false }
         _ = initResult["result"]
         // 2. notifications/initialized（无响应，POST 即可）
@@ -242,7 +242,7 @@ final class MCPClientManager: ObservableObject {
             "jsonrpc": "2.0", "method": "initialize", "id": 1,
             "params": ["protocolVersion": "2025-06-18",
                        "capabilities": ["tools": [:] as [String: Any]],
-                       "clientInfo": ["name": "TrollAgent", "version": "7.1.86"]]
+                       "clientInfo": ["name": "All-in-One AI Assistant", "version": "7.1.86"]]
         ])
         let sem = DispatchSemaphore(value: 0)
         var serverName: String?

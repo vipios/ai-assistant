@@ -15,54 +15,65 @@ struct ModelsView: View {
     @State private var showImportMessage = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            // v4.3.27：推荐卡片区——全宽直达外框（去掉 insetGrouped 内框），
-            // 顺序：推荐破甲站第一、推荐中转站第二（用户要求）；面板加大加宽。
-            RecommendCardArea()
+        ScrollViewReader { proxy in
+            VStack(spacing: 0) {
+                // 2026-11-02 按用户要求：顶部加「已添加供应商」快捷条——
+                // 横向滑动可看全部供应商名字，点击直接跳到对应分组；列表上滑时本栏固定不动。
+                if !store.configs.isEmpty {
+                    supplierChipsBar(proxy: proxy)
+                    Divider()
+                }
 
-            List {
-                if store.configs.isEmpty {
-                    Section {
-                        HStack {
-                            Spacer()
-                            VStack(spacing: 8) {
-                                Image(systemName: "cpu")
-                                    .font(.system(size: 40))
-                                    .foregroundColor(.secondary)
-                                Text(L10n.t("ui_50"))
-                                    .font(.footnote)
-                                    .foregroundColor(.secondary)
+                List {
+                    if store.configs.isEmpty {
+                        Section {
+                            HStack {
+                                Spacer()
+                                VStack(spacing: 8) {
+                                    Image(systemName: "cpu")
+                                        .font(.system(size: 40))
+                                        .foregroundColor(.secondary)
+                                    Text(L10n.t("ui_50"))
+                                        .font(.footnote)
+                                        .foregroundColor(.secondary)
+                                }
+                                .padding(.vertical, 40)
+                                Spacer()
                             }
-                            .padding(.vertical, 40)
-                            Spacer()
                         }
-                    }
-                } else {
-                    // v2.9.107：按分组展示（默认组优先，其余按字典序）
-                    let groups = groupedKeys()
-                    ForEach(groups, id: \.self) { g in
-                        Section(header: HStack {
-                            Text(g)
-                                .font(.subheadline.weight(.semibold))
-                            Spacer()
-                            Text(L10n.t("ui_155", count(in: g)))
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }) {
-                            ForEach(configs(in: g)) { cfg in
-                                ModelRow(config: cfg)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture {
-                                        isNewModel = false
-                                        editing = cfg
-                                    }
+                    } else {
+                        // v2.9.107：按分组展示（默认组优先，其余按字典序）
+                        let groups = groupedKeys()
+                        ForEach(groups, id: \.self) { g in
+                            Section(header: HStack {
+                                // 2026-11-02 按用户要求：默认分组（group == "default"）不显示分组名，
+                                // 只保留右侧数量。否则列表头会把 "default" 自动大写成灰色 "DEFAULT"。
+                                // 用户自定义过分组名的仍然照常显示。
+                                if !isDefaultGroup(g) {
+                                    Text(g)
+                                        .font(.subheadline.weight(.semibold))
+                                }
+                                Spacer()
+                                Text(L10n.t("ui_155", count(in: g)))
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }) {
+                                ForEach(configs(in: g)) { cfg in
+                                    ModelRow(config: cfg)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            isNewModel = false
+                                            editing = cfg
+                                        }
+                                        .id(cfg.id)   // 2026-11-02：供顶部供应商条 scrollTo 精确定位
+                                }
+                                .onDelete { offsets in delete(in: g, at: offsets) }
                             }
-                            .onDelete { offsets in delete(in: g, at: offsets) }
                         }
                     }
                 }
+                .listStyle(.insetGrouped)
             }
-            .listStyle(.insetGrouped)
         }
         .navigationTitle(L10n.t("i18n_1102"))
         .toolbar {
@@ -126,7 +137,7 @@ struct ModelsView: View {
             }
             showImportMessage = true
         }
-        .fileExporter(isPresented: $showingExporter, document: exportDoc, contentType: .json, defaultFilename: "TrollAgent-models-\(Date().timeIntervalSince1970)") { _ in }
+        .fileExporter(isPresented: $showingExporter, document: exportDoc, contentType: .json, defaultFilename: "AllInOneAI-models-\(Date().timeIntervalSince1970)") { _ in }
         .alert(isPresented: $showImportMessage) {
             Alert(title: Text(L10n.t("ui_100")), message: Text(importMessage), dismissButton: .default(Text(L10n.t("ui_44"))))
         }
@@ -148,6 +159,55 @@ struct ModelsView: View {
 
     // MARK: v2.9.107 分组辅助
 
+    /// 2026-11-02：顶部「已添加供应商」横向快捷条——列出全部已添加的配置名（供应商），
+    /// 点击直接跳到对应分组；列表上滑滚动时本栏固定不动（VStack 内、List 之外）。
+    @ViewBuilder
+    private func supplierChipsBar(proxy: ScrollViewProxy) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("已添加供应商（\(store.configs.count)）")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(store.configs) { cfg in
+                        Button(action: {
+                            // 跳到该配置所在行（行已挂 .id(cfg.id)，比 Section 定位可靠）
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                proxy.scrollTo(cfg.id, anchor: .top)
+                            }
+                        }) {
+                            HStack(spacing: 5) {
+                                Circle()
+                                    .fill(cfg.isDefault ? Color.blue : Color.secondary.opacity(0.45))
+                                    .frame(width: 6, height: 6)
+                                Text(cfg.name)
+                                    .font(.footnote.weight(.medium))
+                                    .lineLimit(1)
+                                Text(cfg.model)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .fill(Color.secondary.opacity(0.12))
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+            .padding(.bottom, 8)
+        }
+        .background(Color.secondary.opacity(0.04))
+    }
+
     private func groupedKeys() -> [String] {
         var seen: [String] = []
         for c in store.configs where !seen.contains(c.group) { seen.append(c.group) }
@@ -156,6 +216,12 @@ struct ModelsView: View {
             if $1 == L10n.t("ui_144") { return false }
             return $0 < $1
         }
+    }
+
+    /// 2026-11-02：是否为「默认分组」——分组名等于 ModelConfig.group 的默认值 "default"
+    /// （大小写不敏感，兼容老数据里手写成 "Default" 的情况）
+    private func isDefaultGroup(_ g: String) -> Bool {
+        g.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "default"
     }
 
     private func configs(in group: String) -> [ModelConfig] {
@@ -325,8 +391,8 @@ struct ModelRow: View {
     private func speedTest() {
         testing = true
         latencyText = ""
-        let base = config.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard let url = URL(string: base + "/models") else {
+        // 2026-11-02 通用接口：自动剥端点后缀 + 纯主机补 /v1（与主流程同一套解析）
+        guard let url = URL(string: ModelConfig.modelsEndpoint(config.baseURL)) else {
             latencyText = L10n.t("i18n_1103")
             latencyColor = .red
             testing = false
@@ -357,35 +423,9 @@ struct ModelRow: View {
     }
 }
 
-// MARK: - v4.3.28 推荐卡片区（圆角 + 距屏幕边缘留空隙；破甲站第一、中转站第二）
-// 说明：卡片保持移出 List 内框（无分组白框），但恢复圆角并左右留边距，
-// 渐变卡片距屏幕边缘约 16pt，视觉上不再贴边。
-
-struct RecommendCardArea: View {
-    var body: some View {
-        VStack(spacing: 10) {
-            // 推荐破甲站（第一张）
-            RecommendCard(
-                icon: "shield.fill",
-                title: L10n.t("armor_card_title"),
-                message: L10n.t("armor_card_body"),
-                link: "https://caibaizz.xyz/register?aff=9MBDRSGSARN7",
-                colors: [Color(red: 0.55, green: 0.28, blue: 0.85),
-                         Color(red: 0.86, green: 0.30, blue: 0.55)])
-            // 推荐中转站（第二张）
-            RecommendCard(
-                icon: "sparkles",
-                title: L10n.t("relay_card_title"),
-                message: L10n.t("relay_card_body"),
-                link: "https://botcf.com/register?aff=bJMk",
-                colors: [Color(red: 0.16, green: 0.44, blue: 0.92),
-                         Color(red: 0.0, green: 0.74, blue: 0.95)])
-        }
-        .padding(.horizontal, 16)   // v4.3.28：左右距屏幕边缘留空隙
-        .padding(.top, 8)
-        .padding(.bottom, 4)
-    }
-}
+// MARK: - 推荐卡片区
+// 2026-11-02 按用户要求：整块删除（原为「推荐破甲站」+「推荐中转站」两张横幅）
+// 保留 RecommendCard 组件定义（可能被其他地方复用），但不再渲染任何推荐内容。
 
 /// 通用推荐卡片：圆角渐变背景 + 距边缘空隙，标题+正文+可复制链接
 /// 注意：正文属性命名 message——不能叫 body（与 View.body 计算属性重名，编译报
@@ -513,22 +553,95 @@ struct ModelEditorView: View {
             List {
                 Section(header: sectionHeader(apiProtocol.uppercased())) {
                     quickConfigRow
-                    editorRow(L10n.t("i18n_919"), text: $name, placeholder: "Botcf")
+                    editorRow(L10n.t("i18n_919"), text: $name, placeholder: "OpenAI")
                     pickerRow(L10n.t("i18n_1105"), selection: $apiProtocol, options: ModelConfig.apiProtocols)
                 }
 
+                // 2026-11-02 按用户要求重排：接口地址 → API Key（带测试连接）→ 模型名称（点击弹出选择）
                 Section(header: sectionHeader(L10n.t("i18n_1106"))) {
-                    editorRow("Base URL", text: $baseURL, placeholder: "https://botcf.com/v1")
-                    editorRow(L10n.t("i18n_421"), text: $model, placeholder: "gpt-5.6-terra")
+                    editorRow("接口地址", text: $baseURL, placeholder: "http://192.168.1.88:8080")
+
+                    // 2026-11-02 通用接口：实时回显最终请求地址，填什么形式都能用
+                    if !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.turn.down.right")
+                                .font(.caption2)
+                            Text("实际请求：\(ModelConfig.resolveEndpoint(baseURL, apiProtocol: apiProtocol))")
+                                .font(.caption2)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        .foregroundColor(.secondary)
+                    }
+
+                    // API Key 行 + 右侧「测试连接」按钮（对齐用户参考图）
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(authMethod == "None" ? L10n.t("i18n_425") : "API Key")
+                                .font(.body)
+                            if showKey {
+                                TextField("sk-...", text: $apiKey)
+                                    .font(.system(.body, design: .monospaced))
+                                    .autocapitalization(.none)
+                                    .disableAutocorrection(true)
+                            } else {
+                                SecureField("sk-...", text: $apiKey)
+                                    .font(.system(.body, design: .monospaced))
+                            }
+                        }
+                        Button(action: { showKey.toggle() }) {
+                            Image(systemName: showKey ? "eye.slash" : "eye")
+                                .foregroundColor(.secondary)
+                        }
+                        Button(action: { fetchAndPickModels() }) {
+                            if isTesting {
+                                ProgressView().scaleEffect(0.8)
+                            } else {
+                                Text("测试连接")
+                                    .font(.subheadline)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Color.blue.opacity(0.12))
+                                    .foregroundColor(.blue)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isTesting)
+                    }
+                    .padding(.vertical, 4)
+
+                    // 模型名称：点击整行 → 拉取上游模型 → 弹出滑动选择列表
+                    Button(action: { fetchAndPickModels() }) {
+                        HStack {
+                            Text(L10n.t("i18n_421"))
+                                .foregroundColor(.primary)
+                            Spacer()
+                            Text(model.isEmpty ? "点击获取模型列表" : model)
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundColor(model.isEmpty ? .secondary : .primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isTesting)
+
+                    // 状态提示（拉取结果 / 错误）
+                    if !testStatus.isEmpty {
+                        Text(testStatus)
+                            .font(.caption2)
+                            .foregroundColor(testColor)
+                    }
+
+                    // 高级项：鉴权方式（默认 Bearer，一般不用改）
                     pickerRow(L10n.t("i18n_422"), selection: $authMethod, options: ModelConfig.authMethods)
-                    // v7.2.3-fix6：新手友好——预设供应商已自动带正确鉴权（选预设即自动填）；
-                    // 401 时会自动试探纠正，这里只作说明
                     Text(L10n.t("ui_auth_method_hint"))
                         .font(.caption2)
                         .foregroundColor(.secondary)
-                    tokenRow
-                    // v6.1.5-14bk：参数别名/分组 UI 移除（用户看不懂也不需要填）——
-                    // 别名兼容由 OpenAIClient compatLevel 0-4 自动降级覆盖，分组默认"默认"即可
                 }
 
                 // v7.1.107：备用模型组——主模型请求失败（网络/超时/鉴权/熔断/5xx 且未产出内容）
@@ -848,6 +961,34 @@ struct ModelEditorView: View {
         speedTestCore(config: cfg)
     }
 
+    /// 2026-11-02：一键拉取上游模型并弹出滑动选择列表
+    /// 流程：填好接口地址 + API Key → 点「测试连接」或「模型名称」→ GET {base}/models
+    /// → 成功则弹出 ModelPickerSheet（滑动选择），失败则在行下方显示错误原因
+    private func fetchAndPickModels() {
+        let cfg = makeConfig()
+        isTesting = true
+        testStatus = "正在获取模型列表…"
+        testColor = .secondary
+        ModelAPIClient.shared.fetchModelList(config: cfg) { result in
+            isTesting = false
+            switch result {
+            case .success(let models):
+                fetchedModels = models
+                if models.isEmpty {
+                    testStatus = "接口连通，但未返回任何模型（请检查该地址是否支持 /models）"
+                    testColor = .orange
+                } else {
+                    testStatus = "连接成功，获取到 \(models.count) 个模型"
+                    testColor = .green
+                    showingModelPicker = true
+                }
+            case .failure(let error):
+                testStatus = "连接失败：\(error)"
+                testColor = .red
+            }
+        }
+    }
+
     private func fetchUpstreamModels() {
         let cfg = makeConfig()
         onSave(cfg)
@@ -885,8 +1026,8 @@ struct ModelEditorView: View {
 
     /// v7.1.95：轻量测试连接（GET {base}/models 测连通+延迟）——saveAndTest 与 speedTestOnly 共用
     private func speedTestCore(config: ModelConfig) {
-        let base = config.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard let url = URL(string: base + "/models") else {
+        // 2026-11-02 通用接口：自动剥端点后缀 + 纯主机补 /v1（与主流程同一套解析）
+        guard let url = URL(string: ModelConfig.modelsEndpoint(config.baseURL)) else {
             isTesting = false
             testStatus = L10n.t("i18n_1103")
             testColor = .red
@@ -961,46 +1102,114 @@ struct QuickConfigPicker: View {
     }
 }
 
-// MARK: - 模型选择 Sheet
+// MARK: - 模型选择 Sheet（2026-11-02 改造：半屏弹出 + 搜索 + 滑动选择 + 分组标注）
 
 struct ModelPickerSheet: View {
     let models: [String]
     @Binding var selected: String
     @Environment(\.presentationMode) var presentationMode
+    @State private var query = ""
+
+    private var filtered: [String] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return models }
+        return models.filter { $0.localizedCaseInsensitiveContains(q) }
+    }
+
+    /// 按供应商前缀分组（deepseek-*/gpt-*/claude-*/glm-* 等），方便滑动查找
+    private var grouped: [(String, [String])] {
+        var dict: [String: [String]] = [:]
+        for m in filtered {
+            let key: String
+            let lower = m.lowercased()
+            if lower.hasPrefix("gpt") || lower.hasPrefix("o1") || lower.hasPrefix("o3") || lower.hasPrefix("o4") { key = "OpenAI" }
+            else if lower.hasPrefix("deepseek") { key = "DeepSeek" }
+            else if lower.hasPrefix("claude") { key = "Anthropic" }
+            else if lower.hasPrefix("glm") { key = "智谱 GLM" }
+            else if lower.hasPrefix("qwen") { key = "通义千问" }
+            else if lower.hasPrefix("kimi") || lower.hasPrefix("moonshot") { key = "Kimi" }
+            else if lower.hasPrefix("gemini") { key = "Gemini" }
+            else if lower.hasPrefix("grok") { key = "xAI" }
+            else if lower.hasPrefix("llama") || lower.hasPrefix("mixtral") || lower.hasPrefix("mistral") { key = "Meta/Mistral" }
+            else { key = "其他" }
+            dict[key, default: []].append(m)
+        }
+        let order = ["DeepSeek", "OpenAI", "Anthropic", "智谱 GLM", "通义千问", "Kimi", "Gemini", "xAI", "Meta/Mistral", "其他"]
+        return order.compactMap { k in dict[k].map { (k, $0.sorted()) } }
+    }
 
     var body: some View {
         CompatNav {
-            List(models, id: \.self) { m in
-                Button(action: {
-                    selected = m
-                    presentationMode.wrappedValue.dismiss()
-                }) {
-                    HStack {
-                        Text(m)
-                            .font(.system(.body, design: .monospaced))
-                        // v7.4.0-fix73d：视觉能力标注——对齐配置列表（v7.1.109-peers photo 图标），
-                        // 上游模型列表里一眼区分支持发图的模型（如 deepseek-v4-flash-vision-exp）
-                        if ModelConfig.modelSupportsVision(m) {
-                            Image(systemName: "photo")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundColor(.blue)
-                                .accessibilityLabel("Vision")
+            VStack(spacing: 0) {
+                // 搜索框
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.secondary)
+                    TextField("搜索模型", text: $query)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                    if !query.isEmpty {
+                        Button(action: { query = "" }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
                         }
-                        Spacer()
-                        if selected == m {
-                            Image(systemName: "checkmark")
-                                .foregroundColor(.blue)
-                        }
+                        .buttonStyle(.plain)
                     }
                 }
+                .padding(10)
+                .background(Color.secondary.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
+                List {
+                    ForEach(grouped, id: \.0) { section in
+                        Section(header: Text(section.0)) {
+                            ForEach(section.1, id: \.self) { m in
+                                Button(action: {
+                                    selected = m
+                                    presentationMode.wrappedValue.dismiss()
+                                }) {
+                                    HStack(spacing: 10) {
+                                        // 选中标记
+                                        Image(systemName: selected == m ? "checkmark.circle.fill" : "circle")
+                                            .foregroundColor(selected == m ? .blue : Color.secondary.opacity(0.45))
+                                        Text(m)
+                                            .font(.system(.body, design: .monospaced))
+                                            .foregroundColor(.primary)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        if ModelConfig.modelSupportsVision(m) {
+                                            Image(systemName: "photo")
+                                                .font(.system(size: 11, weight: .semibold))
+                                                .foregroundColor(.blue)
+                                                .accessibilityLabel("Vision")
+                                        }
+                                        Spacer()
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    if filtered.isEmpty {
+                        Text("没有匹配的模型")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .listStyle(.insetGrouped)
             }
-            .listStyle(.insetGrouped)
-            .navigationTitle(L10n.t("i18n_432"))
+            .navigationTitle("选择模型（\(models.count)）")
             .toolbar {
-                Button(L10n.t("ui_177")) { presentationMode.wrappedValue.dismiss() }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(L10n.t("ui_177")) { presentationMode.wrappedValue.dismiss() }
+                }
             }
         }
         .navigationViewStyle(.stack)
+        .sheetDetentsHeight(520)
     }
 }
 

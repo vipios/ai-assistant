@@ -36,14 +36,19 @@ jobs:
           echo "VER=$VER"
           IFS=. read -r MAJ MIN PAT <<< "$VER"
           PAT="${PAT:-0}"
+          # 2026-11-02 定制版：主版本号改为 1（原上游为 7）。
+          # 这里按当前 MAJ 递增 patch，不再写死 7.x，避免把 1.0.0 跳回 7.x。
           NEW="$MAJ.$MIN.$((PAT+1))"
           echo "NEW=$NEW"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $NEW" Support/Info.plist
           BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" Support/Info.plist)
+          BUILD="${BUILD:-0}"
+          # 若上游遗留的构建号非常大（如 491），定制版首次构建直接归零重新计数
+          if [ "$BUILD" -gt 1000 ]; then BUILD=0; fi
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $((BUILD+1))" Support/Info.plist
           echo "BUILD=$((BUILD+1))"
           git add Support/Info.plist
-          git -c user.name="TrollAgent CI" -c user.email="ci@trollagent.local" \
+          git -c user.name="AllInOne AI Assistant CI" -c user.email="ci@local" \
             commit -m "chore: bump version to $NEW [skip ci]"
           # v4.5.x：并发防撞——构建期间用户可能又 push 新代码（rebase 前 push 会被
           # fetch first 拒绝 → 构建红）。先 rebase 到远程最新再 push，保证 bump 一定落盘。

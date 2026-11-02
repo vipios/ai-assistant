@@ -105,7 +105,7 @@ extension GirlCharacter {
     /// （voice mode 只对话；要操作必须引导去文字聊天）
     var personaPrompt: String {
         let envFacts = """
-        Environment: iOS 16.3, TrollStore sideload (no jailbreak, no /var/jb). App: TrollAgent.
+        Environment: iOS 16.3, TrollStore sideload (no jailbreak, no /var/jb). App: All-in-One AI Assistant.
         You speak through voice TTS, so keep replies SHORT (1-2 sentences).
         NO TOOLS: voice mode has no tool access. You cannot run commands, open apps, or inspect the system.
         If the user asks for an operation (inject an app, run a command, check logs), say it must be done in the text chat and offer to phrase it for them.

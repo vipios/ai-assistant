@@ -19,8 +19,13 @@ final class DeviceReporter {
     }
 
     /// 是否启用上报
+    /// 2026-11-02 隐私加固：原实现用 UserDefaults.bool(forKey:)，只要历史上被打开过一次就永久为 true，
+    /// 用户很难察觉。改为「必须同时满足：开关为 true 且服务器地址已显式配置」才上报，
+    /// 且未配置时绝不发起任何连接（原实现也会先拼 URL 再返回，属于无谓尝试）。
     private var enabled: Bool {
-        UserDefaults.standard.bool(forKey: "stats_report_enabled")
+        let on = UserDefaults.standard.bool(forKey: "stats_report_enabled")
+        let url = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        return on && !url.isEmpty
     }
 
     private init() {}
@@ -43,7 +48,9 @@ final class DeviceReporter {
         let payload: [String: Any] = [
             "device_uuid": vendorID,
             "device_model": modelName,
-            "device_name": device.name,
+            // 2026-11-02 隐私加固：原实现上报 device.name（用户自取的手机名，常含真实姓名/单位），
+            // 统计安装量并不需要它 → 改为空串，服务器侧字段保留以兼容旧后台。
+            "device_name": "",
             "ios_version": device.systemVersion,
             "app_version": appVersion,
             "bundle_id": bundleId

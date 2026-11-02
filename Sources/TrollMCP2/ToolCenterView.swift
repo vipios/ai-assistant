@@ -66,7 +66,7 @@ struct ToolCenterView: View {
         ("insert_dylib", L10n.t("i18n_1187")),
         ("optool", L10n.t("i18n_1188")),
         ("ct_bypass", L10n.t("i18n_253")),
-        ("opainject", L10n.t("i18n_1189")),
+        ("opainject", L10n.t("i18n_1520")),
         ("install_name_tool", L10n.t("i18n_1190")),
         ("chown", L10n.t("i18n_254")),
         ("cp", L10n.t("i18n_255")),

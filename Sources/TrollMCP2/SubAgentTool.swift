@@ -695,7 +695,7 @@ final class SubAgentRunner {
     /// 子代理系统提示词——通用执行纪律 + 身份纪律特化（persona.systemPrompt）+ 工具集
     private func systemPrompt() -> String {
         var p = """
-        You are a subagent of TrollAgent executing a delegated task in an isolated session.
+        You are a subagent of All-in-One AI Assistant executing a delegated task in an isolated session.
         Your ONLY job is to complete the task below precisely, autonomously, using tools.
         RULES:
         1. The ONLY way to call a tool is an explicit structured function call. Never write calls as plain text.

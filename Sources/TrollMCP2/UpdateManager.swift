@@ -33,10 +33,15 @@ final class UpdateManager: ObservableObject {
 
     // v2.9.108：仓库与工作流改为动态读取（对齐 GitHub 账号页配置）
     // v7.1.285：默认仓库名 trollmcp2 → TrollAgent（旧名 API 301 / CDN 404），并迁移已存的旧值
+    // 2026-11-02 定制版：默认仓库改为空——本版把版本号重置为 1.0.0，
+    // 而上游作者仓库是 7.x，若仍沿用其默认值，「检查更新」会判定 7.x 更新并把人升级回原版，
+    // 把我们所有定制（改名/中转站/UI/隐私加固）全部冲掉。留空=不自动指向上游，
+    // 由用户在 设置→GitHub 里填自己的仓库后才会检查更新。
     private var repo: String {
-        let owner = UserDefaults.standard.string(forKey: "trollmcp2.github_repo_owner") ?? "zrrt"
-        var name = UserDefaults.standard.string(forKey: "trollmcp2.github_repo_name") ?? "TrollAgent"
-        if name == "trollmcp2" { name = "TrollAgent" }
+        let owner = UserDefaults.standard.string(forKey: "trollmcp2.github_repo_owner") ?? ""
+        var name = UserDefaults.standard.string(forKey: "trollmcp2.github_repo_name") ?? ""
+        if name == "trollmcp2" { name = "" }
+        guard !owner.isEmpty, !name.isEmpty else { return "" }
         return "\(owner)/\(name)"
     }
     private var workflow: String {
@@ -88,6 +93,15 @@ final class UpdateManager: ObservableObject {
     /// 检查更新：源1 GitHub API → 源2 jsDelivr CDN → 源3 镜像代理。
     /// 完成回调传是否发现新版本。
     func checkForUpdate(currentVersion: String, completion: ((Bool) -> Void)? = nil) {
+        // 2026-11-02 定制版：未配置自己的仓库时不做任何检查。
+        // 否则会拼出 /repos//actions 这种空 owner 请求、白跑一轮并可能误点亮更新红点。
+        guard !repo.isEmpty else {
+            isChecking = false
+            errorMessage = nil
+            updateAvailable = false
+            completion?(false)
+            return
+        }
         isChecking = true
         errorMessage = nil
         lastSource = nil

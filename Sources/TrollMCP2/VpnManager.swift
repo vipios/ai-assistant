@@ -86,7 +86,7 @@ final class VpnManager {
         NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, _ in
             guard let self = self else { return }
             VpnManager.vpnlog("loadAllFromPreferences count=\(managers?.count ?? -1)")
-            // 优先复用系统已注册的"TrollAgent 抓包 VPN"配置；没有则新建。
+            // 优先复用系统已注册的「全能AI助手 抓包 VPN」配置；没有则新建。
             self.manager = managers?.first(where: { $0.localizedDescription == L10n.t("i18n_831") })
                               ?? NETunnelProviderManager()
             self.manager.loadFromPreferences { [weak self] _ in
@@ -206,7 +206,7 @@ final class VpnManager {
                 return
             }
             VpnManager.vpnlog("saveToPreferences OK")
-            // v3.5.16g：等用户批准——saveToPreferences 会弹"TrollAgent 想添加VPN配置/允许/不允许"，
+            // v3.5.16g：等用户批准——saveToPreferences 会弹「全能AI助手 想添加VPN配置/允许/不允许」，
             // 但 save 的回调在用户点"允许"之前就返回。若立刻 startVPNTunnel，配置尚未批准生效
             // (connection.status==.invalid) → 系统报 NEVPNErrorConfigurationInvalid(1)。
             // 改为轮询等待状态从 .invalid 变为有效(.disconnected/.connecting)后再启动；
@@ -289,7 +289,7 @@ final class VpnManager {
     }
 
     /// fix3cy8：App 启动时清理残留 VPN 配置。
-    /// 上次开 VPN 后异常退出 / 旧版本关 VPN 只停隧道没删配置 → 系统里残留"TrollAgent 抓包 VPN"配置，
+    /// 上次开 VPN 后异常退出 / 旧版本关 VPN 只停隧道没删配置 → 系统里残留「全能AI助手 抓包 VPN」配置，
     /// 其隧道路由没撤销 → 局域网入站（8790）被残留 utun 路由黑洞 → 远程连不上。
     /// 这里启动即查：存在我们的配置且不在 connected 状态 → 删掉（路由随配置撤销）。
     static func cleanupStaleConfig() {
