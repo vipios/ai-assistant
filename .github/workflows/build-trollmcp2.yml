@@ -7,12 +7,9 @@ permissions:
   contents: write
 
 on:
+  # 2026-11-02：native 链默认关闭（见各 native job 的 if）。需要原生工具时，
+  # 在仓库 Settings → Variables 里加 NATIVE_BUILD=true，再手动跑本 workflow。
   workflow_dispatch:
-    inputs:
-      native:
-        description: '同时构建原生工具链（nmap/llvm/node/python，很慢，通常不需要）'
-        required: false
-        default: 'false'
   push:
     branches: [main]
 
@@ -390,7 +387,7 @@ jobs:
     # 2026-11-02：默认不跑原生工具链——属「有就带上、没有也出包」的可选件，
     # 但 native-python 要编 120 分钟的 iOS Python 且占 macOS 并发（免费账号上限 5），
     # 挂在自动流程上会把 build 挤掉。需要时手动 Run workflow 勾 native=true。
-    if: github.event.inputs.native == 'true'
+    if: vars.NATIVE_BUILD == 'true'
     # 2026-11-02：可选依赖——失败不该拖垮出包（macOS 并发上限 5，6 job 并行会被拒）
     continue-on-error: true
     timeout-minutes: 120
@@ -805,7 +802,7 @@ jobs:
     # 2026-11-02：默认不跑原生工具链——属「有就带上、没有也出包」的可选件，
     # 但 native-python 要编 120 分钟的 iOS Python 且占 macOS 并发（免费账号上限 5），
     # 挂在自动流程上会把 build 挤掉。需要时手动 Run workflow 勾 native=true。
-    if: github.event.inputs.native == 'true'
+    if: vars.NATIVE_BUILD == 'true'
     # 2026-11-02：串行排队，避免超出 macOS 并发上限
     needs: native-wheels
     # 上游 wheels 被 skip（python 失败）时也要跑，否则整条链断在这里
@@ -840,7 +837,7 @@ jobs:
     # 2026-11-02：默认不跑原生工具链——属「有就带上、没有也出包」的可选件，
     # 但 native-python 要编 120 分钟的 iOS Python 且占 macOS 并发（免费账号上限 5），
     # 挂在自动流程上会把 build 挤掉。需要时手动 Run workflow 勾 native=true。
-    if: github.event.inputs.native == 'true'
+    if: vars.NATIVE_BUILD == 'true'
     # 2026-11-02：串行排队，避免超出 macOS 并发上限
     needs: native-nmap
     if: always()
@@ -875,7 +872,7 @@ jobs:
     # 2026-11-02：默认不跑原生工具链——属「有就带上、没有也出包」的可选件，
     # 但 native-python 要编 120 分钟的 iOS Python 且占 macOS 并发（免费账号上限 5），
     # 挂在自动流程上会把 build 挤掉。需要时手动 Run workflow 勾 native=true。
-    if: github.event.inputs.native == 'true'
+    if: vars.NATIVE_BUILD == 'true'
     # 2026-11-02：串行排队，避免超出 macOS 并发上限
     needs: native-llvm
     if: always()
