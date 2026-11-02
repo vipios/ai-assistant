@@ -7,6 +7,9 @@ __MACOSX/
 dl_*
 artifacts
 
-CISH/include/
+# 2026-11-02：只忽略 CI 生成的 ish 头文件目录。
+# 之前是 `CISH/include/`（整体忽略）→ wrapper.h / module.modulemap 从未入库，
+# CI 跑 `#include "wrapper.h"` 必然 fatal error: 'wrapper.h' file not found。
+CISH/include/ish/
 TrollAgent.tipa
 TrollAgent.zip
