@@ -20,8 +20,10 @@ struct SelectableText: UIViewRepresentable {
     /// 点自定义菜单项的回调
     var onCopyAll: (() -> Void)? = nil
 
-    /// 菜单注入统一由 CopyableUITextView 自己处理（editMenu(for:in:) / UIMenuController），
+    /// 菜单注入统一由 CopyableUITextView 自己处理（editMenu(for:suggestedActions:) / UIMenuController），
     /// Coordinator 只保留配置转发的职责，避免两处都注册造成菜单项重复。
+    /// 说明：曾尝试用 UITextViewDelegate 的 editMenuForTextIn(suggestedActions:) 注入，
+    /// 但自建子类 + 自任 delegate 容易踩空（协议方法不被调用），改用重写自身方法最稳。
     final class Coordinator: NSObject {
         var copyAllTitle: String?
         var onCopyAll: (() -> Void)?
@@ -80,7 +82,7 @@ struct SelectableText: UIViewRepresentable {
 
 /// 2026-11-02：支持自定义长按菜单项的 UITextView 子类。
 /// 两条系统路径各自处理，互不干扰：
-///   · iOS 16+：重写 editMenu(for:in:)，在系统给出的菜单里追加「复制全文」。
+///   · iOS 16+：重写 editMenu(for:suggestedActions:)，在系统给出的菜单里追加「复制全文」。
 ///     不用 delegate 的 editMenuForTextIn——那要求 delegate 被系统识别，自己写的子类容易踩空；
 ///     重写自身方法最稳，且系统自带的拷贝/查询/翻译全部保留。
 ///   · iOS 15 ：UIMenuController.menuItems + canPerformAction 放行（旧机制）。
@@ -96,16 +98,20 @@ final class CopyableUITextView: UITextView {
 
     // MARK: - iOS 16+：往系统编辑菜单追加一项
 
+    /// 正确签名（编译器提示 expected 'for:suggestedActions:' 得出）：
+    ///   `func editMenu(for textRange: UITextRange, suggestedActions: [UIMenuElement]) -> UIMenu`
+    /// 返回**非可选** UIMenu（旧代码按 `(for:in:) -> UIMenu?` 写，两处都错）：
+    ///   · 方法名参数标签错 → "method does not override any method from its superclass"
+    ///   · 第二参类型错（CGRect vs [UIMenuElement]）→ 不能把 rect 传进来
     @available(iOS 16.0, *)
-    override func editMenu(for textRange: UITextRange, in rect: CGRect) -> UIMenu? {
-        let base = super.editMenu(for: textRange, in: rect)
+    override func editMenu(for textRange: UITextRange, suggestedActions: [UIMenuElement]) -> UIMenu {
+        let base = super.editMenu(for: textRange, suggestedActions: suggestedActions)
         guard hasCustomItem, let handler = onCopyAll else { return base }
         let title = copyAllTitle
         let copyAll = UIAction(title: title, image: UIImage(systemName: "doc.on.doc")) { _ in
             handler()
         }
-        // 系统菜单可能为 nil（没有可选内容时不弹菜单），此时也要能给出「复制全文」
-        guard let base else { return UIMenu(children: [copyAll]) }
+        // 系统菜单项全部保留（拷贝/查询/翻译），只在末尾追加「复制全文」
         return base.replacingChildren(base.children + [copyAll])
     }
 
@@ -120,7 +126,7 @@ final class CopyableUITextView: UITextView {
     override func resignFirstResponder() -> Bool {
         let ok = super.resignFirstResponder()
         if #available(iOS 16, *) {
-            // iOS16+ 走 editMenu(for:in:)，无需处理全局 menuItems
+            // iOS16+ 走 editMenu(for:suggestedActions:)，无需处理全局 menuItems
         } else {
             UIMenuController.shared.menuItems = nil
         }
