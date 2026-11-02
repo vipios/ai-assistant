@@ -38,6 +38,12 @@ final class BaseURLRouter {
 
     private var cache: [UUID: Decision] = [:]
     private let lock = NSLock()
+    /// 正在探测中的配置，防重入。
+    ///
+    /// 为什么要它：`effectiveBaseURL` 和 `effectiveModel` 是两个计算属性，
+    /// SwiftUI 一帧里可能把同一个 config 算好几次，每次走 unknown 分支都会发一个探测。
+    /// 不去重的话，打开设置页就对着网关打出一串 /health。
+    private var probing: Set<UUID> = []
 
     private init() {}
 
@@ -47,13 +53,24 @@ final class BaseURLRouter {
     ///
     /// 没填备用接口时原样返回 `baseURL`——完全向后兼容，老配置行为一点不变。
     func base(for config: ModelConfig) -> String {
+        resolve(for: config).base
+    }
+
+    /// 2026-11-03：一次性把「地址 + 是否走备用」算出来，**同一份判定结果**。
+    ///
+    /// 为什么必须成对返回：`effectiveBaseURL` 和 `effectiveModel` 是两个独立计算属性，
+    /// 各自调一次判定。若两次判定读到的缓存/网络状态不同（比如一次算完刚好网络变了、
+    /// 或者 unknown 分支一次触发了探测另一次没有），就会出现
+    /// 「用在家的地址 + 在外的模型名」——上游必定 404，且极难排查。
+    /// 所以判定只做一次，两个属性都从这一份结果取值。
+    func resolve(for config: ModelConfig) -> (base: String, useBackup: Bool) {
         let home = config.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let away = config.backupBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // 备用没填 = 没启用双通道，直接用主地址
-        guard !away.isEmpty else { return home }
+        guard !away.isEmpty else { return (home, false) }
         // 主地址空、备用有值：只能走备用（用户正在编辑中途也可能出现）
-        guard !home.isEmpty else { return away }
+        guard !home.isEmpty else { return (away, true) }
 
         let sig = netSignature()
 
@@ -63,23 +80,22 @@ final class BaseURLRouter {
         lock.unlock()
 
         if let hit, hit.netSig == sig, Date().timeIntervalSince(hit.at) < ttl {
-            return hit.useBackup ? away : home
+            return (hit.useBackup ? away : home, hit.useBackup)
         }
 
         // 2) 网段判定（零成本）。判不出来就先按「在家」走，
         //    同时扔一个后台探测去校正 —— 不能在这里阻塞用户发消息。
-        let verdict = lanVerdict(homeBase: home)
-        switch verdict {
+        switch lanVerdict(homeBase: home) {
         case .home:
             store(config.id, sig: sig, backup: false)
-            return home
+            return (home, false)
         case .away:
             store(config.id, sig: sig, backup: true)
-            return away
+            return (away, true)
         case .unknown:
             store(config.id, sig: sig, backup: false)
             probeInBackground(config: config, home: home, sig: sig)
-            return home
+            return (home, false)
         }
     }
 
@@ -96,6 +112,14 @@ final class BaseURLRouter {
         // 刚才用的就是备用地址 → 翻回主地址；否则翻到备用
         let usedBackup = base.trimmingCharacters(in: .whitespacesAndNewlines) == away
         store(config.id, sig: netSignature(), backup: !usedBackup)
+    }
+
+    /// 2026-11-03：当前这条配置是不是正在走备用（在外面）。
+    ///
+    /// 模型名必须跟着这个结论走 —— `effectiveModel` 靠它决定用 `model` 还是 `backupModel`。
+    /// 直接复用 `resolve(for:)`，保证和 `effectiveBaseURL` 是**同一份判定**，绝不各判各的。
+    func isUsingBackup(for config: ModelConfig) -> Bool {
+        resolve(for: config).useBackup
     }
 
     /// 清掉某个配置的缓存（用户改了地址 / 手动点「测试连接」时调）
@@ -162,6 +186,13 @@ final class BaseURLRouter {
     private func probeInBackground(config: ModelConfig, home: String, sig: String) {
         guard let url = Self.healthURL(from: home) else { return }
         let id = config.id
+
+        // 同一条配置已经在探了就直接返回，别对网关反复打
+        lock.lock()
+        if probing.contains(id) { lock.unlock(); return }
+        probing.insert(id)
+        lock.unlock()
+
         var req = URLRequest(url: url)
         req.timeoutInterval = 4
         req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -175,6 +206,8 @@ final class BaseURLRouter {
         session.dataTask(with: req) { [weak self] _, resp, err in
             defer { session.finishTasksAndInvalidate() }
             guard let self = self else { return }
+            self.lock.lock(); self.probing.remove(id); self.lock.unlock()
+
             let reachable = (resp as? HTTPURLResponse) != nil && err == nil
             // 网络指纹变了说明这是上一张网的结论，别覆盖新结论
             guard self.netSignature() == sig else { return }

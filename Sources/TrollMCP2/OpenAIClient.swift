@@ -245,7 +245,7 @@ final class OpenAIClient {
     }
     /// 当前模型上下文窗口：优先实测（RuntimeWindowTracker 动态收敛），无则默认
     private func contextWindowTokens() -> Int {
-        RuntimeWindowTracker.shared.measuredWindow(for: config.model) ?? Self.defaultContextWindow
+        RuntimeWindowTracker.shared.measuredWindow(for: config.effectiveModel) ?? Self.defaultContextWindow
     }
     /// v7.3.1-precision：输出预算预留（对齐 Claude/Codex——窗口 = input + output，
     /// 预算在发送前就给输出留位，避免"输入塞满 → 输出被截断/413"）
@@ -366,7 +366,7 @@ final class OpenAIClient {
             return "【\(roleLabel)】\n\(m.content)"
         }.joined(separator: "\n\n")
         var body: [String: Any] = [
-            "model": config.model,
+            "model": config.effectiveModel,
             "messages": [
                 ["role": "system", "content": summarySystem],
                 ["role": "user", "content": conversation]
@@ -649,23 +649,28 @@ final class OpenAIClient {
                 let secs = String(format: "%.1f", Double(el) / 1000.0)
                 NetworkLog.shared.log("\(self.config.name) request done (\(el)ms)")
                 onStatus?(L10n.t("status_response_done", secs))
+                // 2026-11-03：真实请求成功 = 顶栏绿灯最硬的证据，不用再单独探活
+                ConnectionMonitor.shared.report(success: true)
                 ModelStore.shared.breaker(for: self.config.id).recordSuccess(usedHalfOpenPermit: self.usedHalfOpenPermit)
                 UsageRecorder.shared.end(config: self.config, ok: true, elapsedMs: el, usage: self.lastUsage)
                 // v7.1.109-peers：实测自适应——成功请求把窗口上调（未收录/新迭代模型逐步收敛）
                 if let u = self.lastUsage, let p = u["prompt_tokens"] as? Int {
-                    RuntimeWindowTracker.shared.recordSuccess(model: self.config.model, promptTokens: p)
+                    RuntimeWindowTracker.shared.recordSuccess(model: self.config.effectiveModel, promptTokens: p)
                 }
                 // v7.1.109-peers：动态监测——带图请求成功 → 持久化标记支持视觉
                 if messages.contains(where: { !($0.imageDataURLs ?? []).isEmpty }) {
-                    VisionTracker.shared.record(model: self.config.model, supports: true)
+                    VisionTracker.shared.record(model: self.config.effectiveModel, supports: true)
                 }
             case .failure(let e):
                 NetworkLog.shared.log("\(self.config.name) request failed (\(el)ms): \(e.localizedDescription)")
+                // 2026-11-03：失败也回报。但 report(success:error:) 内部会区分——
+                // 429 限流 / 参数错说明链路是通的，不该把灯点红。
+                ConnectionMonitor.shared.report(success: false, error: e)
                 ModelStore.shared.breaker(for: self.config.id).recordFailure(usedHalfOpenPermit: self.usedHalfOpenPermit)
                 UsageRecorder.shared.end(config: self.config, ok: false, elapsedMs: el, error: e.localizedDescription)
                 // v7.1.109-peers：超限错误自动下调窗口（失败信号闭环——静态表追不上迭代时的保险）
                 if self.isContextOverflow(e) {
-                    RuntimeWindowTracker.shared.recordExceeded(model: self.config.model,
+                    RuntimeWindowTracker.shared.recordExceeded(model: self.config.effectiveModel,
                         promptTokens: UsageRecorder.shared.lastInputEstimate)
                 }
             }
@@ -959,7 +964,7 @@ final class OpenAIClient {
                 self.imagesStrippedForVLM = true
                 // v7.1.109-peers：动态监测——模型非视觉错误 → 持久化标记不支持，
                 // 下次 UI 不再让用户发图/发图前自动剥离（对齐 OpenMinis models.dev 能力表）
-                VisionTracker.shared.record(model: self.config.model, supports: false)
+                VisionTracker.shared.record(model: self.config.effectiveModel, supports: false)
                 var stripped = messages
                 for i in stripped.indices {
                     if !(stripped[i].imageDataURLs ?? []).isEmpty {
@@ -1053,12 +1058,12 @@ final class OpenAIClient {
 
         // OpenAI Chat Completions / Custom Endpoint
         if level >= 4 {
-            return ["model": config.model,
+            return ["model": config.effectiveModel,
                     "messages": repairDanglingToolCalls(trimmedMessages(sanitized)).map { messageDict($0) }]
         }
 
         var body: [String: Any] = [
-            "model": config.model,
+            "model": config.effectiveModel,
             "messages": repairDanglingToolCalls(trimmedMessages(sanitized)).map { messageDict($0) },
             tokenKey(level: level): config.maxTokens
         ]
@@ -1336,7 +1341,7 @@ final class OpenAIClient {
             applyAuth(to: &request)
 
             var body: [String: Any] = [
-                "model": config.model,
+                "model": config.effectiveModel,
                 "input": responsesInput(from: messages),
                 "max_output_tokens": config.maxTokens
             ]
@@ -1705,7 +1710,7 @@ final class OpenAIClient {
                                completion: @escaping (Result<ChatResult, Error>) -> Void) {
         // 2026-11-02 通用接口：用户若已填完整 Gemini 端点（…:generateContent）→ 直接改写为流式版，不再拼
         let rawBase = config.effectiveBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let encModel = config.model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? config.model
+        let encModel = config.effectiveModel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? config.effectiveModel
         var urlStr: String
         if rawBase.lowercased().contains(":generatecontent") {
             urlStr = rawBase
@@ -1967,7 +1972,7 @@ final class OpenAIClient {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             applyAuth(to: &request)
             var body: [String: Any] = [
-                "model": config.model,
+                "model": config.effectiveModel,
                 "input": responsesInput(from: messages),
                 "max_output_tokens": config.maxTokens,
                 "stream": false
@@ -2011,7 +2016,7 @@ final class OpenAIClient {
         applyAuth(to: &request)
 
         var body: [String: Any] = [
-            "model": config.model,
+            "model": config.effectiveModel,
             "max_tokens": config.maxTokens,
             "messages": trimmedMessages(messages).map { messageDict($0) }
         ]
@@ -2288,7 +2293,7 @@ final class OpenAIClient {
         applyAuth(to: &request)
 
         var body: [String: Any] = [
-            "model": config.model,
+            "model": config.effectiveModel,
             "input": responsesInput(from: messages),
             "max_output_tokens": config.maxTokens,
             "stream": true
@@ -2750,7 +2755,7 @@ final class UsageRecorder {
             "name": config.name,
             "provider": config.provider,
             "baseURL": config.baseURL,
-            "model": config.model,
+            "model": config.effectiveModel,
             "ok": ok,
             "elapsedMs": elapsedMs,
             "error": error,

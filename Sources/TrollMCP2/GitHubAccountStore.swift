@@ -72,13 +72,30 @@ final class GitHubAccountStore: ObservableObject {
     /// 内置默认 OAuth App Client ID (origina47487lhe-droid 注册的 "TrollAgent 线上编译"，Device Flow 实测有效）
     static let defaultClientID = "Ov23li890n3hM15edlcw"
 
+    /// 2026-11-03：本应用的更新源仓库。
+    /// 必须是**我们自己的**仓库——指向上游作者仓库会导致「检查更新」把定制版
+    /// 升级回原版，所有改动一并丢失。
+    static let defaultOwner = "vipios"
+    static let defaultRepo = "ai-assistant"
+
+    /// 上游作者的仓库名。出现这些值一律视为「尚未配置」，要迁移掉。
+    static let upstreamOwners = ["zrrt", "origina47487lhe-droid"]
+    static let upstreamRepos = ["TrollAgent", "trollmcp2"]
+
     private let apiBase = "https://api.github.com"
     private let loginBase = "https://github.com"
 
     init() {
         let def = UserDefaults.standard
-        repoOwner = def.string(forKey: ownerKey) ?? "zrrt"
-        repoName = def.string(forKey: repoKey) ?? "TrollAgent"
+        // 2026-11-03 修正（关键）：这里原来默认 zrrt/TrollAgent —— 上游作者的仓库。
+        //   危害链条：init 末尾会 persist() 把这个默认值写进 UserDefaults →
+        //   UpdateManager 读到 owner+name 非空 → 「检查更新」去查上游 7.x →
+        //   用户一升级，我们全部定制（双通道接口/状态灯/路由器页/中转站后台）被原版覆盖。
+        //   现在默认指向我们自己的仓库，只查自己的构建产物。
+        let dOwner = def.string(forKey: ownerKey) ?? Self.defaultOwner
+        let dName = def.string(forKey: repoKey) ?? Self.defaultRepo
+        repoOwner = dOwner
+        repoName = dName
         workflowId = def.string(forKey: workflowKey) ?? "build-trollmcp2.yml"
         branch = def.string(forKey: branchKey) ?? "main"
         // v2.9.117：空字符串也回退内置默认 (旧版删空保存会覆盖默认值，导致"未设置 Client ID"）
@@ -107,15 +124,19 @@ final class GitHubAccountStore: ObservableObject {
         // build-tweak workflow (已更名 build-trollmcp2.yml）。覆盖安装会保留旧 UserDefaults，
         // 这里检测到旧值自动纠正，避免线上编译 404 / 触发到错误仓库。
         let def = UserDefaults.standard
-        if def.string(forKey: ownerKey) == "origina47487lhe-droid" {
-            repoOwner = "zrrt"
+        // 2026-11-03：这是**最要紧**的一段迁移。
+        //   设备上装过旧版本的，UserDefaults 里存着 zrrt/TrollAgent（上游作者仓库），
+        //   「检查更新」就会查到 7.x 并提示升级——升上去我们的定制全没了。
+        //   这里把任何上游仓库值强改为我们自己的仓库，一次纠正。
+        if Self.upstreamOwners.contains(def.string(forKey: ownerKey) ?? "") {
+            repoOwner = Self.defaultOwner
+        }
+        if Self.upstreamRepos.contains(def.string(forKey: repoKey) ?? "")
+            || (def.string(forKey: repoKey) ?? "").isEmpty {
+            repoName = Self.defaultRepo
         }
         if def.string(forKey: workflowKey) == "build-tweak" {
             workflowId = "build-trollmcp2.yml"
-        }
-        // v7.1.285：仓库 trollmcp2 → TrollAgent 迁移（旧名 API 301 / jsDelivr CDN 404，检测更新收不到新版）
-        if def.string(forKey: repoKey) == "trollmcp2" {
-            repoName = "TrollAgent"
         }
         if let data = UserDefaults.standard.data(forKey: accountsKey),
            let saved = try? JSONDecoder().decode([GitHubAccount].self, from: data) {
@@ -309,7 +330,7 @@ final class GitHubAccountStore: ObservableObject {
                                          avatarURL: json["avatar_url"] as? String,
                                          token: token)
                 // v2.9.117：全新账号授权OK后，若 Owner 仍是内置默认值 → 自动填入当前登录账号
-                let isDefaultOwner = (self.repoOwner == "zrrt" || self.repoOwner == "origina47487lhe-droid")
+                let isDefaultOwner = Self.upstreamOwners.contains(self.repoOwner)
                 if isDefaultOwner && self.repoOwner != login {
                     self.repoOwner = login
                     self.persist()
@@ -364,7 +385,7 @@ final class GitHubAccountStore: ObservableObject {
                 let avatar = json["avatar_url"] as? String
                 let acct = GitHubAccount(login: login, name: name, avatarURL: avatar, token: token)
                 // v2.9.117：全新账号授权OK后，若 Owner 仍是内置默认值 → 自动填入当前登录账号
-                let isDefaultOwner = (self.repoOwner == "zrrt" || self.repoOwner == "origina47487lhe-droid")
+                let isDefaultOwner = Self.upstreamOwners.contains(self.repoOwner)
                 if isDefaultOwner && self.repoOwner != login {
                     self.repoOwner = login
                     self.persist()

@@ -497,6 +497,8 @@ struct ModelEditorView: View {
     @State private var baseURL: String
     /// 2026-11-03：备用接口地址（在外面时用）——空 = 不启用双通道
     @State private var backupBaseURL: String
+    /// 2026-11-03：备用模型名称（在外面时用）——空 = 在外沿用主模型名
+    @State private var backupModel: String
     @State private var apiKey: String
     @State private var model: String
     @State private var authMethod: String
@@ -522,6 +524,10 @@ struct ModelEditorView: View {
     @State private var isTesting = false
     @State private var fetchedModels: [String] = []
     @State private var showingModelPicker = false
+    /// 2026-11-03：弹窗选择的目标是主模型还是备用模型
+    @State private var pickerForBackup = false
+    /// 备用接口自己的模型清单（拉的是备用接口的上游模型，和主接口可能不是同一批）
+    @State private var fetchedBackupModels: [String] = []
     @State private var savedFlag = false
 
     private let providers = ["openai", "deepseek", "anthropic", "custom"]
@@ -536,6 +542,7 @@ struct ModelEditorView: View {
         _apiProtocol = State(initialValue: config?.apiProtocol ?? (p?.protocol ?? "OpenAI Chat Completions"))
         _baseURL = State(initialValue: config?.baseURL ?? (p?.baseURL ?? ""))
         _backupBaseURL = State(initialValue: config?.backupBaseURL ?? "")
+        _backupModel = State(initialValue: config?.backupModel ?? "")
         _apiKey = State(initialValue: config?.apiKey ?? "")
         _model = State(initialValue: config?.model ?? (p?.model ?? ""))
         _authMethod = State(initialValue: config?.authMethod ?? (p?.auth ?? "Bearer"))
@@ -641,15 +648,38 @@ struct ModelEditorView: View {
                     }
                     .padding(.vertical, 4)
 
-                    // 模型名称：点击整行 → 拉取上游模型 → 弹出滑动选择列表
-                    Button(action: { fetchAndPickModels() }) {
+                    // 模型名称：点击整行 → 拉取上游模型列表 → 弹窗里挑（上游全量模型都在里面）
+                    // 2026-11-03 用户要求：标题改成「模型名称」；点击是弹窗形式。
+                    Button(action: { openPicker(forBackup: false) }) {
                         HStack {
                             Text(L10n.t("i18n_421"))
                                 .foregroundColor(.primary)
                             Spacer()
-                            Text(model.isEmpty ? "点击获取模型列表" : model)
+                            Text(model.isEmpty ? "点击选择模型" : model)
                                 .font(.system(.body, design: .monospaced))
                                 .foregroundColor(model.isEmpty ? .secondary : .primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isTesting)
+
+                    // 2026-11-03 用户要求：模型名称下方再加一行「备用模型」。
+                    //   接口地址 ↔ 模型名称（在家用）
+                    //   备用接口   ↔ 备用模型（在外面用）
+                    // 这样在家和在外的模型可以是两个不同的，各自指定。
+                    Button(action: { openPicker(forBackup: true) }) {
+                        HStack {
+                            Text("备用模型")
+                                .foregroundColor(.primary)
+                            Spacer()
+                            Text(backupModel.isEmpty ? "选填 · 在外面时用这个" : backupModel)
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundColor(backupModel.isEmpty ? .secondary : .primary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                             Image(systemName: "chevron.up.chevron.down")
@@ -674,36 +704,10 @@ struct ModelEditorView: View {
                         .foregroundColor(.secondary)
                 }
 
-                // v7.1.107：备用模型组——主模型请求失败（网络/超时/鉴权/熔断/5xx 且未产出内容）
-                // 自动按序切换重发。对齐 OpenMinis 组路由 fallback 思想。
-                Section(header: sectionHeader("备用模型（失败自动切换）")) {
-                    let others = ModelStore.shared.configs.filter { $0.id != (config?.id ?? UUID()) }
-                    if others.isEmpty {
-                        Text("先保存其他模型配置，再回来勾选备用模型")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    ForEach(others) { m in
-                        Toggle(isOn: Binding(
-                            get: { fallbackIDs.contains(m.id) },
-                            set: { on in
-                                if on {
-                                    if !fallbackIDs.contains(m.id) { fallbackIDs.append(m.id) }
-                                } else {
-                                    fallbackIDs.removeAll { $0 == m.id }
-                                }
-                            }
-                        )) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(m.name)
-                                    .font(.subheadline)
-                                Text(m.model)
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                    }
-                }
+                // 2026-11-03 用户要求：整块「备用模型（失败自动切换）」删除、界面不再显示。
+                // 现在「在家/在外」的模型切换由「模型名称 / 备用模型」这两行负责
+                // （配 接口地址 / 备用接口），不再靠这里的 fallback 勾选列表。
+                // fallbackIDs 字段本身保留：老配置仍然能读，模型组的兜底链也照旧生效。
 
                 // v7.1.280-fix：老手固定模式——默认自适应（新手），可关自动修正/限降级链（老手要可预测）
                 Section(header: sectionHeader("固定模式（老手可选）")) {
@@ -829,7 +833,13 @@ struct ModelEditorView: View {
                 QuickConfigPicker { applyPreset(name: $0) }
             }
             .sheet(isPresented: $showingModelPicker) {
-                ModelPickerSheet(models: fetchedModels, selected: $model)
+                // 2026-11-03：一个弹窗服务两行——主模型 / 备用模型。
+                // 绑定的清单也跟着切换：备用模型拉的是备用接口的上游，
+                // 两个接口的模型可能完全不同（家里中转站 vs 外面中转站）。
+                ModelPickerSheet(
+                    models: pickerForBackup ? fetchedBackupModels : fetchedModels,
+                    selected: pickerForBackup ? $backupModel : $model
+                )
             }
         }
     }
@@ -975,6 +985,7 @@ struct ModelEditorView: View {
             apiProtocol: apiProtocol,
             baseURL: baseURL,
             backupBaseURL: backupBaseURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            backupModel: backupModel.trimmingCharacters(in: .whitespacesAndNewlines),
             apiKey: apiKey,
             model: model,
             authMethod: authMethod,
@@ -1032,16 +1043,70 @@ struct ModelEditorView: View {
     /// 2026-11-02：一键拉取上游模型并弹出滑动选择列表
     /// 流程：填好接口地址 + API Key → 点「测试连接」或「模型名称」→ GET {base}/models
     /// → 成功则弹出 ModelPickerSheet（滑动选择），失败则在行下方显示错误原因
+    ///
+    /// 2026-11-03：同时判定「在家 / 在外面」，把结论写进状态栏——
+    /// 用户点「测试连接」就能顺带确认当前网络该走哪条接口，
+    /// 不用自己猜「我在家用的是哪个地址」。
     private func fetchAndPickModels() {
         let cfg = makeConfig()
+        let who = makeAtHomeNote()
         isTesting = true
-        testStatus = "正在获取模型列表…"
+        testStatus = "正在测试连接（\(who)）…"
         testColor = .secondary
         ModelAPIClient.shared.fetchModelList(config: cfg) { result in
             isTesting = false
             switch result {
             case .success(let models):
                 fetchedModels = models
+                if models.isEmpty {
+                    testStatus = "\(who) · 接口连通，但未返回任何模型（请检查该地址是否支持 /models）"
+                    testColor = .orange
+                } else {
+                    testStatus = "\(who) · 连接成功，获取到 \(models.count) 个模型"
+                    testColor = .green
+                    pickerForBackup = false
+                    showingModelPicker = true
+                }
+            case .failure(let error):
+                testStatus = "\(who) · 连接失败：\(error)"
+                testColor = .red
+            }
+        }
+    }
+
+    /// 2026-11-03：点「模型名称 / 备用模型」→ 拉该地址的上游模型 → 弹窗挑。
+    ///
+    /// 备用模型拉的是**备用接口**的模型清单：家里中转站和外面中转站
+    /// 未必是同一批模型，用主接口的清单去挑备用模型会挑到不存在的名字。
+    private func openPicker(forBackup: Bool) {
+        pickerForBackup = forBackup
+
+        // 该行对应的接口地址：主模型配主接口，备用模型配备用接口
+        let targetBase = forBackup
+            ? backupBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            : baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !targetBase.isEmpty else {
+            testStatus = forBackup
+                ? "先填上面的「备用接口」，才能获取它的模型列表"
+                : "先填「接口地址」，才能获取模型列表"
+            testColor = .orange
+            return
+        }
+
+        // 备用接口还没填时，退回用主地址取清单（至少让用户能看到可选模型）
+        var probe = makeConfig()
+        probe.baseURL = targetBase
+        probe.backupBaseURL = ""
+        probe.model = forBackup ? (backupModel.isEmpty ? model : backupModel) : model
+
+        isTesting = true
+        testStatus = "正在获取模型列表（\(makeAtHomeNote())）…"
+        testColor = .secondary
+        ModelAPIClient.shared.fetchModelList(config: probe) { result in
+            isTesting = false
+            switch result {
+            case .success(let models):
+                if forBackup { fetchedBackupModels = models } else { fetchedModels = models }
                 if models.isEmpty {
                     testStatus = "接口连通，但未返回任何模型（请检查该地址是否支持 /models）"
                     testColor = .orange
@@ -1054,6 +1119,17 @@ struct ModelEditorView: View {
                 testStatus = "连接失败：\(error)"
                 testColor = .red
             }
+        }
+    }
+
+    /// 「在家 / 在外面」的一句人话结论，测试连接时直接显示。
+    private func makeAtHomeNote() -> String {
+        let home = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !home.isEmpty else { return "未填接口地址" }
+        switch BaseURLRouter.shared.lanVerdict(homeBase: home) {
+        case .home:    return "判定：在家，走接口地址"
+        case .away:    return "判定：在外面，走备用接口"
+        case .unknown: return "判定：主接口非内网地址，先试主接口"
         }
     }
 
@@ -1178,6 +1254,8 @@ struct ModelPickerSheet: View {
     @Binding var selected: String
     @Environment(\.presentationMode) var presentationMode
     @State private var query = ""
+    /// 2026-11-03：手填模型名的独立输入（与搜索框分开，免得互相干扰）
+    @State private var handInput = ""
 
     private var filtered: [String] {
         let q = query.trimmingCharacters(in: .whitespaces)
@@ -1263,9 +1341,30 @@ struct ModelPickerSheet: View {
                         }
                     }
                     if filtered.isEmpty {
-                        Text("没有匹配的模型")
+                        Text(models.isEmpty ? "还没有模型清单：点行尾箭头重新拉取，或直接在下面手填" : "没有匹配的模型")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
+                    }
+
+                    // 2026-11-03：手填兜底。
+                    // 上游 /models 未必返回（有的中转关了这接口，或关键模型不在清单里），
+                    // 用户得能自己敲一个名字，不能因为拉不到列表就选不了模型。
+                    // 独立字段 handInput：不跟搜索框共用，避免「搜着搜着搜出个模型名」的歧义。
+                    Section(header: Text("手动输入")) {
+                        HStack(spacing: 8) {
+                            TextField("直接填模型 ID，如 gpt-4o-mini", text: $handInput)
+                                .font(.system(.subheadline, design: .monospaced))
+                                .autocapitalization(.none)
+                                .disableAutocorrection(true)
+                            Button("用这个") {
+                                let t = handInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard !t.isEmpty else { return }
+                                selected = t
+                                presentationMode.wrappedValue.dismiss()
+                            }
+                            .font(.subheadline.weight(.semibold))
+                            .disabled(handInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
                     }
                 }
                 .listStyle(.insetGrouped)

@@ -712,7 +712,7 @@ enum L10n {
             tbl["i18n_418"] = ["zh": "测速失败 · %dms", "en": "Speed test failed · %dms"]
             tbl["i18n_419"] = ["zh": "标准键:供应商键", "en": "Standard key:provider key"]
             tbl["i18n_919"] = ["zh": "名称", "en": "Name"]
-            tbl["i18n_421"] = ["zh": "模型名", "en": "Model Name"]
+            tbl["i18n_421"] = ["zh": "模型名称", "en": "Model Name"]
             tbl["i18n_422"] = ["zh": "鉴权方式", "en": "Auth Method"]
             tbl["i18n_423"] = ["zh": "连接测试", "en": "Connection Test"]
             tbl["i18n_424"] = ["zh": "添加模型", "en": "Add Model"]

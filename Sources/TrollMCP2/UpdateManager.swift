@@ -41,6 +41,11 @@ final class UpdateManager: ObservableObject {
         let owner = UserDefaults.standard.string(forKey: "trollmcp2.github_repo_owner") ?? ""
         var name = UserDefaults.standard.string(forKey: "trollmcp2.github_repo_name") ?? ""
         if name == "trollmcp2" { name = "" }
+        // 2026-11-03 硬保险：不管 UserDefaults 里存着什么，绝不允许更新源指向上游作者。
+        //   只要指过去，「检查更新」就会报 7.x，用户一点升级 = 定制版被原版覆盖。
+        //   这是最后一道闸——GitHubAccountStore 那边已经有迁移，这里是双保险。
+        if GitHubAccountStore.upstreamOwners.contains(owner) { return "" }
+        if GitHubAccountStore.upstreamRepos.contains(name) { return "" }
         guard !owner.isEmpty, !name.isEmpty else { return "" }
         return "\(owner)/\(name)"
     }

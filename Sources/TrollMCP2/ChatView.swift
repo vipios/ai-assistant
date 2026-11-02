@@ -9,6 +9,8 @@ import UniformTypeIdentifiers
 struct ChatView: View {
     @ObservedObject private var store = ConversationStore.shared
     @ObservedObject private var modelStore = ModelStore.shared
+    /// 2026-11-03：顶栏那颗状态灯的真实数据源（探活 / 真实请求结果双向回报）
+    @ObservedObject private var conn = ConnectionMonitor.shared
     @ObservedObject private var tts = TTSService.shared
     // 2026-11-02：语音输入（复用 GirlVoice 的 SFSpeechRecognizer 实现，不另造一套）
     @ObservedObject private var voice = GirlVoice.shared
@@ -88,9 +90,12 @@ struct ChatView: View {
                             .lineLimit(1)
                         Button(action: { showModelPicker = true }) {
                             HStack(spacing: 4) {
-                                Image(systemName: "circle.fill")
+                                // 2026-11-03 用户要求：这颗灯要「变成真实的」。
+                                // 以前写死 green——断网、密钥错、路由器关机都还亮着，等于骗人。
+                                // 现在由 ConnectionMonitor 驱动：真连通绿、连不上红、没配模型灰。
+                                Image(systemName: conn.state == .unknown ? "circle" : "circle.fill")
                                     .font(.system(size: 7))
-                                    .foregroundColor(.green)
+                                    .foregroundColor(connTint)
                                 // 2026-11-02 按用户要求：顶栏显示模型名（不是供应商名）
                                 Text(modelStore.defaultConfig?.model ?? L10n.t("i18n_1032"))
                                     .font(.caption2)
@@ -378,11 +383,31 @@ struct ChatView: View {
         // v2.9.10：网络恢复 / 回前台提示（配合后台自动重连）
         .onReceive(NotificationCenter.default.publisher(for: AppLifecycleMonitor.networkRestored)) { _ in
             showToast(L10n.t("i18n_1034"))
+            // 网络刚恢复：灯必须立刻重判，不能等下个 25 秒周期
+            conn.refreshNow()
         }
         .onReceive(NotificationCenter.default.publisher(for: AppLifecycleMonitor.willEnterForeground)) { _ in
             if AppLifecycleMonitor.shared.isNetworkAvailable {
                 showToast(L10n.t("i18n_1035"))
             }
+            conn.refreshNow()
+        }
+        .onAppear {
+            // 只在聊天页可见时跑周期探活，离开就停——省电、也省一次往返
+            conn.startAutoProbe()
+        }
+        .onDisappear {
+            conn.stopAutoProbe()
+        }
+    }
+
+    /// 顶栏状态灯的灯色。
+    /// 绿=真的连通；红=连不上；灰=还没探过 / 没配模型。
+    private var connTint: Color {
+        switch conn.state {
+        case .online:  return .green
+        case .offline: return .red
+        case .unknown: return .secondary
         }
     }
 

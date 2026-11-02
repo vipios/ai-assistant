@@ -20,6 +20,13 @@ struct ModelConfig: Codable, Identifiable, Hashable {
     /// 空串 = 未启用双通道（老配置全部是这个值，行为与改前完全一致）。
     /// 判定逻辑见 BaseURLRouter：网段 → 后台探测 → 失败回切，三层。
     var backupBaseURL: String = ""
+    /// 2026-11-03：备用模型名称——和 backupBaseURL 配成一对。
+    ///
+    /// 用户诉求原话：「模型名称下方再添加一个备用模型，接口地址对应模型名称，
+    /// 备用地址对应备用模型，这样我在家可以选择指定的模型，在外我也可以选择指定的模型」。
+    ///
+    /// 空串 = 在外时沿用主模型名（只是换地址，不换模型）。
+    var backupModel: String = ""
     var apiKey: String
     var model: String             // gpt-4o-mini
     var authMethod: String        // Bearer / API Key / Body api_key / Body token / Query token / None
@@ -34,6 +41,21 @@ struct ModelConfig: Codable, Identifiable, Hashable {
     /// 没填备用地址时它就是 `baseURL`，行为与改前完全一致。
     var effectiveBaseURL: String {
         BaseURLRouter.shared.base(for: self)
+    }
+
+    /// 2026-11-03：**真正该用的模型名**——和 `effectiveBaseURL` 严格配对。
+    ///
+    /// 在家 → `model`（配 baseURL）；在外 → `backupModel`（配 backupBaseURL）。
+    /// 备用模型名没填时沿用主模型名（只换地址、不换模型），
+    /// 这样只想换地址不想换模型的用户什么都不用多填。
+    ///
+    /// 走哪一条由 BaseURLRouter 统一决定，模型名和地址必须同源 ——
+    /// 否则会出现「用在家地址 + 在外模型名」这种上游必定 404 的组合。
+    var effectiveModel: String {
+        let bm = backupModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bm.isEmpty else { return model }
+        // 只有真的切到备用地址时才用备用模型名
+        return BaseURLRouter.shared.isUsingBackup(for: self) ? bm : model
     }
 
     /// v7.1.107：备用模型组（fallback 链）——主模型请求失败（网络/超时/鉴权/熔断/5xx，
@@ -111,7 +133,7 @@ struct ModelConfig: Codable, Identifiable, Hashable {
     }
 
     init(id: UUID = UUID(), name: String, provider: String, apiProtocol: String = "OpenAI Chat Completions",
-         baseURL: String, backupBaseURL: String = "", apiKey: String, model: String,
+         baseURL: String, backupBaseURL: String = "", backupModel: String = "", apiKey: String, model: String,
          authMethod: String = "Bearer",
          isDefault: Bool = false, temperature: Double = 0.2, maxTokens: Int = 16384, compatLevel: Int = 0,
          contextTokens: Int = 128000, group: String = "default", paramAliases: [String: String] = [:],
@@ -123,6 +145,7 @@ struct ModelConfig: Codable, Identifiable, Hashable {
         self.apiProtocol = apiProtocol
         self.baseURL = baseURL
         self.backupBaseURL = backupBaseURL
+        self.backupModel = backupModel
         self.apiKey = apiKey
         self.model = model
         self.authMethod = authMethod
@@ -150,6 +173,8 @@ struct ModelConfig: Codable, Identifiable, Hashable {
         baseURL = try c.decode(String.self, forKey: .baseURL)
         // 2026-11-03：旧配置没有这个键 → 默认空串（= 不启用双通道）
         backupBaseURL = (try? c.decode(String.self, forKey: .backupBaseURL)) ?? ""
+        // 2026-11-03：旧配置没有这个键 → 默认空串（在外时沿用主模型名）
+        backupModel = (try? c.decode(String.self, forKey: .backupModel)) ?? ""
         apiKey = try c.decode(String.self, forKey: .apiKey)
         model = try c.decode(String.self, forKey: .model)
         let decodedAuthMethod = (try? c.decode(String.self, forKey: .authMethod)) ?? "Bearer"
@@ -869,18 +894,18 @@ final class ModelAPIClient {
         if proto == "Anthropic Messages" {
             // Anthropic 协议要求必须传 max_tokens
             body = [
-                "model": config.model,
+                "model": config.effectiveModel,
                 "max_tokens": 64,
                 "messages": [["role": "user", "content": "hi"]]
             ]
         } else if proto == "OpenAI Responses" {
             body = [
-                "model": config.model,
+                "model": config.effectiveModel,
                 "input": [["role": "user", "content": "hi"]]
             ]
         } else {
             body = [
-                "model": config.model,
+                "model": config.effectiveModel,
                 "messages": [["role": "user", "content": "hi"]]
             ]
         }
@@ -928,7 +953,7 @@ final class ModelAPIClient {
 
         let body: [String: Any]
         if proto == "Anthropic Messages" {
-            body = ["model": config.model, "max_tokens": 4096, "messages": messages]
+            body = ["model": config.effectiveModel, "max_tokens": 4096, "messages": messages]
         } else if proto == "OpenAI Responses" {
             var msgs: [[String: Any]] = []
             for m in messages {
@@ -937,9 +962,9 @@ final class ModelAPIClient {
                     "content": [[ "type": "input_text", "text": (m["content"] as? String) ?? "" ]]
                 ])
             }
-            body = ["model": config.model, "input": msgs]
+            body = ["model": config.effectiveModel, "input": msgs]
         } else {
-            body = ["model": config.model, "messages": messages, "temperature": 0.3]
+            body = ["model": config.effectiveModel, "messages": messages, "temperature": 0.3]
         }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
