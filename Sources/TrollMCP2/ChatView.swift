@@ -69,6 +69,7 @@ struct ChatView: View {
     /// 手指轻轻一滑就变成每帧一次全量重建 → 帧率崩、CPU 满载、手机发烫。
     /// 现在只有 FloatingScrollButtons 这一个小组件订阅它，主 body 完全不读。
     @StateObject private var scroll = ChatScrollState()
+
     var body: some View {
         CompatNav {
             VStack(spacing: 0) {
@@ -647,7 +648,14 @@ struct ChatView: View {
     /// 这是 Apple 官方推荐的解法（"try breaking up the expression"）。
     @ViewBuilder
     private func bubble(for msg: ChatMessage) -> some View {
-        let fast = scroll.isScrollingFast
+        // 注意：isScrollingFast 在 scroll.activity 上，**不在 scroll 上**。
+        // 这是刻意拆分（见 ChatScrollState.swift）：它跟 offset/contentHeight 放一起的话，
+        // body 一订阅就会连每帧的 offset 更新一起收，等于把修好的滚动性能问题退回去。
+        //
+        // 内层 activity 的变更由 ChatScrollState.init 里的 sink 转发到外层 objectWillChange，
+        // 所以这里直接读是能触发刷新的（之前漏了这段转发，导致 fastScrolling 恒为 false，
+        // 「滚动降级为轻量 Text」的优化从未生效 —— 这是滑动卡死的真正原因）。
+        let fast = scroll.activity.isScrollingFast
         let sel = selectionMode
         let picked = selectedIds.contains(msg.id)
         let streaming = store.streamingMessageId == msg.id

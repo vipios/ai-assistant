@@ -1,5 +1,7 @@
 import SwiftUI
 import UIKit
+// activity.objectWillChange 的 sink 需要 Combine
+import Combine
 
 /// 2026-11-03：滚动位置/内容高度/视口高度的独立状态容器。
 ///
@@ -34,6 +36,33 @@ final class ChatScrollState: ObservableObject {
     /// 连 offset 的每帧更新一起收 —— 直接把本类开头注释修好的性能问题退回去。
     /// 拆开后 offset 那条高频链谁都不读，isScrollingFast 每轮滚动只翻转两次。
     let activity = ChatScrollActivity()
+
+    /// 2026-11-03 **关键修复**：把 activity 的变化转发到本对象的 objectWillChange。
+    ///
+    /// 之前这里没有这段转发，后果很严重：
+    /// ChatView 里写的是 `@StateObject private var scroll = ChatScrollState()`，
+    /// 它订阅的是**外层** scroll 的 objectWillChange。而 isScrollingFast 变更
+    /// 只发生在内层 activity 上 → 外层收不到通知 → ChatView.body 不重新求值
+    /// → `fastScrolling` 永远是初始值 false。
+    /// 也就是说「滚动时降级为轻量 Text」这个优化**从来没生效过**，
+    /// 快速上滑时几十个 UITextView 照样疯进疯出，这就是用户反复反馈的
+    /// 「上下滑动完全没反应 / 卡死」的真实原因。
+    ///
+    /// 注意不能简单地把 activity 改成 @Published：那会连带每帧 offset 一起刷新。
+    /// 这里只转发 activity 的变更（每轮滚动仅两次），不影响 offset 的高频链。
+    private var activityObserver: AnyCancellable?
+
+    init() {
+        // receive(on: RunLoop.main)：objectWillChange 的 sink 必须在主线程调用
+        // SwiftUI 的刷新链。noteScrolled 是从 KVO 回调进来的（本来就在主线程），
+        // 但显式声明调度更安全——绝不能在后台线程触发 @Published 的 willChange，
+        // 否则是 "Publishing changes from background threads is not allowed" 崩溃。
+        activityObserver = activity.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+    }
 
     /// 由 ScrollGeometryBridge 的 onOffset 调用（每帧都会调，必须极轻）。
     func noteScrolled() {
