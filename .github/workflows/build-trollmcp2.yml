@@ -58,6 +58,21 @@ jobs:
             commit -m "chore: bump version to $NEW [skip ci]"
           # v4.5.x：并发防撞——构建期间用户可能又 push 新代码（rebase 前 push 会被
           # fetch first 拒绝 → 构建红）。先 rebase 到远程最新再 push，保证 bump 一定落盘。
+          #
+          # 2026-11-03 **必读**：这一步之前一直红，报
+          #   error: cannot pull with rebase: You have unstaged changes.
+          # 原因：仓库加了 .gitattributes（*.swift text eol=lf 等）。checkout 之后
+          # Git 会按新规则重新归一工作区换行，于是**一堆文件显示为已修改**（纯 CRLF→LF）。
+          # `git pull --rebase` 见到未暂存改动就直接拒绝 → 整个 job 红，
+          # 后面 20 多个编译步骤全被跳过（所以之前那次"失败"其实**根本没编译**）。
+          #
+          # 修法：rebase 前把这些无关的换行噪音丢掉（只在 CI runner 里丢，
+          # 不影响任何人本地工作区）。
+          # 注意顺序：bump 已经在上面 commit 过了，所以 --hard HEAD 只会丢掉
+          # 归一化产生的换行噪音，不会丢版本号修改。
+          git checkout -- .
+          git reset --hard HEAD
+
           git pull --rebase "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
           echo ">>> version bumped to $NEW (build $((BUILD+1)))"
