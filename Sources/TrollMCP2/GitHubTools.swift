@@ -122,32 +122,143 @@ final class GitHubAccountStatusTool: MCPTool {
     }
 }
 
-/// 触发线上编译 (build-trollmcp2 或 build-tweak）
+/// 触发线上编译 (build-trollmcp2 打包 / build-ios-dylib 编 dylib、deb)
+///
+/// 2026-11-03 重写：以前这个工具只会发 `{"ref":…, "inputs":{"tweak":…}}`，
+/// 只认 build-tweak.yml 那一个写法。用户在手机上要求「编译一个 dylib / 插件 deb」
+/// 时，模型没有任何可用入口 —— 要么被指去 build-tool.yml（那个 `|| true`
+/// 吞掉所有编译错误，永远绿但产物为空），要么干脆告诉用户「手机编不了」。
+/// 现在按 workflow 分派参数：
+///   · build-ios-dylib.yml → name / kind / source_mode / source / inline_code / arch / min_ios
+///   · build-trollmcp2.yml → 无 inputs（只是重新打包 IPA）
+///   · build-tweak.yml     → tweak 名
 final class GitHubTriggerBuildTool: MCPTool {
     let definition = ToolDefinition(
         name: "github.trigger_build",
-        summary: "Trigger GitHub Actions CI build (compile All-in-One AI Assistant IPA or tweak). Use for: build new version of the assistant, compile a tweak dylib. Don't use for: run local shell commands (use shell.exec), download files (use fs tools). Prerequisite: GitHub account must be logged in. Example: user says 'build new version' → trigger build-trollmcp2.yml workflow.",
-        parameters: ["workflow": "Workflow file: build-trollmcp2.yml (default, build IPA) or build-tweak.yml (build tweak dylib)", "tweak": "Only for tweak builds: tweak project name (e.g. CompileProbe / ProbeAgent)", "ref": "Git branch to build (default main)"], verified: true, category: "build")
+        summary: "Trigger GitHub Actions build: compile a dylib/deb/tweak, or repackage the app IPA. Use for: build tweak/dylib/deb from source code, build new IPA version. Don't use for: run local shell commands (use shell.exec), download files (use github.download_artifact). NOTE: iPhone cannot compile iOS Mach-O locally (needs macOS SDK) — this workflow IS the compile chain. Prerequisite: GitHub account logged in. Example: user says 'compile this into a dylib' → workflow=build-ios-dylib.yml, kind=dylib, source_mode=inline, inline_code=<source>.",
+        parameters: [
+            "workflow": "Workflow file: build-ios-dylib.yml (compile dylib/deb/binary — use this for tweaks and plugins) or build-trollmcp2.yml (repackage IPA, default) or build-tweak.yml (legacy)",
+            "name": "Artifact name for dylib/deb build (e.g. MyTweak)",
+            "kind": "For build-ios-dylib: dylib | deb | binary",
+            "source_mode": "For build-ios-dylib: inline (source given in inline_code) | self (this repo) | remote (source=repo URL)",
+            "source": "For source_mode=remote: repository URL",
+            "inline_code": "For source_mode=inline: the full source code. Multiple files separated by lines '// ==== FILE: name.ext ====' (ObjC/C/Swift/Makefile all supported)",
+            "project": "Alternative to inline_code: a tweak project name under workspace/projects/<name>; its files are collected and packed automatically (use this after project.generate_tweak)",
+            "arch": "For build-ios-dylib: arm64 (default) | arm64e",
+            "min_ios": "For build-ios-dylib: minimum iOS version (default 15.0)",
+            "tweak": "Legacy, only for build-tweak.yml: tweak project name",
+            "ref": "Git branch (default main)"
+        ], verified: true, category: "build")
     func invoke(_ params: [String: Any]) throws -> [String: Any] {
         guard let token = GHConfig.activeToken else {
             throw MCPError.failed("not logged in to GitHub, log in first in Settings - GitHub Account")
         }
         let owner = GHConfig.repoOwner
         let repo = GHConfig.repoName
-        let workflow = params["workflow"] as? String ?? GHConfig.workflowId
+        // workflow 显式传入优先；否则按「有没有源码要编」自动选。
+        // 自动选很重要：模型经常忘了传 workflow，然后 IPA 打包流程跑起来，
+        // 用户等了十分钟拿到一个和上次一样的包。
+        var workflow = params["workflow"] as? String ?? ""
+        if workflow.isEmpty {
+            let hasCode = !(params["inline_code"] as? String ?? "").isEmpty
+            workflow = hasCode ? "build-ios-dylib.yml" : GHConfig.workflowId
+        }
         let ref = params["ref"] as? String ?? GHConfig.branch
         var body: [String: Any] = ["ref": ref]
-        if let tweak = params["tweak"] as? String, !tweak.isEmpty {
-            body["inputs"] = ["tweak": tweak]
+
+        var inputs: [String: String] = [:]
+        if workflow.contains("ios-dylib") {
+            var code = params["inline_code"] as? String ?? ""
+            // 2026-11-03：project=xxx 时直接从工作区读工程源码，自动拼成 inline_code。
+            // 为什么要这个：模型先 project.generate_tweak 生成 Makefile/Tweak.x/plist，
+            // 然后得自己把三个文件按 "// ==== FILE: x ====" 拼成一个大字符串再塞进
+            // inline_code —— 少一个文件、漏一行分隔符，CI 就编不出来，而模型很难自查。
+            // 交给这里读目录，比让模型手拼可靠得多。
+            if code.isEmpty, let proj = params["project"] as? String, !proj.isEmpty {
+                code = Self.collectProjectSource(proj) ?? ""
+                if code.isEmpty {
+                    throw MCPError.failed("project '\(proj)' not found or empty under workspace/projects/\(proj)")
+                }
+            }
+            let mode = (params["source_mode"] as? String)
+                ?? (code.isEmpty ? "self" : "inline")
+            if code.isEmpty && mode == "inline" {
+                throw MCPError.failed("source_mode=inline but inline_code is empty: pass the source code in inline_code, or pass project=<name> to auto-collect it from the workspace")
+            }
+            inputs["name"] = params["name"] as? String
+                ?? params["project"] as? String
+                ?? "build_\(Int(Date().timeIntervalSince1970))"
+            inputs["kind"] = params["kind"] as? String ?? "dylib"
+            inputs["source_mode"] = mode
+            inputs["source"] = params["source"] as? String ?? ""
+            inputs["inline_code"] = code
+            inputs["arch"] = params["arch"] as? String ?? "arm64"
+            inputs["min_ios"] = params["min_ios"] as? String ?? "15.0"
+            // GitHub 单 input 上限 64KB，超了 dispatch 会 422 而报错信息很含糊。
+            if code.utf8.count > 60000 {
+                throw MCPError.failed("inline_code is \(code.utf8.count) bytes, over GitHub's 64KB workflow-input limit. Reduce the sources (drop build junk / split into multiple builds)")
+            }
+        } else if workflow.contains("build-tweak") {
+            if let tweak = params["tweak"] as? String, !tweak.isEmpty {
+                inputs["tweak"] = tweak
+            }
         }
+        if !inputs.isEmpty { body["inputs"] = inputs }
+
         let (code, json) = GHAPI.post(
             "\(GHConfig.apiBase)/repos/\(owner)/\(repo)/actions/workflows/\(workflow)/dispatches",
             token: token, body: body)
         if code == 204 {
-            return ["triggered": true, "workflow": workflow, "ref": ref, "note": "triggered, wait a few seconds then check progress with github.fetch_runs"]
+            return ["triggered": true, "workflow": workflow, "ref": ref,
+                    "inputs": inputs,
+                    "note": "triggered. Wait ~10s then poll with github.fetch_runs; when conclusion=success call github.download_artifact to fetch the dylib/deb."]
         }
-        return ["triggered": false, "http_status": code, "message": (json?["message"] as? String) ?? "trigger failed"]
+        return ["triggered": false, "workflow": workflow,
+                "http_status": code,
+                "message": (json?["message"] as? String) ?? "trigger failed",
+                "hint": code == 404
+                    ? "workflow file not found or not on the default branch yet; push it first"
+                    : (code == 403 ? "token lacks 'workflow' scope" : "")]
     }
+
+    /// 把一个 tweak 工程的源码目录打成一个 inline_code 字符串。
+    ///
+    /// 为什么要它：CI 端（build-ios-dylib.yml）用
+    /// `// ==== FILE: 名字 ====` 这种分隔符还原多文件工程。
+    /// 由模型手拼太容易出错（漏文件、写错分隔行、把 Makefile 的 tab 换成空格），
+    /// 每错一次就要白等一轮 CI（macOS runner 排队 + 编译 3~8 分钟）。
+    /// 这里直接读盘，按固定顺序、原样保留缩进（Makefile 必须是真 tab）。
+    static func collectProjectSource(_ name: String) -> String? {
+        let root = Workspace.root.appendingPathComponent("projects/\(name)")
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: root.path) else { return nil }
+        // 只要这些类型；其它（.o/.dSYM/隐藏文件）一律不收，否则会把体积和
+        // 64KB 上限浪费在中间产物上。
+        let exts: Set<String> = ["x", "xm", "m", "mm", "c", "cc", "cpp", "h", "hpp",
+                                 "swift", "plist", "storyboard", "xib", "json", "sh"]
+        let exact: Set<String> = ["Makefile", "makefile", "GNUmakefile"]
+        var parts: [String] = []
+        let base = root.standardizedFileURL.path.count
+        if let en = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey],
+                                  options: [.skipsHiddenFiles]) {
+            for case let f as URL in en {
+                let isFile = (try? f.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile ?? false
+                guard isFile else { continue }
+                let fn = f.lastPathComponent
+                guard exact.contains(fn) || exts.contains(f.lowercasedExtension) else { continue }
+                guard let txt = try? String(contentsOf: f, encoding: .utf8) else { continue }
+                var rel = String(f.standardizedFileURL.path.dropFirst(base))
+                if rel.hasPrefix("/") { rel.removeFirst() }
+                parts.append("// ==== FILE: \(rel) ====\n\(txt)")
+            }
+        }
+        if parts.isEmpty { return nil }
+        return parts.joined(separator: "\n")
+    }
+}
+
+private extension URL {
+    var lowercasedExtension: String { pathExtension.lowercased() }
 }
 
 /// 查询最近线上编译进度

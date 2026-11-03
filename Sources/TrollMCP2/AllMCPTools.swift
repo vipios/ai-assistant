@@ -441,7 +441,7 @@ final class InjectionExecTool: MCPTool {
         verified: true, category: "injection", prerequisites: [
             "MANDATORY for encrypted (App Store) targets — cryptid=1 apps REJECT injection (TARGET_INCOMPATIBLE). Complete this order BEFORE enable: ① app command=decrypt ② app command=replace_decrypted ③ launch the app (inject only works on a launched process) ④ then inject command=enable. Skipping any step fails with the next-step pointing here.",
             "before enable/static confirm the app is installed and bundle_id valid (app status)",
-            "hook full chain: project generate_tweak → write tweaks/<name>/Tweak.x → github trigger_build (build-tweak.yml) → download_artifact → copy the dylib into the target app's data container Documents (workspace is blocked for mmap) → inject enable with that path → restart verify"])
+            "hook full chain: project generate_tweak → write tweaks/<name>/Tweak.x → github trigger_build (workflow=build-ios-dylib.yml, kind=dylib, source_mode=inline, inline_code=<the Tweak.x source>) → download_artifact → copy the dylib into the target app's data container Documents (workspace is blocked for mmap) → inject enable with that path → restart verify"])
 
     func invoke(_ params: [String: Any]) throws -> [String: Any] {
         guard let command = params["command"] as? String else {

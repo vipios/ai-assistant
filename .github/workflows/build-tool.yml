@@ -1,21 +1,43 @@
-# v4.3.65：通用原生 iOS 工具交叉编译（由 tool.install 触发，best-effort）
-# 用法: AI 调用 tool.install name:<tool> source:<git 仓库 URL>
-#   → workflow_dispatch inputs: name / source
-#   → macOS runner 上设置 iphoneos SDK 环境后 make 交叉编译（arm64 iOS）
-#   → 产物打包为 artifact tool-<name>，github.download_artifact 可取回
-# 注意：Makefile 类 C 工程可直接交叉编译；依赖复杂或产物为空时，请改用 PC 交叉编译或自写 dylib（inject load_dylib）
+# 2026-11-03 重写：这个 workflow 以前是「假成功」的源头
+#
+# 旧版的问题（必须记下来，别再犯）：
+#   · `make -j4 2>&1 | tail -80 || true`  ← 管道 + || true 双重吞错
+#     make 编不过 → tail 照样成功退出 → 整步是绿的
+#   · `find ... -exec cp {} out/ \; || true`  ← 找不到产物也不报错
+#   · upload-artifact 用 `if-no-files-found: warn` ← out/ 空着也照样「成功」
+#   结果：AI 说「编译好了」，用户点下载拿到一个空 zip，或者 Git 上是一片绿叉
+#   但 artifact 里什么都没有。这是「工具调用不对」最气人的一种。
+#
+# 现在的做法：
+#   · 编译失败 → ::error:: + exit 1（红叉，且有明确报错）
+#   · 没产出任何东西 → exit 1
+#   · 产物逐个用 `file` 验证必须是 Mach-O（iOS 可执行 / dylib / .a archive）
+#   · 只保留真正给 iOS 编出来的，不把 macOS 的中间产物混进去
+#
+# 用法（保留旧接口，AI 已有的调用不用改）:
+#   AI: tool.install name:<tool> source:<git 仓库 URL>
+#   或直接 dispatch: name / source / make_args
+
 name: build-tool
 
 on:
   workflow_dispatch:
     inputs:
       name:
-        description: 'Tool name（artifact 前缀 tool-<name>）'
+        description: '工具名（artifact 前缀 tool-<name>）'
         required: true
         default: jtool2
       source:
         description: 'Git 仓库 URL（含 Makefile）'
         required: true
+      make_args:
+        description: '额外的 make 参数（留空 = -j4）'
+        required: false
+        default: ''
+      arch:
+        description: '目标架构：arm64 / arm64e'
+        required: false
+        default: arm64
 
 jobs:
   build:
@@ -29,25 +51,115 @@ jobs:
 
       - name: Prepare iOS SDK env
         run: |
-          echo "SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_ENV"
-          echo "CC=$(xcrun --sdk iphoneos --find clang)" >> "$GITHUB_ENV"
-          echo "CXX=$(xcrun --sdk iphoneos --find clang++)" >> "$GITHUB_ENV"
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC=$(xcrun --sdk iphoneos --find clang)
+          CXX=$(xcrun --sdk iphoneos --find clang++)
+          {
+            echo "SDKROOT=$SDK"
+            echo "CC=$CC"
+            echo "CXX=$CXX"
+            echo "CPP=$CC -E"
+            echo "AR=$(xcrun --sdk iphoneos --find ar)"
+            echo "RANLIB=$(xcrun --sdk iphoneos --find ranlib)"
+            echo "STRIP=$(xcrun --sdk iphoneos --find strip)"
+            # 关键的三个：没有它们，绝大多数 Makefile 会拿宿主 macOS 的
+            # 架构去编，编出来是 x86_64 的 macOS 二进制，装到 iPhone 上直接
+            # 「Bad CPU type」。之前一直没设，所以产物永远是错的。
+            echo "CFLAGS=-arch ${ARCH} -isysroot $SDK -miphoneos-version-min=14.0 -O2"
+            echo "CXXFLAGS=-arch ${ARCH} -isysroot $SDK -miphoneos-version-min=14.0 -O2 -std=c++17"
+            echo "LDFLAGS=-arch ${ARCH} -isysroot $SDK -miphoneos-version-min=14.0"
+          } >> "$GITHUB_ENV"
+        env:
+          ARCH: ${{ github.event.inputs.arch }}
 
-      - name: Make (best-effort cross-compile arm64 iOS)
+      - name: Make (real cross-compile, fail = fail)
         working-directory: src
+        env:
+          EXTRA: ${{ github.event.inputs.make_args }}
         run: |
-          make -j4 2>&1 | tail -80 || true
+          set -euo pipefail
+          # 注意：这里**不能**用 `| tail -N`。
+          # `make ... | tail` 的退出码是 tail 的（几乎总是 0），
+          # make 失败会被彻底吞掉 —— 这正是旧版「永远绿」的根因。
+          # 要截断日志就用 tee 写文件，再在该步失败时把尾部打出来。
+          ARGS="${EXTRA:--j4}"
+          echo "== make $ARGS =="
+          if ! make $ARGS > /tmp/make.log 2>&1; then
+            echo "::error::make 失败（退出码非 0），下面是最后 120 行"
+            tail -120 /tmp/make.log
+            exit 1
+          fi
+          tail -40 /tmp/make.log
 
-      - name: Stage binaries
+      - name: Collect and verify artifacts
+        env:
+          NAME: ${{ github.event.inputs.name }}
         run: |
+          set -euo pipefail
           mkdir -p out
-          find src -maxdepth 4 -type f \( -perm -111 -o -name "*.dylib" -o -name "*.a" \) \
-            -not -path "*/.git/*" -exec cp {} out/ \; 2>/dev/null || true
+          # 收集候选：可执行位 / .dylib / .a
+          # 排除 macOS 自家的东西（.o 中间文件、dSYM、.dylib 里宿主架构的）
+          while IFS= read -r f; do
+            cp "$f" out/ 2>/dev/null || true
+          done < <(find src -maxdepth 6 -type f \
+                    \( -perm -111 -o -name "*.dylib" -o -name "*.a" \) \
+                    -not -path "*/.git/*" -not -path "*/node_modules/*" \
+                    -not -name "*.sh" -not -name "*.py" -not -name "*.pl" 2>/dev/null || true)
+
+          echo "== 收集到的候选 =="
           ls -la out || true
+
+          if [ -z "$(ls -A out 2>/dev/null)" ]; then
+            echo "::error::make 跑完了但没有任何产物（out/ 为空）——编译实际没成功，不再静默放行"
+            echo "----- make.log 最后 120 行 -----"
+            tail -120 /tmp/make.log || true
+            exit 1
+          fi
+
+          # 逐个校验：必须是 iOS 的 Mach-O，不是 macOS 的
+          ok=0; bad=0
+          for f in out/*; do
+            [ -f "$f" ] || continue
+            desc=$(file -b "$f" || echo unknown)
+            echo "$f  ->  $desc"
+            case "$desc" in
+              *"Mach-O"*)
+                # 架构校验：必须含 arm64，且不能是 x86_64 的 macOS 产物
+                if echo "$desc" | grep -q "x86_64" && ! echo "$desc" | grep -q "arm64"; then
+                  echo "::warning::$f 是 x86_64（macOS 宿主架构），装到 iPhone 上会 Bad CPU type"
+                  rm -f "$f"; bad=$((bad+1)); continue
+                fi
+                ok=$((ok+1))
+                ;;
+              *"current ar archive"*)
+                # .a 静态库无法可靠判架构，只验大小
+                sz=$(stat -f%z "$f" 2>/dev/null || echo 0)
+                if [ "$sz" -lt 512 ]; then
+                  echo "::warning::$f 静态库体积异常（$sz bytes）"; rm -f "$f"; bad=$((bad+1))
+                else
+                  ok=$((ok+1))
+                fi
+                ;;
+              *)
+                echo "::warning::$f 不是 Mach-O / 静态库（$desc），已剔除"
+                rm -f "$f"; bad=$((bad+1))
+                ;;
+            esac
+          done
+
+          if [ "$ok" -eq 0 ]; then
+            echo "::error::没有任何有效 iOS 产物（剔除 $bad 个）——检查上面的 make 日志"
+            exit 1
+          fi
+          echo "OK: $ok 个有效产物，剔除 $bad 个"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: tool-${{ github.event.inputs.name }}
-          path: out
-          if-no-files-found: warn
+          path: out/
+          # error 而不是 warn：走到这一步 out/ 必然非空（上一步已经校验），
+          # 若为空说明真出问题了，必须红。
+          if-no-files-found: error
+          retention-days: 14
