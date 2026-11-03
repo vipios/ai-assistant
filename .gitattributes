@@ -1,0 +1,44 @@
+# 2026-11-03 新增。
+#
+# 为什么必须有这个文件：
+# 本仓库有 Windows 侧和 macOS CI（GitHub Actions）两侧在改。
+# Windows 上 core.autocrlf 默认会把 .sh 也转成 CRLF，而 CI 是 macOS——
+# CRLF 的 shell 脚本一执行就报 "bad interpreter: /bin/bash^M: no such file or directory"，
+# 整个出包直接失败，而且报错信息完全看不出是换行符问题。
+#
+# 之前一直没配这个文件，是靠运气没踩到。这次既然在改 build-ipa.sh，顺手定死。
+
+# 所有 shell 脚本强制 LF
+*.sh       text eol=lf
+*.bash     text eol=lf
+*.command  text eol=lf
+
+# Python 脚本同理（CI 里用 python3 跑）
+*.py       text eol=lf
+
+# 构建配置强制 LF
+*.yml      text eol=lf
+*.yaml     text eol=lf
+Makefile   text eol=lf
+*.mk       text eol=lf
+
+# 打包/签名相关配置
+*.plist    text eol=lf
+*.entitlements text eol=lf
+*.xcconfig text eol=lf
+
+# Swift 源码：统一 LF（跨平台一致，避免 diff 噪音）
+*.swift    text eol=lf
+
+# 真·二进制，不要碰
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.car      binary
+*.dylib    binary
+*.deb      binary
+*.ipa      binary
+*.tipa     binary
+*.zip      binary
+*.framework/** binary
