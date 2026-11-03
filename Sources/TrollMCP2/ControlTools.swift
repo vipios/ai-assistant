@@ -268,6 +268,125 @@ final class ControlAgentTools {
     }
 }
 
+// MARK: - v7.1.287：系统级引擎A（免注入）——与注入式 ControlAgent 结合成统一 control 接口
+// 复用已有：HIDTouchInjector(IOHID 系统级触摸) + LSApplicationWorkspace(系统启动) + UIThreadBridge(剪贴板)。
+// 目标 app 未注入时，control.tap/swipe 自动回退到本引擎；sys_launch 免注入启动任意 app。
+// verified:false——需真机验证 entitlement 生效（TrollStore 无沙箱 + com.apple.private.hid.client.event-dispatch）。
+
+final class SystemUIEngine {
+    static let shared = SystemUIEngine()
+
+    /// 系统级启动 app（TrollStore 可用：LSApplicationWorkspace 私有 API，不依赖 shell/注入）
+    func launch(bundleId: String) -> [String: Any] {
+        if let wsClass = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
+           let ws = wsClass.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue() as? NSObject,
+           ws.responds(to: NSSelectorFromString("openApplicationWithBundleID:")) {
+            _ = ws.perform(NSSelectorFromString("openApplicationWithBundleID:"), with: bundleId)
+            return ["ok": true, "engine": "system", "method": "LSApplicationWorkspace", "bundle_id": bundleId,
+                    "hint": "launched via system (no injection). Then use control.sys_tap / sys_swipe to control it, or control.screenshot / control.ui_tree (if injected) to read screen."]
+        }
+        return ["ok": false, "engine": "system", "error": "LSApplicationWorkspace unavailable",
+                "hint": "fallback: control.inject the target app then use injected control"]
+    }
+
+    /// 系统级 HID 点击当前前台 app（无需注入目标 app）
+    func tap(x: Double, y: Double) -> [String: Any] {
+        let ok = HIDTouchInjector.shared.tap(x: Float(x), y: Float(y))
+        return ["ok": ok, "engine": "system_hid", "tap_x": x, "tap_y": y,
+                "hint": ok ? "system HID tap (no injection)" : "HID unavailable: needs com.apple.private.hid.client.event-dispatch entitlement (TrollStore ok)"]
+    }
+
+    /// 系统级 HID 滑动当前前台 app
+    func swipe(x1: Double, y1: Double, x2: Double, y2: Double, durationMs: Int = 300) -> [String: Any] {
+        let ok = HIDTouchInjector.shared.swipe(x1: Float(x1), y1: Float(y1), x2: Float(x2), y2: Float(y2), durationMs: durationMs)
+        return ["ok": ok, "engine": "system_hid",
+                "hint": ok ? "system HID swipe" : "HID unavailable (entitlement?)"]
+    }
+
+    /// 剪贴板写入（输入文字兜底：未注入时把搜索词 paste 到搜索框）
+    func paste(_ text: String) -> [String: Any] {
+        UIThreadBridge.paste(text)
+        return ["ok": true, "engine": "system", "clipboard": text,
+                "hint": "text copied to clipboard. In the target app long-press the input field and choose Paste."]
+    }
+}
+
+// MARK: - v7.1.290：系统 HID 独立工具（免注入，AI 枚举顶层工具即见）
+// 与 control 大工具的 sys_* 子命令等价，但注册为独立顶层工具 (sys.launch/sys.tap/sys.swipe/sys.paste)，
+// 解决"AI 枚举顶层工具看不到系统 HID 接口"的可见性问题（真机可直接 sys.tap / sys.swipe 测）。
+// verified:false——HID 依赖 com.apple.private.hid.client.event-dispatch entitlement，TrollStore 可行待真机验证。
+
+final class SysLaunchTool: MCPTool {
+    let definition = ToolDefinition(
+        name: "sys.launch",
+        summary: "Launch any app via the system (LSApplicationWorkspace private API, NO injection needed). Use for: opening an app without injecting ControlAgent, then drive it with sys.tap / sys.swipe (system HID). Don't use for: launching when you need to read the app's semantic tree (inject first, use control.inject).",
+        parameters: ["bundle_id": "Target app bundle ID (required), e.g. com.ss.iphone.ugc.Aweme (抖音)"],
+        verified: false, category: "ui_control")
+    func invoke(_ params: [String: Any]) throws -> [String: Any] {
+        guard let bid = params["bundle_id"] as? String, !bid.isEmpty else {
+            throw MCPError.invalidParams("bundle_id required. Usage: sys.launch bundle_id:'com.ss.iphone.ugc.Aweme'")
+        }
+        AuditLog.shared.log("sys.launch", detail: bid)
+        return SystemUIEngine.shared.launch(bundleId: bid)
+    }
+}
+
+final class SysTapTool: MCPTool {
+    let definition = ToolDefinition(
+        name: "sys.tap",
+        summary: "System-level HID tap at (x,y) on the current foreground app — REAL screen touch via IOHID digitizer, NO injection needed (works on any app). Coordinates are screen POINTS (logical points, not ratio): get them from control.find / control.ui_tree frame and tap the center (x+w/2, y+h/2). Don't use for: semantic taps by role/label (use control.tap_selector / control.tap_text).",
+        parameters: [
+            "x": "X in screen points (required, Number)",
+            "y": "Y in screen points (required, Number)"
+        ],
+        verified: false, category: "ui_control")
+    func invoke(_ params: [String: Any]) throws -> [String: Any] {
+        guard let x = params["x"] as? Double, let y = params["y"] as? Double else {
+            throw MCPError.invalidParams("x,y required. Usage: sys.tap x:200 y:400 (screen points)")
+        }
+        AuditLog.shared.log("sys.tap", detail: "\(x),\(y)")
+        return SystemUIEngine.shared.tap(x: x, y: y)
+    }
+}
+
+final class SysSwipeTool: MCPTool {
+    let definition = ToolDefinition(
+        name: "sys.swipe",
+        summary: "System-level HID swipe from (x1,y1) to (x2,y2) on the current foreground app — REAL screen gesture via IOHID digitizer, NO injection needed. Use for: swiping an app that is not injected, e.g. swipe up on 抖音 (x1:mid y1:high, x2:mid y2:low). Coordinates are screen POINTS (not ratio). Don't use for: injected apps (use control.swipe).",
+        parameters: [
+            "x1": "Start X in screen points (required)",
+            "y1": "Start Y in screen points (required)",
+            "x2": "End X in screen points (required)",
+            "y2": "End Y in screen points (required)",
+            "duration_ms": "Swipe duration in ms (optional, default 300)"
+        ],
+        verified: false, category: "ui_control")
+    func invoke(_ params: [String: Any]) throws -> [String: Any] {
+        guard let x1 = params["x1"] as? Double, let y1 = params["y1"] as? Double,
+              let x2 = params["x2"] as? Double, let y2 = params["y2"] as? Double else {
+            throw MCPError.invalidParams("x1,y1,x2,y2 required. Usage: sys.swipe x1:200 y1:700 x2:200 y2:200 (screen points)")
+        }
+        AuditLog.shared.log("sys.swipe", detail: "\(x1),\(y1)->\(x2),\(y2)")
+        return SystemUIEngine.shared.swipe(x1: x1, y1: y1, x2: x2, y2: y2,
+                                           durationMs: (params["duration_ms"] as? Int) ?? 300)
+    }
+}
+
+final class SysPasteTool: MCPTool {
+    let definition = ToolDefinition(
+        name: "sys.paste",
+        summary: "Put text into the system clipboard (UIThreadBridge). Use for: typing into a search box when the target app is NOT injected — copy the search text, then in the app long-press the input field and choose Paste. Don't use for: typing into an injected app (use control.type).",
+        parameters: ["text": "Text to copy to clipboard (required)"],
+        verified: false, category: "ui_control")
+    func invoke(_ params: [String: Any]) throws -> [String: Any] {
+        guard let text = params["text"] as? String, !text.isEmpty else {
+            throw MCPError.invalidParams("text required. Usage: sys.paste text:'iphone4'")
+        }
+        AuditLog.shared.log("sys.paste", detail: "\(text.count) chars")
+        return SystemUIEngine.shared.paste(text)
+    }
+}
+
 // MARK: - MCP 工具注册
 
 final class ControlInjectTool: MCPTool {
@@ -303,6 +422,154 @@ final class ControlScreenshotTool: MCPTool {
     }
 }
 
+// MARK: - v7.1.287：语义控制辅助（番茄小说/通用 App 闭环：role+name → 唯一节点 → 点中心）
+// 解决根因：书名/书城文字在子 UILabel，可点的是父 cell/button；把子树文本聚合到可点父，并做唯一性匹配。
+// 适配 v7.1.281+ 的节点字段：accessibility_role / accessibility_label / is_accessibility_element / frame。
+
+enum ControlSemantics {
+    /// 可点击角色白名单（小写）。UILabel/static_text 本身通常不可点，可点父多为 cell/button/tab。
+    static let actionableRoles: Set<String> = [
+        "button", "link", "tab", "cell", "collection_view_cell", "table_view_cell",
+        "collectionviewcell", "tableviewcell", "image_button", "switch", "tabbar",
+        "scrollview", "text_view", "slider", "text_field", "image"
+    ]
+
+    /// 提取节点 role（accessibility_role / role / type，小写）
+    static func role(of node: [String: Any]) -> String? {
+        if let r = node["accessibility_role"] as? String { return r.lowercased() }
+        if let r = node["role"] as? String { return r.lowercased() }
+        if let r = node["type"] as? String { return r.lowercased() }
+        return nil
+    }
+
+    /// 节点自身文本（text / label / accessibilityLabel / accessibility_label）
+    /// 借鉴 Appium：accessibilityIdentifier 是最稳定位锚（与 UI 文本解耦），纳入定位
+    static func nodeText(_ node: [String: Any]) -> String {
+        (node["text"] as? String) ?? (node["label"] as? String)
+            ?? (node["accessibilityLabel"] as? String) ?? (node["accessibility_label"] as? String)
+            ?? (node["accessibilityIdentifier"] as? String) ?? (node["identifier"] as? String) ?? ""
+    }
+
+    /// 聚合子树全部文本（自身+后代，去空去重保序）——让"书城/书名"落到可点父
+    static func subtreeText(_ node: [String: Any]) -> String {
+        var parts: [String] = []
+        collectText(node, into: &parts)
+        var seen = Set<String>()
+        var out: [String] = []
+        for p in parts where !p.isEmpty {
+            if !seen.contains(p) { seen.insert(p); out.append(p) }
+        }
+        return out.joined(separator: " ")
+    }
+
+    private static func collectText(_ node: [String: Any], into parts: inout [String]) {
+        let t = nodeText(node)
+        if !t.isEmpty { parts.append(t) }
+        if let ch = node["children"] as? [[String: Any]] {
+            for c in ch { collectText(c, into: &parts) }
+        }
+    }
+
+    /// 是否可点击：enabled 显式 false 先拦截（借鉴 WebDriverAgent predicate enabled==true）；
+    /// 其次 isHittable / is_accessibility_element；再可点角色；缺省（leaf+有 frame）保守视为可点
+    static func isActionable(_ node: [String: Any]) -> Bool {
+        if let en = node["enabled"] as? Bool, !en { return false }
+        if let en = node["isEnabled"] as? Bool, !en { return false }
+        if let h = node["isHittable"] as? Bool { return h }
+        if let h = node["hittable"] as? Bool { return h }
+        if let a = node["is_accessibility_element"] as? Bool { return a }
+        if let r = role(of: node), actionableRoles.contains(r) { return true }
+        let hasChildren = (node["children"] as? [[String: Any]])?.isEmpty == false
+        let hasFrame = node["frame"] != nil
+        return !hasChildren && hasFrame
+    }
+
+    /// 提取 frame -> [x, y, width, height]，缺省 [0,0,0,0]
+    static func frame(_ node: [String: Any]) -> [Double] {
+        guard let f = node["frame"] as? [String: Any],
+              let x = f["x"] as? Double, let y = f["y"] as? Double,
+              let w = f["width"] as? Double, let h = f["height"] as? Double else { return [0, 0, 0, 0] }
+        return [x, y, w, h]
+    }
+
+    static func isVisible(_ node: [String: Any]) -> Bool {
+        (node["isVisible"] as? Bool) ?? (node["visible"] as? Bool) ?? true
+    }
+
+    /// 从树里取节点数组（兼容 nodes / elements / tree 三种容器）
+    static func nodeList(_ tree: [String: Any]) -> [[String: Any]] {
+        if let n = tree["nodes"] as? [[String: Any]] { return n }
+        if let e = tree["elements"] as? [[String: Any]] { return e }
+        if let t = tree["tree"] as? [[String: Any]] { return t }
+        return []
+    }
+
+    /// 从所有节点 frame 的边界推断屏幕尺寸 [width, height]（近似，供滚动幅度估算）
+    static func screenSize(of nodes: [[String: Any]]) -> [Double] {
+        var maxX = 0.0, maxY = 0.0
+        func scan(_ n: [String: Any]) {
+            let f = frame(n)
+            maxX = max(maxX, f[0] + f[2]); maxY = max(maxY, f[1] + f[3])
+            if let ch = n["children"] as? [[String: Any]] { for c in ch { scan(c) } }
+        }
+        for n in nodes { scan(n) }
+        return maxX > 10 && maxY > 10 ? [maxX, maxY] : [390, 844]
+    }
+
+    // FNV-1a 64 位，输出稳定十六进制指纹（无需 CryptoKit）
+    private static func fnv1a(_ s: String) -> UInt64 {
+        var h: UInt64 = 0xcbf29ce484222325
+        for b in s.utf8 { h = (h ^ UInt64(b)) &* 0x100000001b3 }
+        return h
+    }
+
+    /// 语义指纹：role + 子树文本 + 自身文本 + 最近 2 层父语义。
+    /// 同一控件（同 role/文本/父链）每次读树得到相同指纹 → 可安全"锁"复用；树变后查不到 → 安全失效。
+    static func semanticFingerprint(_ node: [String: Any], ancestors: [[String: Any]]) -> String {
+        let nodeRole = role(of: node) ?? ""
+        let subtree = subtreeText(node)
+        let own = nodeText(node)
+        var parents: [String] = []
+        for p in ancestors.prefix(2) {
+            let pr = role(of: p) ?? ""
+            let pt = nodeText(p)
+            parents.append("\(pr):\(pt.prefix(12))")
+        }
+        let sig = nodeRole + "|" + subtree + "|" + own + "|" + parents.joined(separator: ">")
+        return String(format: "fp_%016llx", fnv1a(sig))
+    }
+
+    /// 验证闭环（借鉴 Maestro assertVisible）：整树是否包含期望文本
+    static func treeContainsText(_ text: String, partial: Bool = false) -> Bool {
+        let tree = ControlAgentTools.shared.uiTree()
+        let nodes = nodeList(tree)
+        var found = false
+        func walk(_ n: [String: Any]) {
+            if found { return }
+            if partial ? subtreeText(n).localizedCaseInsensitiveContains(text) : (subtreeText(n) == text) {
+                found = true; return
+            }
+            if let ch = n["children"] as? [[String: Any]] { for c in ch { walk(c) } }
+        }
+        for n in nodes { walk(n) }
+        return found
+    }
+
+    /// 点击后验证期望元素是否出现；未出现给明确提示（点击可能未生效）
+    static func attachExpect(_ result: [String: Any], expect: String?, partial: Bool) -> [String: Any] {
+        var out = result
+        if let e = expect, !e.isEmpty {
+            Thread.sleep(forTimeInterval: 0.4)   // 等页面跳转/渲染
+            out["verified"] = treeContainsText(e, partial: partial)
+            out["expect"] = e
+            if out["verified"] as? Bool != true {
+                out["expect_hint"] = "期待元素\"\(e)\"未出现——点击可能未生效，请重读 control.ui_tree / control.find"
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - v3.0.72：control.tap_text — 语义化点击 (传文字，自动找元素点）
 
 final class ControlTapTextTool: MCPTool {
@@ -311,7 +578,9 @@ final class ControlTapTextTool: MCPTool {
         summary: "PREREQUISITE: call control.inject first. Tap an element by its visible text label. Use for: tap a button/link by its text (e.g. \"搜索\", \"登录\"). Don't use for: tap by coordinates (use control.tap), swipe gesture (use control.swipe).",
         parameters: [
             "text": "Visible text label of the element to tap (REQUIRED)",
-            "partial": "If true, match partial text (default true) (optional)"
+            "partial": "If true, match partial text (default false; exact match by default) (optional)",
+            "role": "Optional accessibility role filter to disambiguate, e.g. button/cell/tab/link (optional)",
+            "expect": "After tapping, verify this text appears on screen (e.g. target page title). Optional."
         ],
         verified: true, category: "ui_control")
 
@@ -319,75 +588,94 @@ final class ControlTapTextTool: MCPTool {
         guard let text = params["text"] as? String, !text.isEmpty else {
             throw MCPError.invalidParams("text required")
         }
-        let partial = (params["partial"] as? Bool) ?? true
+        let partial = (params["partial"] as? Bool) ?? false
+        let role = params["role"] as? String
 
-        // 拿 UI 树
-        let tree = ControlAgentTools.shared.uiTree()
-        if let nodes = tree["nodes"] as? [[String: Any]] {
-            return try findAndTap(nodes: nodes, text: text, partial: partial)
+        // 借鉴 Maestro/Appium：找不到时短暂重试（加载/动画场景），最多 3 次
+        var lastError: Error = MCPError.failed("no element matching \"\(text)\" found in UI tree")
+        for attempt in 0..<3 {
+            do {
+                let tree = ControlAgentTools.shared.uiTree()
+                let nodes = ControlSemantics.nodeList(tree)
+                guard !nodes.isEmpty else { throw MCPError.failed("cannot parse UI tree") }
+                return ControlSemantics.attachExpect(try findAndTap(nodes: nodes, text: text, partial: partial, role: role),
+                                                     expect: params["expect"] as? String, partial: partial)
+            } catch {
+                lastError = error
+                let m = "\(error)"
+                let retryable = m.contains("no element") || m.contains("cannot parse") || m.contains("not found")
+                if retryable && attempt < 2 {
+                    Thread.sleep(forTimeInterval: 0.4)
+                    continue
+                }
+                throw error
+            }
         }
-        if let nodes = tree["elements"] as? [[String: Any]] {
-            return try findAndTap(nodes: nodes, text: text, partial: partial)
-        }
-        if let nodes = tree["tree"] as? [[String: Any]] {
-            return try findAndTap(nodes: nodes, text: text, partial: partial)
-        }
-        throw MCPError.failed("cannot parse UI tree")
+        throw lastError
     }
 
-    private func findAndTap(nodes: [[String: Any]], text: String, partial: Bool) throws -> [String: Any] {
-        // 递归遍历 UI 树找匹配的元素
-        var bestNode: [String: Any]?
-        var bestFrame: [Double] = [0, 0, 0, 0]
+    private struct Candidate {
+        let frame: [Double]
+        let area: Double
+        let hittable: Bool
+    }
 
-        func search(_ node: [String: Any]) {
-            // 检查 text/label/accessibilityLabel
-            let nodeText = (node["text"] as? String) ?? (node["label"] as? String) ?? (node["accessibilityLabel"] as? String) ?? ""
-            var match = false
-            if partial {
-                match = nodeText.localizedCaseInsensitiveContains(text)
-            } else {
-                match = nodeText == text
+    private func findAndTap(nodes: [[String: Any]], text: String, partial: Bool, role: String?) throws -> [String: Any] {
+        // 语义闭环：匹配文字 → 向上找最近可点击祖先（书城/书名在子 UILabel，可点父是 button/cell）→ 唯一性排序 → 点中心
+        var candidates: [Candidate] = []
+
+        func walk(_ node: [String: Any], _ ancestors: [[String: Any]]) {
+            let t = ControlSemantics.nodeText(node)
+            var matched = partial ? t.localizedCaseInsensitiveContains(text) : (t == text)
+            if matched, let r = role {
+                matched = (ControlSemantics.role(of: node) == r.lowercased())
             }
-
-            if match {
-                // 优先用 visible/hittable 的
-                let visible = (node["isVisible"] as? Bool) ?? true
-                let hittable = (node["isHittable"] as? Bool) ?? true
-                if visible && hittable {
-                    bestNode = node
-                    if let frame = node["frame"] as? [String: Any],
-                       let x = frame["x"] as? Double,
-                       let y = frame["y"] as? Double,
-                       let w = frame["width"] as? Double,
-                       let h = frame["height"] as? Double {
-                        bestFrame = [x, y, w, h]
+            if matched {
+                var chain = [node] + ancestors   // 近→远：node 在前，ancestors[0] 是最近父
+                var targetFrame = [0.0, 0.0, 0.0, 0.0]
+                var targetHittable = false
+                for n in chain {
+                    if ControlSemantics.isActionable(n) {
+                        targetFrame = ControlSemantics.frame(n)
+                        targetHittable = true
+                        break
                     }
-                    return
                 }
+                if targetFrame == [0.0, 0.0, 0.0, 0.0] {
+                    targetFrame = ControlSemantics.frame(node)
+                }
+                let area = targetFrame[2] * targetFrame[3]
+                candidates.append(Candidate(frame: targetFrame, area: area, hittable: targetHittable))
             }
-
-            // 递归子节点
-            if let children = node["children"] as? [[String: Any]] {
-                for child in children { search(child) }
+            if let ch = node["children"] as? [[String: Any]] {
+                var newAnc = ancestors
+                newAnc.insert(node, at: 0)
+                for c in ch { walk(c, newAnc) }
             }
         }
+        for n in nodes { walk(n, []) }
 
-        for node in nodes { search(node) }
-
-        guard bestNode != nil else {
+        guard !candidates.isEmpty else {
             throw MCPError.failed("no element matching \"\(text)\" found in UI tree")
         }
+        // 排序：可点优先；同可点按可视面积大优先
+        candidates.sort { a, b in
+            if a.hittable != b.hittable { return a.hittable && !b.hittable }
+            return a.area > b.area
+        }
+        let best = candidates[0]
+        let cx = best.frame[0] + best.frame[2] / 2
+        let cy = best.frame[1] + best.frame[3] / 2
 
-        // 算中心点
-        let cx = bestFrame[0] + bestFrame[2] / 2
-        let cy = bestFrame[1] + bestFrame[3] / 2
-
-        AuditLog.shared.log("control.tap_text", detail: "\"\(text)\" at (\(cx),\(cy))")
+        AuditLog.shared.log("control.tap_text", detail: "\"\(text)\" at (\(cx),\(cy)) matches=\(candidates.count)")
         var result = ControlAgentTools.shared.tap(x: cx, y: cy)
         result["matched_text"] = text
+        result["match_count"] = candidates.count
         result["tap_x"] = cx
         result["tap_y"] = cy
+        if candidates.count > 1 {
+            result["hint"] = "\(candidates.count) matches; tapped the largest hittable target. To disambiguate pass exact role, or list first with control.find."
+        }
         return result
     }
 }
@@ -440,6 +728,434 @@ final class ControlTypeTextTool: MCPTool {
     }
 }
 
+// MARK: - v7.1.287：control.find — 查询式精简 UI 树（只回匹配节点，不烧 token）
+
+final class ControlFindTool: MCPTool {
+    let definition = ToolDefinition(
+        name: "control.find",
+        summary: "PREREQUISITE: control.inject first. Query the UI tree and return only matching actionable/visible nodes (role/name/text/frame), NOT the whole tree. Use for: locate a book/tab/button before tapping, or check what's on screen without a huge tree. Don't use for: actual tapping (use control.tap_selector / tap_text).",
+        parameters: [
+            "text": "Optional text to match (exact unless partial=true) (optional)",
+            "role": "Optional role to filter, e.g. button/cell/tab/link (optional)",
+            "partial": "If true match partial text (default false) (optional)",
+            "visible_only": "Only return visible nodes (default true) (optional)",
+            "actionable_only": "Only return actionable (clickable) nodes (default true) (optional)",
+            "limit": "Max results returned (default 20) (optional)"
+        ],
+        verified: false, category: "ui_control")
+
+    func invoke(_ params: [String: Any]) throws -> [String: Any] {
+        let text = params["text"] as? String
+        let role = params["role"] as? String
+        let partial = (params["partial"] as? Bool) ?? false
+        let visibleOnly = (params["visible_only"] as? Bool) ?? true
+        let actionableOnly = (params["actionable_only"] as? Bool) ?? true
+        let limit = (params["limit"] as? Int) ?? 20
+
+        let tree = ControlAgentTools.shared.uiTree()
+        let nodes = ControlSemantics.nodeList(tree)
+        guard !nodes.isEmpty else {
+            throw MCPError.failed("cannot parse UI tree")
+        }
+
+        var out: [[String: Any]] = []
+        func walk(_ node: [String: Any], _ ancestors: [[String: Any]]) {
+            if out.count >= limit { return }
+            let t = ControlSemantics.nodeText(node)
+            var ok = true
+            if let text = text {
+                let direct = partial ? t.localizedCaseInsensitiveContains(text) : (t == text)
+                let agg = ControlSemantics.subtreeText(node)
+                let viaAgg = partial ? agg.localizedCaseInsensitiveContains(text) : (agg == text)
+                ok = direct || viaAgg
+            }
+            if let r = role, ok {
+                ok = (ControlSemantics.role(of: node) == r.lowercased())
+            }
+            if visibleOnly && ok {
+                ok = ControlSemantics.isVisible(node)
+            }
+            if actionableOnly && ok {
+                ok = ControlSemantics.isActionable(node)
+            }
+            if ok {
+                out.append([
+                    "role": ControlSemantics.role(of: node) ?? "",
+                    "name": ControlSemantics.subtreeText(node),
+                    "text": t,
+                    "frame": ControlSemantics.frame(node),
+                    "fingerprint": ControlSemantics.semanticFingerprint(node, ancestors: ancestors)
+                ])
+            }
+            if let ch = node["children"] as? [[String: Any]] {
+                var newAnc = ancestors
+                newAnc.insert(node, at: 0)
+                for c in ch { walk(c, newAnc) }
+            }
+        }
+        for n in nodes { walk(n, []) }
+
+        return ["ok": true, "count": out.count, "results": out,
+                "hint": "use control.tap_selector role:... name:... to tap, or control.tap_node fingerprint:<fp> to reuse a stable node, or control.scroll_find_tap text:... to scroll-and-tap"]
+    }
+}
+
+// MARK: - v7.1.287：control.tap_selector — 语义直点 (role + name → 唯一节点 → 点中心，不传坐标)
+
+final class ControlTapSelectorTool: MCPTool {
+    let definition = ToolDefinition(
+        name: "control.tap_selector",
+        summary: "PREREQUISITE: control.inject first. Tap the single actionable element matching role+name (subtree text aggregated). e.g. tap_selector role:'button' name:'书城'. No coordinates needed — device-side match. Don't use for: coordinate taps (control.tap), pure text tap (control.tap_text).",
+        parameters: [
+            "name": "Subtree text (name) of the element to tap — REQUIRED. Use aggregated text, e.g. '书城' for the tab button",
+            "role": "Optional role to filter, e.g. button/cell/tab/link (optional)",
+            "partial": "If true match partial name (default false) (optional)",
+            "expect": "After tapping, verify this text appears on screen (e.g. target page title). Optional."
+        ],
+        verified: false, category: "ui_control")
+
+    func invoke(_ params: [String: Any]) throws -> [String: Any] {
+        guard let name = params["name"] as? String, !name.isEmpty else {
+            throw MCPError.invalidParams("name required. Use aggregated text like '书城'.")
+        }
+        let role = params["role"] as? String
+        let partial = (params["partial"] as? Bool) ?? false
+
+        var frames: [[Double]] = []
+        // 借鉴 Maestro/Appium：找不到时短暂重试（加载/动画），最多 3 次
+        for attempt in 0..<3 {
+            let tree = ControlAgentTools.shared.uiTree()
+            let nodes = ControlSemantics.nodeList(tree)
+            guard !nodes.isEmpty else {
+                if attempt < 2 { Thread.sleep(forTimeInterval: 0.4); continue }
+                throw MCPError.failed("cannot parse UI tree")
+            }
+            frames = []
+            func walk(_ node: [String: Any]) {
+                if ControlSemantics.isActionable(node) {
+                    let agg = ControlSemantics.subtreeText(node)
+                    var ok = partial ? agg.localizedCaseInsensitiveContains(name) : (agg == name)
+                    if let r = role, ok {
+                        ok = (ControlSemantics.role(of: node) == r.lowercased())
+                    }
+                    if ok {
+                        frames.append(ControlSemantics.frame(node))
+                    }
+                }
+                if let ch = node["children"] as? [[String: Any]] {
+                    for c in ch { walk(c) }
+                }
+            }
+            for n in nodes { walk(n) }
+            if !frames.isEmpty { break }
+            if attempt < 2 { Thread.sleep(forTimeInterval: 0.4) }
+        }
+
+        guard !frames.isEmpty else {
+            throw MCPError.failed("no actionable element matching role:\(role ?? "any") name:\"\(name)\" found")
+        }
+        frames.sort { ($0[2] * $0[3]) > ($1[2] * $1[3]) }
+        let best = frames[0]
+        let cx = best[0] + best[2] / 2
+        let cy = best[1] + best[3] / 2
+
+        AuditLog.shared.log("control.tap_selector", detail: "role:\(role ?? "any") name:\"\(name)\" matches=\(frames.count)")
+        var result = ControlAgentTools.shared.tap(x: cx, y: cy)
+        result["matched_name"] = name
+        result["match_count"] = frames.count
+        result["tap_x"] = cx
+        result["tap_y"] = cy
+        if frames.count > 1 {
+            result["hint"] = "\(frames.count) actionable nodes matched; tapped the largest. Add exact role or use control.find to inspect."
+        }
+        return ControlSemantics.attachExpect(result, expect: params["expect"] as? String, partial: partial)
+    }
+}
+
+// MARK: - v7.1.287：control.tap_node — 语义指纹直点 (通用锁 ID：同屏内可复用、树变即失效)
+
+final class ControlTapNodeTool: MCPTool {
+    let definition = ToolDefinition(
+        name: "control.tap_node",
+        summary: "PREREQUISITE: control.inject first. Tap the single actionable element by its semantic fingerprint (returned by control.find). Reuse the same fingerprint within one screen — it is stable across reads. If the tree changed (scrolled/navigated) the fingerprint won't be found and this reports it. Use for: tap an already-located node fast without re-searching. Don't use for: first-time locate (use control.find then tap_node, or tap_selector/tap_text directly).",
+        parameters: [
+            "fingerprint": "Semantic fingerprint from control.find results — REQUIRED (e.g. fp_...)",
+            "name": "Optional human-readable name for logging (optional)",
+            "expect": "After tapping, verify this text appears on screen (e.g. target page title). Optional."
+        ],
+        verified: false, category: "ui_control")
+
+    func invoke(_ params: [String: Any]) throws -> [String: Any] {
+        guard let fp = params["fingerprint"] as? String, !fp.isEmpty else {
+            throw MCPError.invalidParams("fingerprint required. Get it from control.find / ui_tree results.")
+        }
+
+        var frames: [[Double]] = []
+        // 借鉴 Maestro/Appium：页面加载/滚动中短暂重试，最多 3 次
+        for attempt in 0..<3 {
+            let tree = ControlAgentTools.shared.uiTree()
+            let nodes = ControlSemantics.nodeList(tree)
+            guard !nodes.isEmpty else {
+                if attempt < 2 { Thread.sleep(forTimeInterval: 0.4); continue }
+                throw MCPError.failed("cannot parse UI tree")
+            }
+            frames = []
+            func walk(_ node: [String: Any], _ ancestors: [[String: Any]]) {
+                if ControlSemantics.isActionable(node),
+                   ControlSemantics.semanticFingerprint(node, ancestors: ancestors) == fp {
+                    frames.append(ControlSemantics.frame(node))
+                }
+                if let ch = node["children"] as? [[String: Any]] {
+                    var newAnc = ancestors
+                    newAnc.insert(node, at: 0)
+                    for c in ch { walk(c, newAnc) }
+                }
+            }
+            for n in nodes { walk(n, []) }
+            if !frames.isEmpty { break }
+            if attempt < 2 { Thread.sleep(forTimeInterval: 0.4) }
+        }
+
+        guard !frames.isEmpty else {
+            throw MCPError.failed("fingerprint \(fp) not found — the UI tree changed (scrolled/navigated). Re-run control.find and take a fresh fingerprint.")
+        }
+        frames.sort { ($0[2] * $0[3]) > ($1[2] * $1[3]) }
+        let best = frames[0]
+        let cx = best[0] + best[2] / 2
+        let cy = best[1] + best[3] / 2
+        var result = ControlAgentTools.shared.tap(x: cx, y: cy)
+        result["fingerprint"] = fp
+        result["tap_x"] = cx
+        result["tap_y"] = cy
+        return ControlSemantics.attachExpect(result, expect: params["expect"] as? String, partial: false)
+    }
+}
+
+// MARK: - v7.1.287：control.scroll_find_tap — 滚动查找并点击 (一次调用完成，长列表通用)
+
+final class ControlScrollFindTapTool: MCPTool {
+    let definition = ToolDefinition(
+        name: "control.scroll_find_tap",
+        summary: "PREREQUISITE: control.inject first. Scroll the list and tap the first matching actionable element — all on the device side, in ONE call. Use for: locate & tap a book/tab far down a long list (e.g. 番茄小说). Returns what was tapped + fingerprint. Don't use for: tap something already visible (use tap_selector/tap_text — faster).",
+        parameters: [
+            "text": "Text to find while scrolling (REQUIRED)",
+            "role": "Optional role filter, e.g. cell/button/link (optional)",
+            "partial": "If true match partial text (default false) (optional)",
+            "direction": "Scroll direction: 'up' = swipe up to reveal later content (default, finds items further down), 'down' = swipe down toward the top (optional)",
+            "max_swipes": "Max scroll swipes before giving up (default 6) (optional)",
+            "expect": "After tapping, verify this text appears on screen (e.g. target page title). Optional."
+        ],
+        verified: false, category: "ui_control")
+
+    func invoke(_ params: [String: Any]) throws -> [String: Any] {
+        guard let text = params["text"] as? String, !text.isEmpty else {
+            throw MCPError.invalidParams("text required")
+        }
+        let role = params["role"] as? String
+        let partial = (params["partial"] as? Bool) ?? false
+        let direction = (params["direction"] as? String) ?? "up"
+        let maxSwipes = max(1, (params["max_swipes"] as? Int) ?? 6)
+
+        // 1) 先看当前屏有没有
+        var tree = ControlAgentTools.shared.uiTree()
+        var nodes = ControlSemantics.nodeList(tree)
+        guard !nodes.isEmpty else {
+            throw MCPError.failed("cannot parse UI tree")
+        }
+        if let hit = findMatch(nodes: nodes, text: text, partial: partial, role: role) {
+            return ControlSemantics.attachExpect(tapHit(hit, text: text, swipes: 0),
+                                                 expect: params["expect"] as? String, partial: partial)
+        }
+
+        let screen = ControlSemantics.screenSize(of: nodes)
+        let midX = screen[0] / 2
+        let upper = screen[1] * 0.8
+        let lower = screen[1] * 0.2
+        // 2) 滚动查找（最多 maxSwipes 次）
+        for s in 1...maxSwipes {
+            let swipeResult: [String: Any]
+            if direction == "down" {
+                swipeResult = ControlAgentTools.shared.swipe(x1: midX, y1: upper, x2: midX, y2: lower, duration: 0.3)
+            } else {
+                swipeResult = ControlAgentTools.shared.swipe(x1: midX, y1: lower, x2: midX, y2: upper, duration: 0.3)
+            }
+            if let err = swipeResult["error"] as? String {
+                throw MCPError.failed("swipe failed: \(err)")
+            }
+            Thread.sleep(forTimeInterval: 0.25)   // 等滚动/渲染稳定
+            tree = ControlAgentTools.shared.uiTree()
+            nodes = ControlSemantics.nodeList(tree)
+            guard !nodes.isEmpty else { throw MCPError.failed("ui_tree empty after swipe") }
+            if let hit = findMatch(nodes: nodes, text: text, partial: partial, role: role) {
+                return ControlSemantics.attachExpect(tapHit(hit, text: text, swipes: s),
+                                                     expect: params["expect"] as? String, partial: partial)
+            }
+        }
+        throw MCPError.failed("\(text) not found after scrolling \(maxSwipes) times \(direction). It may be off-list or the list ended.")
+    }
+
+    private func tapHit(_ hit: (cx: Double, cy: Double, fp: String), text: String, swipes: Int) -> [String: Any] {
+        var r = ControlAgentTools.shared.tap(x: hit.cx, y: hit.cy)
+        r["matched_text"] = text
+        r["fingerprint"] = hit.fp
+        r["tap_x"] = hit.cx
+        r["tap_y"] = hit.cy
+        r["swipes"] = swipes
+        return r
+    }
+
+    /// 匹配文本（子树聚合）+ 向上找可点祖先，选面积最大的命中
+    private func findMatch(nodes: [[String: Any]], text: String, partial: Bool, role: String?) -> (cx: Double, cy: Double, fp: String)? {
+        var best: (cx: Double, cy: Double, fp: String)?
+        var bestArea = -1.0
+        func walk(_ node: [String: Any], _ ancestors: [[String: Any]]) {
+            let agg = ControlSemantics.subtreeText(node)
+            var ok = partial ? agg.localizedCaseInsensitiveContains(text) : (agg == text)
+            if ok, let r = role { ok = (ControlSemantics.role(of: node) == r.lowercased()) }
+            if ok {
+                var target = [0.0, 0.0, 0.0, 0.0]
+                var chain = [node] + ancestors
+                for n in chain where ControlSemantics.isActionable(n) {
+                    target = ControlSemantics.frame(n)
+                    break
+                }
+                if target == [0.0, 0.0, 0.0, 0.0] { target = ControlSemantics.frame(node) }
+                let area = target[2] * target[3]
+                if area > bestArea {
+                    bestArea = area
+                    let cx = target[0] + target[2] / 2
+                    let cy = target[1] + target[3] / 2
+                    best = (cx, cy, ControlSemantics.semanticFingerprint(node, ancestors: ancestors))
+                }
+            }
+            if let ch = node["children"] as? [[String: Any]] {
+                var newAnc = ancestors
+                newAnc.insert(node, at: 0)
+                for c in ch { walk(c, newAnc) }
+            }
+        }
+        for n in nodes { walk(n, []) }
+        return best
+    }
+}
+
+// MARK: - v7.1.287：control.actions — 多步动作批处理
+// 一次决策、设备端连续执行（借鉴 Apelin agent 会话连续 uiAction，砍掉中间重读树/回传往返）。
+// AI 输出动作串 + 策略；默认连续执行，某步失败即停并报告失败点；失败可回退逐步。
+
+final class ControlActionsTool: MCPTool {
+    let definition = ToolDefinition(
+        name: "control.actions",
+        summary: "PREREQUISITE: control.inject first. Execute a sequence of control actions on the device in ONE call — the AI decides the action chain, the device runs it back-to-back (fast, like Apelin's agent session). Use for: a known multi-step flow (e.g. open 抖音 then swipe up 5 times) without re-reading the tree between steps. Don't use for: first-time discovery of what's on screen (use control.find / control.ui_tree).",
+        parameters: [
+            "actions": "Array of action dicts, each {op, ...}. op: tap_text(text,partial?,role?,expect?) / tap_selector(name,role?,partial?,expect?) / tap_node(fingerprint,expect?) / swipe(direction,count?,expect?) / scroll_find_tap(text,role?,partial?,direction?,max_swipes?,expect?) / wait(seconds). (REQUIRED)",
+            "strategy": "'continuous' (default) runs all actions back-to-back without re-reading the tree; stops and reports the failed step if one fails. 'stepwise' keeps per-step expect/verification (slower, safer). Optional",
+            "expect": "Optional final text to verify after the whole sequence (optional)"
+        ],
+        verified: false, category: "ui_control")
+
+    func invoke(_ params: [String: Any]) throws -> [String: Any] {
+        guard let actions = params["actions"] as? [[String: Any]], !actions.isEmpty else {
+            throw MCPError.invalidParams("actions: non-empty array of {op,...} required")
+        }
+        let strategy = (params["strategy"] as? String) ?? "continuous"
+        var results: [[String: Any]] = []
+
+        for (i, action) in actions.enumerated() {
+            guard let op = action["op"] as? String, !op.isEmpty else {
+                throw MCPError.invalidParams("actions[\(i)].op required: tap_text/tap_selector/tap_node/swipe/scroll_find_tap/wait/sys_launch/sys_tap/sys_swipe/sys_paste")
+            }
+            var inner = action
+            inner.removeValue(forKey: "op")
+            do {
+                results.append(try Self.run(op: op, params: inner))
+            } catch {
+                results.append(["ok": false, "op": op, "error": "\(error)"])
+                return [
+                    "ok": false,
+                    "strategy": strategy,
+                    "step_failed": i,
+                    "failed_op": op,
+                    "done": results,
+                    "hint": "Sequence stopped at step \(i) (\(op)). Re-read the tree (control.ui_tree / control.find) and retry, or set strategy:'stepwise' for per-step verified execution."
+                ]
+            }
+        }
+
+        var out: [String: Any] = ["ok": true, "strategy": strategy, "results": results, "steps": results.count]
+        if let exp = params["expect"] as? String, !exp.isEmpty {
+            out = ControlSemantics.attachExpect(out, expect: exp, partial: false)
+        }
+        return out
+    }
+
+    private static func run(op: String, params: [String: Any]) throws -> [String: Any] {
+        switch op {
+        case "tap_text":
+            return try ControlTapTextTool().invoke(params)
+        case "tap_selector":
+            return try ControlTapSelectorTool().invoke(params)
+        case "tap_node":
+            return try ControlTapNodeTool().invoke(params)
+        case "scroll_find_tap":
+            return try ControlScrollFindTapTool().invoke(params)
+        case "swipe":
+            // 屏幕级滑动：方向 + 可选次数（连续 N 次上划/下划），设备端本地连续注入
+            // v7.1.287：注入式优先，未注入自动回退系统级 HID（引擎A）
+            let direction = (params["direction"] as? String) ?? "up"
+            let count = max(1, (params["count"] as? Int) ?? 1)
+            let tree = ControlAgentTools.shared.uiTree()
+            let nodes = ControlSemantics.nodeList(tree)
+            let screen = ControlSemantics.screenSize(of: nodes)
+            let midX = screen[0] > 0 ? screen[0] / 2 : Double(UIScreen.main.bounds.width) / 2
+            let upper = screen[1] > 0 ? screen[1] * 0.8 : Double(UIScreen.main.bounds.height) * 0.8
+            let lower = screen[1] > 0 ? screen[1] * 0.2 : Double(UIScreen.main.bounds.height) * 0.2
+            var last: [String: Any] = [:]
+            var usedSystem = false
+            for _ in 0..<count {
+                if direction == "down" {
+                    last = ControlAgentTools.shared.swipe(x1: midX, y1: upper, x2: midX, y2: lower, duration: 0.3)
+                    if last["error"] != nil { usedSystem = true; last = SystemUIEngine.shared.swipe(x1: midX, y1: upper, x2: midX, y2: lower) }
+                } else {
+                    last = ControlAgentTools.shared.swipe(x1: midX, y1: lower, x2: midX, y2: upper, duration: 0.3)
+                    if last["error"] != nil { usedSystem = true; last = SystemUIEngine.shared.swipe(x1: midX, y1: lower, x2: midX, y2: upper) }
+                }
+                if last["error"] != nil { break }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            var r = last
+            r["direction"] = direction
+            r["count"] = count
+            r["engine"] = usedSystem ? "system_hid" : "injected"
+            if r["error"] == nil { r["ok"] = true }
+            if let exp = params["expect"] as? String, !exp.isEmpty {
+                r = ControlSemantics.attachExpect(r, expect: exp, partial: (params["partial"] as? Bool) ?? false)
+            }
+            return r
+        case "wait":
+            let secs = (params["seconds"] as? Double) ?? 0.5
+            Thread.sleep(forTimeInterval: max(0, secs))
+            return ["ok": true, "waited_seconds": secs]
+        // v7.1.287：引擎A（系统级免注入）动作，可在 actions 批处理内混合使用
+        case "sys_launch":
+            guard let bundleId = params["bundle_id"] as? String else { throw MCPError.invalidParams("bundle_id required for sys_launch") }
+            return SystemUIEngine.shared.launch(bundleId: bundleId)
+        case "sys_tap":
+            guard let x = params["x"] as? Double, let y = params["y"] as? Double else { throw MCPError.invalidParams("x,y required for sys_tap") }
+            return SystemUIEngine.shared.tap(x: x, y: y)
+        case "sys_swipe":
+            guard let x1 = params["x1"] as? Double, let y1 = params["y1"] as? Double,
+                  let x2 = params["x2"] as? Double, let y2 = params["y2"] as? Double else { throw MCPError.invalidParams("x1,y1,x2,y2 required for sys_swipe") }
+            return SystemUIEngine.shared.swipe(x1: x1, y1: y1, x2: x2, y2: y2, durationMs: (params["duration_ms"] as? Int) ?? 300)
+        case "sys_paste":
+            guard let text = params["text"] as? String else { throw MCPError.invalidParams("text required for sys_paste") }
+            return SystemUIEngine.shared.paste(text)
+        default:
+            throw MCPError.invalidParams("unknown op: \(op)")
+        }
+    }
+}
+
 // MARK: - v7.1.283: control 进度通知
 // AI 控制目标 App 时，把每步结果镜像为系统通知——用户在前台 App 也能看到控制进度
 enum ControlNotifier {
@@ -484,9 +1200,12 @@ enum ControlNotifier {
 final class ControlExecTool: MCPTool {
     let definition = ToolDefinition(
         name: "control",
-        summary: "Control target app UI. Subcommands: inject / status / ui_tree / screenshot / tap / swipe / type / key / tap_text / type_text. Params per subcommand: tap→x,y(Number); swipe→x1,y1,x2,y2(Number); type→text; tap_text→text; type_text→placeholder+text; key→key(home/back/enter); inject→bundle_id; others none. Use for: UI automation / app screen control. Semantic UI tree (v7.1.281+): ui_tree nodes carry accessibility_role (button/link/text_field/switch/image/...), accessibility_label (human name), accessibility_value, is_accessibility_element and frame — locate an element by role+label, then tap its frame center; do NOT hardcode coordinates when labels are available. First `inject` to install ControlAgent, then call other subcommands.",
+        summary: "Control target app UI. Subcommands: inject / status / ui_tree / find / screenshot / tap / swipe / type / key / tap_text / tap_selector / tap_node / scroll_find_tap / actions / sys_launch / sys_tap / sys_swipe / sys_paste / type_text. Params per subcommand: tap→x,y(Number); swipe→x1,y1,x2,y2(Number); type→text; tap_text→text,partial?,role?; tap_selector→name,role?,partial?; tap_node→fingerprint; scroll_find_tap→text,role?,partial?,direction?,max_swipes?; actions→actions(array of {op,...}),strategy?; find→text?,role?,partial?,visible_only?,actionable_only?,limit?; type_text→placeholder+text; key→key(home/back/enter); inject→bundle_id; sys_launch→bundle_id; sys_tap→x,y; sys_swipe→x1,y1,x2,y2,duration_ms?; sys_paste→text; others none. Use for: UI automation / app screen control. DUAL ENGINE (v7.1.287): tap/swipe auto-route — if the target app is injected (ControlAgent 4789 online) they run in-process; if not, they automatically fall back to SYSTEM HID (no injection, works on the current foreground app). Use sys_launch to launch any app without injecting; use sys_tap/sys_swipe for no-injection HID touch; use sys_paste to put text into the clipboard (for search boxes when not injected). Semantic UI tree (v7.1.281+): ui_tree nodes carry accessibility_role (button/link/text_field/switch/image/...), accessibility_label (human name), accessibility_value, is_accessibility_element and frame — locate an element by role+label, then tap its frame center; do NOT hardcode coordinates when labels are available. PREFER semantic taps: tap_selector(role,name), tap_text(text), or tap_node(fingerprint) — no coordinates; use find to list matches cheaply; use scroll_find_tap(text) to scroll-and-tap a long list in one call; use actions([...]) to run a known multi-step flow in one fast call. First `inject` to install ControlAgent, then call other subcommands.",
         parameters: [
-            "command": "Subcommand (required): inject / status / ui_tree / screenshot / tap / swipe / type / key / tap_text / type_text",
+            "command": "Subcommand (required): inject / status / ui_tree / find / screenshot / tap / swipe / type / key / tap_text / tap_selector / tap_node / scroll_find_tap / actions / sys_launch / sys_tap / sys_swipe / sys_paste / type_text",
+            "duration_ms": "Swipe duration ms — for sys_swipe (optional)",
+            "actions": "Action array — REQUIRED for actions. Each {op,...}: tap_text/tap_selector/tap_node/swipe(direction,count?)/scroll_find_tap/wait(seconds)",
+            "strategy": "'continuous' or 'stepwise' — for actions",
             "bundle_id": "App bundle ID — REQUIRED for inject only",
             "x": "X coordinate Number — REQUIRED for tap",
             "y": "Y coordinate Number — REQUIRED for tap",
@@ -495,6 +1214,15 @@ final class ControlExecTool: MCPTool {
             "x2": "End X Number — REQUIRED for swipe",
             "y2": "End Y Number — REQUIRED for swipe",
             "text": "Text string — REQUIRED for type / tap_text",
+            "name": "Aggregated name — REQUIRED for tap_selector",
+            "role": "Role filter — optional for tap_text/tap_selector/find",
+            "partial": "Partial text match (default false) — optional",
+            "visible_only": "Only visible (default true) — for find",
+            "actionable_only": "Only clickable (default true) — for find",
+            "limit": "Max find results (default 20) — for find",
+            "fingerprint": "Semantic fingerprint — REQUIRED for tap_node",
+            "direction": "Scroll direction up/down (default up) — for scroll_find_tap",
+            "max_swipes": "Max swipes before giving up (default 6) — for scroll_find_tap",
             "key": "Key name: home/back/enter — REQUIRED for key",
             "placeholder": "Field placeholder (for type_text)"
         ],
@@ -540,20 +1268,38 @@ final class ControlExecTool: MCPTool {
             guard let x = params["x"] as? Double, let y = params["y"] as? Double else {
                 throw MCPError.invalidParams("x and y required. Usage: control tap x:100 y:200 (both Numbers)")
             }
-            let result = ControlAgentTools.shared.tap(x: x, y: y)
-            let d = ControlNotifier.describe(command: "tap", result: result, extra: "已点击 (\(Int(x)), \(Int(y)))")
-            ControlNotifier.post(command: "tap", ok: d.ok, detail: d.detail)
-            return result
+            var injected = ControlAgentTools.shared.tap(x: x, y: y)
+            if injected["error"] == nil {
+                injected["engine"] = "injected"
+                let d = ControlNotifier.describe(command: "tap", result: injected, extra: "已点击 (\(Int(x)), \(Int(y))) [注入式]")
+                ControlNotifier.post(command: "tap", ok: d.ok, detail: d.detail)
+                return injected
+            }
+            // 未注入 → 自动回退系统级 HID（引擎A，免注入）
+            var sys = SystemUIEngine.shared.tap(x: x, y: y)
+            sys["fallback_reason"] = injected["error"] ?? "injected unreachable"
+            let sd = ControlNotifier.describe(command: "tap", result: sys, extra: "已点击 (\(Int(x)), \(Int(y))) [系统HID]")
+            ControlNotifier.post(command: "tap", ok: sd.ok, detail: sd.detail)
+            return sys
 
         case "swipe":
             guard let x1 = params["x1"] as? Double, let y1 = params["y1"] as? Double,
                   let x2 = params["x2"] as? Double, let y2 = params["y2"] as? Double else {
                 throw MCPError.invalidParams("x1,y1,x2,y2 required. Usage: control swipe x1:100 y1:200 x2:300 y2:400 (all Numbers)")
             }
-            let result = ControlAgentTools.shared.swipe(x1: x1, y1: y1, x2: x2, y2: y2, duration: 0.3)
-            let d = ControlNotifier.describe(command: "swipe", result: result, extra: "已滑动 (\(Int(x1)),\(Int(y1))) → (\(Int(x2)),\(Int(y2)))")
-            ControlNotifier.post(command: "swipe", ok: d.ok, detail: d.detail)
-            return result
+            var injected = ControlAgentTools.shared.swipe(x1: x1, y1: y1, x2: x2, y2: y2, duration: 0.3)
+            if injected["error"] == nil {
+                injected["engine"] = "injected"
+                let d = ControlNotifier.describe(command: "swipe", result: injected, extra: "已滑动 (\(Int(x1)),\(Int(y1))) → (\(Int(x2)),\(Int(y2))) [注入式]")
+                ControlNotifier.post(command: "swipe", ok: d.ok, detail: d.detail)
+                return injected
+            }
+            // 未注入 → 自动回退系统级 HID（引擎A，免注入）
+            var sys = SystemUIEngine.shared.swipe(x1: x1, y1: y1, x2: x2, y2: y2)
+            sys["fallback_reason"] = injected["error"] ?? "injected unreachable"
+            let sd = ControlNotifier.describe(command: "swipe", result: sys, extra: "已滑动 [系统HID]")
+            ControlNotifier.post(command: "swipe", ok: sd.ok, detail: sd.detail)
+            return sys
 
         case "type":
             guard let text = params["text"] as? String else {
@@ -573,14 +1319,80 @@ final class ControlExecTool: MCPTool {
             ControlNotifier.post(command: "key", ok: d.ok, detail: d.detail)
             return result
 
+        // v7.1.287：系统级引擎A子命令（免注入）——启动任意 app / HID 触摸 / 剪贴板
+        case "sys_launch":
+            guard let bundleId = params["bundle_id"] as? String else {
+                throw MCPError.invalidParams("bundle_id required. Usage: control sys_launch bundle_id:'com.ss.iphone.ugc.Aweme'")
+            }
+            return SystemUIEngine.shared.launch(bundleId: bundleId)
+
+        case "sys_tap":
+            guard let x = params["x"] as? Double, let y = params["y"] as? Double else {
+                throw MCPError.invalidParams("x and y required. Usage: control sys_tap x:100 y:200")
+            }
+            return SystemUIEngine.shared.tap(x: x, y: y)
+
+        case "sys_swipe":
+            guard let x1 = params["x1"] as? Double, let y1 = params["y1"] as? Double,
+                  let x2 = params["x2"] as? Double, let y2 = params["y2"] as? Double else {
+                throw MCPError.invalidParams("x1,y1,x2,y2 required. Usage: control sys_swipe x1:100 y1:200 x2:300 y2:400")
+            }
+            return SystemUIEngine.shared.swipe(x1: x1, y1: y1, x2: x2, y2: y2,
+                                               durationMs: (params["duration_ms"] as? Int) ?? 300)
+
+        case "sys_paste":
+            guard let text = params["text"] as? String else {
+                throw MCPError.invalidParams("text required. Usage: control sys_paste text:'iphone4'")
+            }
+            return SystemUIEngine.shared.paste(text)
+
         case "tap_text":
             guard let text = params["text"] as? String else {
                 throw MCPError.invalidParams("text required. Usage: control tap_text text:'login'")
             }
-            let result = try ControlTapTextTool().invoke(["text": text])
-            let d = ControlNotifier.describe(command: "tap_text", result: result, extra: "已点击文本：\(text.prefix(20))")
-            ControlNotifier.post(command: "tap_text", ok: d.ok, detail: d.detail)
-            return result
+            let tapText = try ControlTapTextTool().invoke(params)
+            let td = ControlNotifier.describe(command: "tap_text", result: tapText, extra: "已点击文本：\(text.prefix(20))")
+            ControlNotifier.post(command: "tap_text", ok: td.ok, detail: td.detail)
+            return tapText
+
+        case "tap_selector":
+            guard let name = params["name"] as? String else {
+                throw MCPError.invalidParams("name required. Usage: control tap_selector name:'书城' role:'button'")
+            }
+            let sel = try ControlTapSelectorTool().invoke(params)
+            let sd = ControlNotifier.describe(command: "tap_selector", result: sel, extra: "已语义点击：\(name.prefix(20))")
+            ControlNotifier.post(command: "tap_selector", ok: sd.ok, detail: sd.detail)
+            return sel
+
+        case "find":
+            let findResult = try ControlFindTool().invoke(params)
+            let fd = ControlNotifier.describe(command: "find", result: findResult)
+            ControlNotifier.post(command: "find", ok: fd.ok, detail: fd.detail)
+            return findResult
+
+        case "tap_node":
+            guard let fp = params["fingerprint"] as? String else {
+                throw MCPError.invalidParams("fingerprint required. Usage: control tap_node fingerprint:'fp_...'")
+            }
+            let nodeRes = try ControlTapNodeTool().invoke(params)
+            let nd = ControlNotifier.describe(command: "tap_node", result: nodeRes, extra: "已按指纹点击：\(fp.prefix(20))")
+            ControlNotifier.post(command: "tap_node", ok: nd.ok, detail: nd.detail)
+            return nodeRes
+
+        case "scroll_find_tap":
+            guard let text = params["text"] as? String else {
+                throw MCPError.invalidParams("text required. Usage: control scroll_find_tap text:'某小说' direction:'up'")
+            }
+            let scrollRes = try ControlScrollFindTapTool().invoke(params)
+            let sd2 = ControlNotifier.describe(command: "scroll_find_tap", result: scrollRes, extra: "滚动查找并点击：\(text.prefix(20))")
+            ControlNotifier.post(command: "scroll_find_tap", ok: sd2.ok, detail: sd2.detail)
+            return scrollRes
+
+        case "actions":
+            let actionsRes = try ControlActionsTool().invoke(params)
+            let ad = ControlNotifier.describe(command: "actions", result: actionsRes, extra: "批量动作执行完成")
+            ControlNotifier.post(command: "actions", ok: ad.ok, detail: ad.detail)
+            return actionsRes
 
         case "type_text":
             guard let placeholder = params["placeholder"] as? String,
@@ -593,7 +1405,7 @@ final class ControlExecTool: MCPTool {
             return result
 
         default:
-            throw MCPError.invalidParams("Unknown command: \(command). Available: inject/status/ui_tree/screenshot/tap/swipe/type/key/tap_text/type_text")
+            throw MCPError.invalidParams("Unknown command: \(command). Available: inject/status/ui_tree/find/screenshot/tap/swipe/type/key/tap_text/tap_selector/tap_node/scroll_find_tap/actions/type_text")
         }
     }
 }

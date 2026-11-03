@@ -10,7 +10,8 @@ import SwiftUI
 // v7.0.4: 自动启用 JIT——wrapper.c 的 ptrace 自开（免闪切）；失败时 fallback apple-magnifier URL
 @_silgen_name("troll_self_enable_jit") func troll_self_enable_jit() -> Int32
 @_silgen_name("troll_jit_probe") func troll_jit_probe() -> Int32
-// v6.6.0: troll_request_jit/have_jit 已删（CELF/elf-runner 退役——统一环境 Asbestos 无 JIT）
+// v6.6.0: troll_request_jit/have_jit 已删；v7.0.4.7 起 JIT = jit_helper（root 外部 attach）+ 无条件 TrollStore URL 兜底
+// （wrapper.c 的 troll_self_enable_jit/troll_jit_probe 为早期 self-attach 方案，已无调用）
 
 @main
 struct TrollAgentApp {
@@ -91,8 +92,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
         // v7.0.4.5: 自举 root helper 开 JIT（照抄 TrollStore RootHelper/jit.m——PT_ATTACHEXC+100ms+PT_DETACH）。
         // jit_helper 是独立 root 进程（spawnRoot persona uid 0），外部 attach 主进程 = 有效（区别于 self-attach）。
-        // 成功（rc=0，等价 TrollStore 手动开 JIT）→ 不调 URL（零闪切）；失败 → TrollStore URL 兜底。
-        // probe（mmap MAP_JIT）实测不可靠（mmap 成功≠执行放行）已废弃。
+        // v7.0.4.7 起：无论 helper rc 都无条件调 TrollStore URL 兜底（v7.0.4.5 实测 rc=0 但 JIT 未生效→SIGBUS；
+        //   URL 是 v7.0.3 验证的可靠路径）。注意：v7.0.4.5 及更早版本是"rc=0 免 URL 零闪切"——
+        //   老 tipa 在可靠设备（如 kfd 可用的 iOS 16.x）上不闪切即由此而来。
         let pidStr = String(ProcessInfo.processInfo.processIdentifier)
         if let helperPath = Bundle.main.url(forResource: "jit_helper", withExtension: nil, subdirectory: "bin")?.path {
             logJIT("[JIT] helperPath=\(helperPath) pid=\(pidStr)\n")
@@ -177,7 +179,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         RemoteAgent.shared.reportPendingCrashes()
 
         // 14de: 去掉启动自动 JIT 请求（App 切后台被杀→回前台重启→重复闪切 TrollStore 烦人）。
-        // v6.6.0: elf-runner 退役后无 JIT 需求（统一环境 Asbestos 纯解释），此路径保留仅作诊断。
+        // v7.0.4: 启动自动 JIT 请求已由 wrapper.c ptrace 自开替代（免闪切），此路径保留仅作诊断。
 
         window = UIWindow(frame: UIScreen.main.bounds)
         window?.rootViewController = UIHostingController(rootView: RootView())

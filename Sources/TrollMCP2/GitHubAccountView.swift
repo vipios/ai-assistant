@@ -59,6 +59,41 @@ struct GitHubAccountView: View {
                     }
                 }
                 .padding(.vertical, 4)
+
+                // v7.1.292：编译就绪度自动诊断（登录成功后程序自动跑，UI 自动展示）
+                if store.activeAccount != nil {
+                    if store.checksReady {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(store.allReady ? "✅ 编译就绪，可直接触发线上编译"
+                                                : "⚠️ 编译未就绪，还需处理 \(store.checks.filter { !$0.ok }.count) 项：")
+                                .font(.footnote.weight(.semibold))
+                            ForEach(store.checks) { c in
+                                HStack(alignment: .top, spacing: 6) {
+                                    Image(systemName: c.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                        .foregroundColor(c.ok ? .green : .orange)
+                                        .font(.caption)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(c.label).font(.caption)
+                                        if !c.detail.isEmpty {
+                                            Text(c.detail).font(.caption2).foregroundColor(.secondary)
+                                        }
+                                        if !c.ok && !c.hint.isEmpty {
+                                            Text(c.hint).font(.caption2).foregroundColor(.orange)
+                                        }
+                                    }
+                                    Spacer(minLength: 4)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    } else {
+                        HStack(spacing: 8) {
+                            ProgressView().scaleEffect(0.7)
+                            Text("检测编译就绪度…").font(.caption).foregroundColor(.secondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
             } else {
                 HStack {
                     Image(systemName: "person.crop.circle.badge.exclamationmark")
@@ -340,6 +375,26 @@ struct AddGitHubAccountView: View {
                     ) {
                         openVerification(dc.verification_uri)
                     }
+                    // v7.1.292：卡 "Use GitHub Mobile" 时的引导框 + 系统 Safari 备选
+                    //（内嵌 Safari 的 app 跳转受限；系统 Safari 跳转更完整、可走邮箱验证码）
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("如果卡在 Use GitHub Mobile 没反应：")
+                            .font(.caption).fontWeight(.semibold).foregroundColor(.orange)
+                        Text("① 点授权页的“Send a code via email”用邮箱验证码；② 或先开启 2FA 再授权；③ 或用下方“系统浏览器打开”。设备验证一次后 GitHub 不再重复要求。")
+                            .font(.caption).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.12)))
+                    SettingRowButton(
+                        title: "用系统浏览器打开授权页",
+                        subtitle: "系统 Safari 跳转更完整，可改用邮箱验证码",
+                        icon: "safari.fill",
+                        color: .orange
+                    ) {
+                        openExternal(dc.verification_uri)
+                    }
                     if store.isDevicePolling {
                         HStack {
                             ProgressView().scaleEffect(0.8)
@@ -358,6 +413,16 @@ struct AddGitHubAccountView: View {
             SecureField("ghp_…", text: $token)
                 .autocapitalization(.none)
                 .disableAutocorrection(true)
+                .onSubmit { login() }
+            Button {
+                login()
+            } label: {
+                Text("登录")
+                    .fontWeight(.semibold)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(BorderlessButtonStyle())
+            .disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || loading)
             if let err = errorMsg {
                 Text(err).font(.caption).foregroundColor(.red)
             }
@@ -407,6 +472,13 @@ struct AddGitHubAccountView: View {
         if let url = URL(string: uri) {
             safariURL = url
             showSafari = true
+        }
+    }
+
+    // v7.1.292：用系统 Safari 打开授权页（内嵌 Safari 跳转 GitHub app 受限，系统 Safari 更完整）
+    private func openExternal(_ uri: String) {
+        if let url = URL(string: uri) {
+            UIApplication.shared.open(url)
         }
     }
 

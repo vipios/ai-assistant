@@ -56,7 +56,7 @@ final class OpenAIClient {
         // 2026-11-02 通用接口：用户手工填了完整端点 = 明确指定了用哪个端点，
         // 降级链不得再切到别的端点（否则 Responses 的请求体被发到 /chat/completions，
         // 必然 400）。此时封顶 L4：仍可降载荷（L0→L1→L2→L3→L4），只是跳过 L5 不换端点。
-        let cap = ModelConfig.hasExplicitEndpoint(config.baseURL) ? 4 : min(config.compatMaxLevel, 5)
+        let cap = ModelConfig.hasExplicitEndpoint(config.effectiveBaseURL) ? 4 : min(config.compatMaxLevel, 5)
         return max(0, min(cap, 5))
     }
     /// v2.9.10：自定义 session——waitsForConnectivity 让切后台/网络抖动时不立即failed，
@@ -306,7 +306,7 @@ final class OpenAIClient {
         // 2026-11-02 通用接口：用户直接把完整端点（…/chat/completions、…/responses、…/messages）
         // 填进接口地址时，一律以端点为准——跳过按模型名的自动纠偏，否则用户填的 /messages
         // 会被 gpt 前缀改写成 Responses，每次 init 反复来回改（端点即事实，优先级最高）。
-        let endpointImplied = ModelConfig.impliedProtocol(from: c.baseURL)
+        let endpointImplied = ModelConfig.impliedProtocol(from: config.effectiveBaseURL)
         if let implied = endpointImplied {
             if implied != c.apiProtocol {
                 c.compatLevel = 0
@@ -314,7 +314,7 @@ final class OpenAIClient {
                 c.apiProtocol = implied
             }
         } else if c.protocolAutoFixEnabled {
-            let corrected = ModelConfig.autoCorrectProtocol(model: c.model, provider: c.provider, current: c.apiProtocol)
+            let corrected = ModelConfig.autoCorrectProtocol(model: config.effectiveModel, provider: c.provider, current: c.apiProtocol)
             if corrected != c.apiProtocol {
                 // 协议变了, 旧的 compatLevel 记忆(尤其 L5=Responses)基于旧协议不再适用 → 重置到 L0 重新试探
                 c.compatLevel = 0
@@ -694,7 +694,7 @@ final class OpenAIClient {
     private func nextLevel(after level: Int, hasTools: Bool, avoidL5: Bool = false) -> Int {
         // 2026-11-02 通用接口：用户手填完整端点 → 端点已锁定，L5 会切到别的端点/别的请求体格式，
         // 直接跳过（不切端点，只降载荷：L2→L3→L4）。
-        let endpointLocked = ModelConfig.hasExplicitEndpoint(config.baseURL)
+        let endpointLocked = ModelConfig.hasExplicitEndpoint(config.effectiveBaseURL)
         if level == 2, hasTools, !avoidL5, !endpointLocked { return 5 }
         if level == 5 { return 3 }
         if level >= 4 { return 6 }   // 哨兵：链尾，避免 L4→L5→L3 循环
@@ -2754,7 +2754,7 @@ final class UsageRecorder {
             "ts": Date().timeIntervalSince1970,
             "name": config.name,
             "provider": config.provider,
-            "baseURL": config.baseURL,
+            "baseURL": config.effectiveBaseURL,
             "model": config.effectiveModel,
             "ok": ok,
             "elapsedMs": elapsedMs,
