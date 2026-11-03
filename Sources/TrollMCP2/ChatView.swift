@@ -632,6 +632,45 @@ struct ChatView: View {
         store.send(text, using: cfg, reasoningLevel: thinkEnabled ? reasoning : 5, smartSearch: smartSearch)
     }
 
+    /// 2026-11-03 **编译修复**（CI 实测报错）：
+    ///
+    ///   ChatView.swift:673:41: error: the compiler is unable to type-check
+    ///   this expression in reasonable time
+    ///
+    /// 原因：MessageBubble 有 11 个参数，其中 5 个是闭包、3 个是 @State 相关的
+    /// 表达式（isStreaming/forceType 都是 `store.xxx == msg.id` 的比较）。
+    /// 这样的构造直接内联在 `ForEach { switch { case .msg } }` 两层泛型嵌套里时，
+    /// Swift 的类型推断器要枚举的组合数爆炸，直接在 60 秒上限处放弃。
+    ///
+    /// 修法：把这个构造提成独立方法并用 `-> some View` 显式给出返回类型。
+    /// 类型锚点一给出，推断器就不用再猜整棵树，很快就能过。
+    /// 这是 Apple 官方推荐的解法（"try breaking up the expression"）。
+    @ViewBuilder
+    private func bubble(for msg: ChatMessage) -> some View {
+        let fast = scroll.isScrollingFast
+        let sel = selectionMode
+        let picked = selectedIds.contains(msg.id)
+        let streaming = store.streamingMessageId == msg.id
+        let produced = store.liveProducedID == msg.id
+        MessageBubble(
+            message: msg,
+            fastScrolling: fast,
+            selectionMode: sel,
+            isSelected: picked,
+            onToggleSelect: { toggleSelect(msg.id) },
+            onCopy: { copyMessage(msg) },
+            onShare: { shareMessage(msg) },
+            onWithdraw: { withdraw(msg) },
+            onOpenSubAgent: { tid, fallback in
+                subAgentDetailTaskID = tid
+                subAgentDetailFallback = fallback
+            },
+            isStreaming: streaming,
+            forceType: produced,
+            thinkEnabled: thinkEnabled
+        )
+    }
+
     private var messageList: some View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottomTrailing) {
@@ -659,23 +698,7 @@ struct ChatView: View {
                         ForEach(ChatListGrouping.group(store.currentMessages), id: \.id) { item in
                             switch item {
                             case .msg(let msg):
-                                MessageBubble(
-                                    message: msg,
-                                    fastScrolling: scroll.isScrollingFast,
-                                    selectionMode: selectionMode,
-                                    isSelected: selectedIds.contains(msg.id),
-                                    onToggleSelect: { toggleSelect(msg.id) },
-                                    onCopy: { copyMessage(msg) },
-                                    onShare: { shareMessage(msg) },
-                                    onWithdraw: { withdraw(msg) },
-                                    onOpenSubAgent: { tid, fallback in
-                                        subAgentDetailTaskID = tid
-                                        subAgentDetailFallback = fallback
-                                    },
-                                    isStreaming: store.streamingMessageId == msg.id,
-                                    forceType: store.liveProducedID == msg.id,
-                                    thinkEnabled: thinkEnabled
-                                )
+                                bubble(for: msg)
                                 .id(msg.id)
                             case .tools(let msgs):
                                 // 2026-11-03 修「怎么滑都回不到最底部 / 上滑到底内容还在动」：
@@ -1629,23 +1652,11 @@ struct ChatView: View {
             if toolsRunExpanded.contains(gid) {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(msgs) { msg in
-                        MessageBubble(
-                            message: msg,
-                            selectionMode: selectionMode,
-                            isSelected: selectedIds.contains(msg.id),
-                            onToggleSelect: { toggleSelect(msg.id) },
-                            onCopy: { copyMessage(msg) },
-                            onShare: { shareMessage(msg) },
-                            onWithdraw: { withdraw(msg) },
-                            onOpenSubAgent: { tid, fallback in
-                                subAgentDetailTaskID = tid
-                                subAgentDetailFallback = fallback
-                            },
-                            isStreaming: store.streamingMessageId == msg.id,
-                            forceType: store.liveProducedID == msg.id,
-                            thinkEnabled: thinkEnabled
-                        )
-                        .id(msg.id)
+                        // 与主列表共用同一个构造方法：一是避免同样的
+                        // "unable to type-check in reasonable time"，
+                        // 二是保证两处的回调/样式永远一致（以前是复制粘贴，容易改漏）
+                        bubble(for: msg)
+                            .id(msg.id)
                     }
                 }
                 .padding(.leading, 6)

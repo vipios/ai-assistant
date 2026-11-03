@@ -2587,7 +2587,10 @@ final class ConversationStore: ObservableObject {
             // 没有闭合标签、没有 parameter 段，参数只能从标签属性里抠。
             // 必须和上面那些 invoke 形态比"谁出现得更早"，否则同一段文本里
             // 混用两种写法时会打乱顺序（模型是按顺序表达的意图）。
-            if let selfRange = firstSelfClosingRange(in: remaining) {
+            // 注意：这个函数的参数是**无标签**的（定义处是 `_ s: String`），
+            // 不能写 firstSelfClosingRange(in: ...)——CI 已实测报
+            // error: extraneous argument label 'in:' in call
+            if let selfRange = firstSelfClosingRange(remaining) {
                 if bestRange == nil || selfRange.full.lowerBound < bestRange!.lowerBound {
                     // 自闭合优先于 invoke
                     let tagName = selfRange.name
