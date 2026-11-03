@@ -64,6 +64,37 @@ mkdir -p "$APP"
 cp "$BIN" "$APP/TrollAgent"
 cp Support/Info.plist "$APP/Info.plist"
 
+# 2026-11-03 **桌面图标修复**（用户反馈「ipa 的桌面图标还是没有变，还是原来的图标」）：
+#
+# 根因：Support/Info.plist 里明明声明了
+#   CFBundleIconFiles = [AppIcon60x60, AppIcon1024x1024]
+#   CFBundleIconName  = AppIcon
+# 但打包脚本从头到尾**没有把任何一张 AppIcon*.png 拷进 .app**（全仓库 grep 无命中）。
+# Info.plist 指的是不存在的文件，iOS 只能回落到默认图标/上一版缓存 ——
+# 换多少次图标都白换。
+#
+# 这里按 iOS 的图标查找规则补齐：
+#   · CFBundleIconFiles 里的 "AppIcon60x60" → 实际文件名 AppIcon60x60@2x.png / @3x.png，
+#     iOS 按屏幕倍率自动选取，所以两个倍率都要有
+#   · 另放一张 AppIcon.png（1024）作为 cfver 兜底
+#   · 代码里 ChatView / OnboardingView 用 UIImage(named:) 取图标，也依赖这些文件在包内
+if [ -d "Resources" ]; then
+    ICON_N=0
+    for f in Resources/AppIcon*.png Resources/AppIcon.png; do
+        [ -f "$f" ] || continue
+        cp "$f" "$APP/$(basename "$f")"
+        ICON_N=$((ICON_N+1))
+    done
+    # CFBundleIconName 指向的 AppIcon 若没有独立文件，用 1024 版兜底，
+    # 否则 Xcode 14+/iOS 16 上 CFBundleIconName 优先，找不到就白图标。
+    if [ ! -f "$APP/AppIcon.png" ] && [ -f "Resources/AppIcon1024x1024.png" ]; then
+        cp "Resources/AppIcon1024x1024.png" "$APP/AppIcon.png"
+        ICON_N=$((ICON_N+1))
+    fi
+    echo ">>> bundled icons: $ICON_N 个"
+    ls -la "$APP"/AppIcon*.png 2>/dev/null || echo ">>> WARN: 包里没有 AppIcon*.png，桌面图标会回落成默认"
+fi
+
 # v2.9.133: 版本注入——CI 传 RELEASE_VERSION 时覆盖产物版本，
 # 解决"构建产物版本永远停在仓库写死值、装上分不清新旧"的脱节问题。
 # 未传时保持 Support/Info.plist 原值（本地构建默认）。

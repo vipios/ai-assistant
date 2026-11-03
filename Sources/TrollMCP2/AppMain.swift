@@ -55,6 +55,24 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // 崩溃现场写 Documents/crash.log（复现后直接取日志定位）
         CrashReporter.install()
 
+        // 2026-11-03 **崩溃循环自救**（用户反馈「点击桌面图标进不去，一直闪退」）：
+        //
+        // 场景：某条聊天消息会让渲染崩溃，而 App 每次启动都自动打开上次会话 →
+        // 每次都崩在同一处 → 用户被彻底锁在门外，连删掉那条消息的机会都没有。
+        //
+        // 这里在启动最早期判断：如果连续 2 次都没能跑到主界面，就进安全模式，
+        // 本次不自动打开上次会话，直接停到会话列表。用户能进去自己处理。
+        // 不删任何数据。
+        //
+        // 必须放在最前面（在 ConversationStore 初始化之前）——会话加载是在
+        // store 的 init 里发起的，晚于这里的判断就来不及了。
+        if CrashBreadcrumb.shared.registerLaunchAttempt() {
+            CrashBreadcrumb.safeModeThisLaunch = true
+            CrashBreadcrumb.shared.mark("*** 连续启动失败 → 进入安全模式（不自动打开上次会话）***")
+            fputs("[appmain] SAFE MODE: 连续启动失败，本次跳过自动打开上次会话\n", stderr)
+        }
+        CrashBreadcrumb.shared.mark("—— App 启动 v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") ——")
+
         // v2.9.368：全局 UITextView 零内边距——TextEditor 默认有 8pt 上下内边距，
         // 导致输入框高度过大；全局清零后 TextEditor 高度紧贴文字。
         UITextView.appearance().textContainerInset = .zero
@@ -94,6 +112,15 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         }
 
         CrashCatcher.install()  // v2.9.145c：最先注册崩溃捕获，闪退自动落盘 crash/ 可查
+
+        // 2026-11-03：诊断日志自动回流。
+        // 用户要求「出问题自动回日志给你看，不要让我手动导」——
+        // 上次若异常结束（或有过异常请求），这里把现场传上去；传成功就标记，不重复传。
+        // 放后台队列：上传失败也不能影响启动速度。
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
+            DiagnosticUploader.shared.uploadPendingIfNeeded()
+        }
+
         Workspace.ensure()
         Workspace.ensureBundledTweaks()  // v2.9.62：把内置 dylib（MemoryTweak 等）复制到工作区，AI 可直接 artifact.find 定位
         ConfigMigration.migrateIfNeeded()  // v2.9.126：配置 schema 迁移（防模块脱节：升级后旧配置结构自动搬运）
@@ -214,6 +241,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     // v2.9.10：进后台时申请后台任务，让正在进行的请求有保活窗口（最多 3 分钟）
     func applicationDidEnterBackground(_ application: UIApplication) {
+        // 2026-11-03：进后台时补写「正常退出」标记。
+        // 用户平时是划到后台而不是杀进程，所以这个时机最能代表「App 是正常被挂起的」。
+        // 下次冷启动若发现标记太旧/不存在，才判定上次是崩了。
+        CrashBreadcrumb.shared.markCleanExit()
+        CrashBreadcrumb.shared.mark("—— 进入后台 ——")
         // 2026-11-03 修「切到别的 App 再回来，AI 自己停工了」（用户连续多次反馈）：
         //
         // 以前只有 beginBackgroundTask 给 180 秒窗口，窗口一耗尽就

@@ -93,8 +93,23 @@ struct RelayAdminView: View {
     @State private var isUnlocked = false          // 已拿到密钥，可以显示 WebView
     @State private var errorText = ""
     @State private var reloadToken = 0             // 变更即触发 WebView reload
-    @State private var isLoading = true
+    // 2026-11-03 **转圈修复**（用户截图：蓝色按钮里一直转圈、点不动）：
+    //
+    // 原来这里是 `@State private var isLoading = true`。这个变量在**两个场景**共用：
+    //   ① 解锁表单里表示「正在校验密码」
+    //   ② WebView 里表示「页面正在加载」
+    // 初始值写 true，而解锁表单刚打开时**没有任何代码把它设回 false**
+    // （只有 unlock() 的 probe 回调才会设）——于是按钮一进来就是「校验中」的样子，
+    // 永远转圈且 disabled，用户根本点不了。这就是截图里那个现象。
+    //
+    // 修法：校验状态和页面加载状态彻底分开。这里只管校验，初始 false。
+    @State private var isVerifying = false
+    @State private var isLoading = false
     @State private var titleText = L10n.t("i18n_1511")
+    /// 密码是否明文显示（小眼睛）
+    @State private var revealPassword = false
+    /// 校验结果：nil=无、true=成功、false=失败。用于决定横幅样式。
+    @State private var verifyOK: Bool? = nil
 
     var body: some View {
         CompatNav {
@@ -155,7 +170,7 @@ struct RelayAdminView: View {
 
     private var unlockForm: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(L10n.t("i18n_1513"))
                         .font(.title3.weight(.semibold))
@@ -185,38 +200,39 @@ struct RelayAdminView: View {
                     Text(L10n.t("i18n_1515"))
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    SecureField("输入一次，之后不用再输", text: $passwordInput)
-                        .font(.system(.body, design: .monospaced))
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                        .padding(10)
-                        .background(Color.secondary.opacity(0.1))
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    // 2026-11-03：换成带小眼睛的输入框（用户两次点名要求）
+                    SecretInputField(
+                        text: $passwordInput,
+                        revealed: $revealPassword,
+                        placeholder: "输入一次，之后不用再输")
                 }
 
-                if !errorText.isEmpty {
-                    Text(errorText)
-                        .font(.caption)
-                        .foregroundColor(.red)
-                }
+                // 2026-11-03：确定 / 取消 + 结果反馈（用户原话「点击确定要有提示
+                // 登录成功还是失败的样式」）。原来只有一个蓝按钮，成功失败都没样式。
+                ConfirmCancelRow(
+                    confirmTitle: "确定",
+                    cancelTitle: "取消",
+                    canConfirm: canSubmit,
+                    busy: isVerifying,
+                    onConfirm: unlock,
+                    onCancel: {
+                        passwordInput = ""
+                        revealPassword = false
+                        errorText = ""
+                        verifyOK = nil
+                    })
 
-                Button(action: unlock) {
-                    HStack {
-                        Spacer()
-                        if isLoading {
-                            ProgressView().scaleEffect(0.85)
-                        } else {
-                            Text(L10n.t("i18n_1516"))
-                                .fontWeight(.semibold)
-                        }
-                        Spacer()
+                // 结果横幅：成功绿勾、失败红叉，一眼可辨
+                if isVerifying {
+                    InlineResultBanner(kind: .info, text: "正在验证密码，请稍候…")
+                } else if let ok = verifyOK {
+                    if ok {
+                        InlineResultBanner(kind: .success, text: "登录成功，正在打开后台…")
+                    } else {
+                        InlineResultBanner(kind: .failure,
+                                           text: errorText.isEmpty ? "登录失败，请检查密码和地址" : errorText)
                     }
-                    .padding(.vertical, 12)
-                    .background(canSubmit ? Color.blue : Color.secondary.opacity(0.25))
-                    .foregroundColor(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
-                .disabled(!canSubmit || isLoading)
 
                 Text(L10n.t("i18n_1517"))
                     .font(.caption2)
@@ -235,25 +251,37 @@ struct RelayAdminView: View {
     }
 
     /// 校验密码 → 保存 → 打开后台
+    ///
+    /// 2026-11-03 修：原来用 `isLoading` 兼做「校验中」标记，初始值还是 true，
+    /// 导致一进页面按钮就转圈。现在改用独立的 `isVerifying`（初始 false），
+    /// 并加上成功/失败两种明确反馈。
     private func unlock() {
         let addr = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = passwordInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !addr.isEmpty, !key.isEmpty else { return }
 
-        isLoading = true
+        isVerifying = true
+        verifyOK = nil
         errorText = ""
 
         // 真校验一次：拿 /admin/api/status 试打，密钥对才保存——避免存错密码后
         // 每次都白屏（后台对错密钥返回 401，我们据此提示）。
         RelayAdminWebView.probe(addr: addr, key: key) { ok, message in
-            isLoading = false
+            isVerifying = false
+            verifyOK = ok
             if ok {
                 RelayAdminCredential.shared.baseURL = addr
                 RelayAdminCredential.shared.save(accessKey: key)
                 baseURL = addr
                 passwordInput = ""      // 明文立刻清掉，不进内存常驻
-                isUnlocked = true
-                reloadToken += 1
+                revealPassword = false
+                // 让「登录成功」的绿横幅停留一小会儿再进后台——
+                // 用户要求「点击确定要有提示成功」，切换太快就看不到提示了
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                    isUnlocked = true
+                    reloadToken += 1
+                    verifyOK = nil
+                }
             } else {
                 errorText = message.isEmpty ? "密码或地址不正确" : message
             }

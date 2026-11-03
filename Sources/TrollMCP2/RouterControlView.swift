@@ -1,11 +1,21 @@
 import SwiftUI
+// UIPasteboard（复制公网地址）在 UIKit 里；SwiftUI 会间接带入，
+// 但显式引入更稳（换 Swift 版本时传递关系可能变，项目里有过先例）
+import UIKit
 
-/// 路由器控制面板（2026-11-02 新增，入口在输入框右侧「+」的附件栏）。
+/// 路由器控制面板（2026-11-02 新增，2026-11-03 大改）。
 ///
-/// 三个动作，代价差三个数量级，所以按危险度从上到下排：
-///   · 重启中转站 —— 1 秒恢复，只影响 AI 后台，家里其它人无感
-///   · 重启路由器 —— 全家断网约 40 秒，最后手段
-/// 每个动作都要二次确认，且必须填后台密钥（就是打开网页后台时输的那串）。
+/// 改版原因（用户截图反馈「这个界面你没有把我需要的添加进来」）：
+/// 原来整页只有「一个地址 + 一个密码框 + 两个重启按钮」，
+/// 用户真正想看的**设备状态**和**公网地址**一个都没有。
+///
+/// 现在页面从上到下是：
+///   ① 设备状态卡 —— 在线/离线、运行时长、内存、负载（来自 /admin/api/device）
+///   ② 公网地址卡 —— 从 Gist 自动取最新地址，点一下就刷新（用户明确要求的）
+///   ③ 后台密钥 —— 小眼睛 + 确定/取消 + 验证成功失败样式
+///   ④ 两个动作 —— 中转站重启（蓝）/ 路由器重启（红）
+///
+/// 按钮颜色按用户最终确认：「一个蓝色一个红色」——中转站蓝、路由器红。
 struct RouterControlView: View {
     @Environment(\.dismiss) private var dismiss
 
@@ -21,6 +31,22 @@ struct RouterControlView: View {
 
     /// 重启中转站后等它起来的倒计时提示
     @State private var waitingBack = false
+
+    // MARK: 新增状态（2026-11-03）
+    @State private var revealKey = false
+    /// 密钥校验结果：nil 未校验 / true 通过 / false 失败
+    @State private var keyCheckOK: Bool? = nil
+    @State private var keyChecking = false
+    /// 设备状态
+    @State private var device: RelayDeviceStatus? = nil
+    @State private var deviceLoading = false
+    @State private var deviceError: String = ""
+    /// 公网地址（来自 Gist）
+    @State private var publicAddr: RelayPublicAddress? = nil
+    @State private var publicLoading = false
+    @State private var publicError: String = ""
+    /// 设备状态自动刷新
+    @State private var refreshTimer: Timer? = nil
 
     private enum RouterAction: String, Identifiable {
         case relay, reboot
@@ -44,7 +70,7 @@ struct RouterControlView: View {
             case .reboot: return L10n.t("i18n_1543")
             }
         }
-        /// 重启路由器更危险，用红色
+        /// 用户最终确认：「路由器重启」用红色警示可以，「这个」改成蓝色 → 一蓝一红
         var tint: Color {
             switch self {
             case .relay:  return .blue
@@ -59,10 +85,9 @@ struct RouterControlView: View {
                 Color(.systemGroupedBackground).ignoresSafeArea()
                 ScrollView {
                     VStack(spacing: 16) {
-                        headerCard
-                        if !keyLoaded {
-                            keyCard
-                        }
+                        deviceCard
+                        publicAddressCard
+                        keyCard
                         actionCard(.relay)
                         actionCard(.reboot)
                         if !statusLine.isEmpty {
@@ -81,9 +106,18 @@ struct RouterControlView: View {
                     Button(L10n.t("i18n_1512")) { dismiss() }
                 }
             }
-            .onAppear(perform: loadKey)
+            .onAppear {
+                loadKey()
+                // 进页面就把设备状态和公网地址拉一遍，不等用户点
+                refreshDevice()
+                refreshPublicAddress()
+                startAutoRefresh()
+            }
+            .onDisappear {
+                refreshTimer?.invalidate()
+                refreshTimer = nil
+            }
             // 二次确认：两条路径都走同一个 dialog，标题/描述/按钮颜色由当前动作决定。
-            // 用 presenting 把动作一起带进闭包，避免在点击时再读可能已被清空的 @State。
             .confirmationDialog(
                 confirmAction?.title ?? L10n.t("i18n_1535"),
                 isPresented: Binding(
@@ -105,41 +139,224 @@ struct RouterControlView: View {
         }
     }
 
-    // MARK: - 卡片
+    // MARK: - 设备状态卡
 
-    private var headerCard: some View {
-        HStack(spacing: 12) {
-            Image(systemName: foundHost == nil ? "wifi.router" : "wifi.router.fill")
-                .font(.system(size: 26, weight: .medium))
-                .foregroundColor(.blue)
-                .frame(width: 46, height: 46)
-                .background(Color.blue.opacity(0.12))
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            VStack(alignment: .leading, spacing: 3) {
-                Text(foundHost ?? L10n.t("i18n_1536"))
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                Text(L10n.t("i18n_1538"))
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+    private var deviceCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Image(systemName: foundHost == nil ? "wifi.router" : "wifi.router.fill")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundColor(foundHost == nil ? .secondary : .blue)
+                    .frame(width: 40, height: 40)
+                    .background((foundHost == nil ? Color.secondary : Color.blue).opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    // 标题：优先显示设备实际地址
+                    Text(foundHost ?? L10n.t("i18n_1536"))
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    // 在线状态：绿点 = 在线，灰点 = 未连上
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(device != nil ? Color.green : Color.secondary.opacity(0.5))
+                            .frame(width: 6, height: 6)
+                        Text(device != nil ? "在线" : (deviceError.isEmpty ? "检测中…" : "未连上"))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+                Button {
+                    refreshDevice()
+                } label: {
+                    if deviceLoading {
+                        ProgressView().scaleEffect(0.7)
+                            .frame(width: 30, height: 30)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 30, height: 30)
+                            .contentShape(Rectangle())
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(deviceLoading)
             }
-            Spacer(minLength: 0)
+
+            if let d = device {
+                Divider().opacity(0.5)
+                // 两列小格子：运行时长 / 内存 / 负载 / 中转站占用
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 10),
+                                    GridItem(.flexible(), spacing: 10)], spacing: 10) {
+                    metricTile("已运行", d.uptimeText, icon: "clock")
+                    metricTile("可用内存", d.memAvailText, icon: "memorychip",
+                               warn: d.memLow)
+                    metricTile("负载", d.loadText, icon: "gauge",
+                               warn: d.loadHigh)
+                    metricTile("中转站进程", d.relayRssText, icon: "server.rack")
+                }
+                if d.swapHigh {
+                    InlineResultBanner(kind: .failure,
+                                       text: "交换内存已用到 \(Int(d.swapUsedPct))%，设备很吃力。建议点下面的「中转站重启」释放一下。")
+                }
+            } else if !deviceError.isEmpty {
+                InlineResultBanner(kind: .failure, text: deviceError)
+            }
         }
         .padding(14)
         .background(Color(.secondarySystemGroupedBackground))
         .cornerRadius(14)
     }
 
+    private func metricTile(_ title: String, _ value: String,
+                            icon: String, warn: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 9, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 10))
+            }
+            .foregroundColor(.secondary)
+            Text(value)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundColor(warn ? .orange : .primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 8)
+        .background(Color.secondary.opacity(0.07))
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+
+    // MARK: - 公网地址卡
+
+    private var publicAddressCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "globe")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.blue)
+                Text("公网地址")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Spacer(minLength: 0)
+                Button {
+                    refreshPublicAddress(force: true)
+                } label: {
+                    if publicLoading {
+                        ProgressView().scaleEffect(0.6)
+                            .frame(width: 26, height: 26)
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.blue)
+                            .frame(width: 26, height: 26)
+                            .contentShape(Rectangle())
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(publicLoading)
+            }
+
+            if let p = publicAddr {
+                VStack(alignment: .leading, spacing: 6) {
+                    // 有域名就显示域名，没有就显示 IPv6 直连地址
+                    Text(p.bestAddress)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundColor(.primary)
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Text("更新于 \(p.updatedText)")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        if !p.ipv6.isEmpty {
+                            Text("· 含 IPv6")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        Button {
+                            UIPasteboard.general.string = p.bestAddress
+                            statusIsError = false
+                            statusLine = "公网地址已复制"
+                        } label: {
+                            HStack(spacing: 3) {
+                                Image(systemName: "doc.on.doc")
+                                    .font(.system(size: 9))
+                                Text("复制")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                            .foregroundColor(.blue)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            } else if !publicError.isEmpty {
+                InlineResultBanner(kind: .failure, text: publicError)
+            } else {
+                Text("正在从 Gist 获取最新公网地址…")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Text("设备每 3 分钟自动把当前位置写到 Gist，这里打开就会取最新值，不用手动点测试。")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary.opacity(0.85))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .background(Color(.secondarySystemGroupedBackground))
+        .cornerRadius(14)
+    }
+
+    // MARK: - 密钥卡（小眼睛 + 确定取消 + 结果样式）
+
     private var keyCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(L10n.t("i18n_1539"))
-                .font(.caption)
-                .foregroundColor(.secondary)
-            SecureField(L10n.t("i18n_1515"), text: $accessKey)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled(true)
-                .textFieldStyle(.roundedBorder)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 4) {
+                Image(systemName: "key.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                Text(L10n.t("i18n_1539"))
+                    .font(.caption)
+            }
+            .foregroundColor(.secondary)
+
+            SecretInputField(
+                text: $accessKey,
+                revealed: $revealKey,
+                placeholder: L10n.t("i18n_1515"))
+
+            // 用户要求：输完要有确定和取消，点确定要看到成功/失败
+            ConfirmCancelRow(
+                confirmTitle: "确定",
+                cancelTitle: "取消",
+                canConfirm: !accessKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                busy: keyChecking,
+                onConfirm: verifyKey,
+                onCancel: {
+                    // 取消 = 回到已保存的那把密钥，不动用户的既有配置
+                    accessKey = RelayAdminCredential.shared.loadAccessKey() ?? ""
+                    revealKey = false
+                    keyCheckOK = nil
+                })
+
+            if keyChecking {
+                InlineResultBanner(kind: .info, text: "正在验证密钥…")
+            } else if let ok = keyCheckOK {
+                if ok {
+                    InlineResultBanner(kind: .success, text: "密钥有效，可以执行下面的操作")
+                } else {
+                    InlineResultBanner(kind: .failure, text: "密钥无效，后台拒绝了这次请求。请核对后重填。")
+                }
+            }
         }
         .padding(14)
         .background(Color(.secondarySystemGroupedBackground))
@@ -167,7 +384,9 @@ struct RouterControlView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(action.title)
                         .font(.subheadline.weight(.semibold))
-                        .foregroundColor(.primary)
+                        // 用户要求「和原版一样」：标题用动作自身的颜色（蓝/红），
+                        // 不写死 primary——原来两行都是黑字，看不出危险度差异。
+                        .foregroundColor(action.tint)
                     Text(action.detail)
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -175,7 +394,6 @@ struct RouterControlView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
-                // 等待设备恢复期间显示转圈并锁住按钮——避免用户连点导致重复重启
                 if busy || waitingBack {
                     ProgressView()
                 } else {
@@ -221,23 +439,93 @@ struct RouterControlView: View {
 
     // MARK: - 逻辑
 
-    /// 优先复用中转站后台已保存的那把密钥（用户此前输过一次就够）
     private func loadKey() {
         if let saved = RelayAdminCredential.shared.loadAccessKey(), !saved.isEmpty {
             accessKey = saved
             keyLoaded = true
         }
         Task {
-            // 预热：顺手探一下路由器在不在，让页面一打开就能看出「在家/不在家」
             let host = await findHost()
             await MainActor.run {
                 foundHost = host
+                refreshDevice()
             }
         }
     }
 
     private func findHost() async -> String? {
         await RouterControl.discover(candidates: RouterControl.lanCandidates())
+    }
+
+    /// 每 20 秒自动刷设备状态——用户要的是「打开就能看到真实状态」，
+    /// 不是「打开一片空白，等你自己点刷新」。
+    private func startAutoRefresh() {
+        refreshTimer?.invalidate()
+        let t = Timer(timeInterval: 20, repeats: true) { _ in
+            refreshDevice(silent: true)
+        }
+        RunLoop.main.add(t, forMode: .common)
+        refreshTimer = t
+    }
+
+    private func refreshDevice(silent: Bool = false) {
+        guard !deviceLoading else { return }
+        deviceLoading = true
+        if !silent { deviceError = "" }
+
+        // 优先用已探测到的地址；没有就用后台里存的地址
+        let base = foundHost ?? RelayAdminCredential.shared.baseURL
+        let key = accessKey.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        RelayBackend.fetchDeviceStatus(base: base, key: key) { result in
+            deviceLoading = false
+            switch result {
+            case .success(let d):
+                device = d
+                deviceError = ""
+            case .failure(let msg):
+                // 静默刷新失败时不覆盖上一次的好数据，避免状态卡闪来闪去
+                if !silent || device == nil { deviceError = msg }
+            }
+        }
+    }
+
+    private func refreshPublicAddress(force: Bool = false) {
+        if publicLoading { return }
+        publicLoading = true
+        if force { publicError = "" }
+        RelayBackend.fetchPublicAddress { result in
+            publicLoading = false
+            switch result {
+            case .success(let p):
+                publicAddr = p
+                publicError = ""
+            case .failure(let msg):
+                if publicAddr == nil { publicError = msg }
+            }
+        }
+    }
+
+    /// 真打一次后台接口验证密钥——不能只看格式对不对
+    private func verifyKey() {
+        let key = accessKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        keyChecking = true
+        keyCheckOK = nil
+        let base = foundHost ?? RelayAdminCredential.shared.baseURL
+
+        RelayBackend.fetchDeviceStatus(base: base, key: key) { result in
+            keyChecking = false
+            switch result {
+            case .success:
+                keyCheckOK = true
+                // 验证通过就记住，省得下次再输
+                RelayAdminCredential.shared.save(accessKey: key)
+                keyLoaded = true
+            case .failure:
+                keyCheckOK = false
+            }
+        }
     }
 
     private func run(_ action: RouterAction) async {
@@ -256,9 +544,6 @@ struct RouterControlView: View {
             statusLine = L10n.t("i18n_1553")
         }
 
-        // 找路由器：内网优先（并发探测，最坏 1.2 秒）。
-        // 这里不做"公网域名兜底"——本项目没有可靠的公网域名来源，
-        // 与其留一段永远为 nil 的假兜底，不如让失败信息明确指向 ZeroTier / 家里 WiFi。
         let host = await RouterControl.discover(candidates: RouterControl.lanCandidates())
 
         guard let target = host else {
@@ -280,12 +565,13 @@ struct RouterControlView: View {
                     statusLine = L10n.t("i18n_1556")
                     waitingBack = true
                 }
-                // 实测：重启后约 9 秒才稳定应答，前 6 秒连不上。等 10 秒再判。
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
                 await MainActor.run {
                     waitingBack = false
                     busy = false
                     statusLine = L10n.t("i18n_1557")
+                    // 重启完立刻重拉一次状态，让用户看到内存释放的效果
+                    refreshDevice(silent: true)
                 }
             case .reboot:
                 try await RouterControl.reboot(host: target, key: key)
@@ -293,12 +579,12 @@ struct RouterControlView: View {
                     statusLine = L10n.t("i18n_1558")
                     waitingBack = true
                 }
-                // 指令已受理，路由器 2 秒后真重启，约 40 秒恢复。不干等，直接告诉用户。
                 try? await Task.sleep(nanoseconds: 45_000_000_000)
                 await MainActor.run {
                     waitingBack = false
                     busy = false
                     statusLine = L10n.t("i18n_1559")
+                    refreshDevice(silent: true)
                 }
             }
         } catch let e as RouterError {
@@ -308,7 +594,10 @@ struct RouterControlView: View {
                 statusIsError = true
                 statusLine = e.errorDescription ?? L10n.t("i18n_1560")
                 if case .noKey = e { keyLoaded = false }
-                if case .badKey = e { keyLoaded = false }
+                if case .badKey = e {
+                    keyLoaded = false
+                    keyCheckOK = false
+                }
             }
         } catch {
             await MainActor.run {

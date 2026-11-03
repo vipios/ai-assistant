@@ -46,6 +46,8 @@ struct ChatView: View {
     @State private var showRelayAdmin = false
     // 2026-11-02：路由器控制（附件栏入口）——中转站重启 / 路由器重启
     @State private var showRouterControl = false
+    // 2026-11-03：聊天诊断（顶栏听诊器图标）——看每次请求为什么停了、崩前在做什么
+    @State private var showDiagnostics = false
 
     // v2.9.9：多模态图片（data URL）。选择相册图片后转 base64 暂存，发送时随消息传给模型
     @State private var pendingImages: [String] = []
@@ -182,6 +184,25 @@ struct ChatView: View {
                                     .frame(width: 24, height: 24)
                             }
                             .disabled(store.currentMessages.isEmpty)
+                            // 2026-11-03：诊断入口。
+                            // 用户要求「出问题自动回日志让我查看」——这里就是查看的地方。
+                            // 平时不打扰；有异常请求时图标带一个小红点提示去看。
+                            Button(action: { showDiagnostics = true }) {
+                                ZStack(alignment: .topTrailing) {
+                                    Image(systemName: "stethoscope")
+                                        .font(.system(size: 18, weight: .semibold))
+                                        .foregroundColor(.secondary)
+                                        .frame(width: 24, height: 24)
+                                    if ChatDiagnostics.shared.abnormalCount > 0 {
+                                        Circle()
+                                            .fill(Color.orange)
+                                            .frame(width: 6, height: 6)
+                                            .offset(x: 1, y: -1)
+                                    }
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(PlainButtonStyle())
                         }
                     }
                 }
@@ -371,6 +392,16 @@ struct ChatView: View {
                     .presentationDragIndicator(.visible)
             } else {
                 RouterControlView()
+            }
+        }
+        // 2026-11-03：聊天诊断——「AI 莫名停止」「闪退」都在这里看原因
+        .sheet(isPresented: $showDiagnostics) {
+            if #available(iOS 16.0, *) {
+                ChatDiagnosticsView()
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+            } else {
+                ChatDiagnosticsView()
             }
         }
         // v6.1.5-14bm：/tools → 工具中心（三层工具总览，给用户看）
@@ -612,7 +643,12 @@ struct ChatView: View {
                     // superview 链直达底层 UIScrollView，KVO 精确上报 contentOffset/contentSize/bounds。
                     // offset 已按原 marker 语义转换（顶部=0，向下为负），下方显示矩阵判断无需改动。
                     ScrollGeometryBridge(
-                        onOffset: { scroll.offset = $0 },
+                        onOffset: { v in
+                            scroll.offset = v
+                            // 2026-11-03：标记「正在滚动」→ 消息正文临时降级为轻量 Text，
+                            // 停手 0.3 秒后恢复 UITextView。修「快速上滑卡死」。
+                            scroll.noteScrolled()
+                        },
                         onContentHeight: { scroll.contentHeight = $0 },
                         onViewportHeight: { scroll.viewportHeight = $0 }
                     )
@@ -625,6 +661,7 @@ struct ChatView: View {
                             case .msg(let msg):
                                 MessageBubble(
                                     message: msg,
+                                    fastScrolling: scroll.isScrollingFast,
                                     selectionMode: selectionMode,
                                     isSelected: selectedIds.contains(msg.id),
                                     onToggleSelect: { toggleSelect(msg.id) },
@@ -1929,13 +1966,35 @@ struct ChatModelPickerSheet: View {
                     }) {
                         HStack(spacing: 10) {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(cfg.name)
-                                    .font(.body)
+                                // 2026-11-03 修（用户反馈「显示的不是供应商而是模型」）：
+                                // 原来主标题直接用 cfg.name —— 用户没改名时它等于模型名，
+                                // 整页看到的就是 deepseek-v4.1-flash，一个供应商都没有。
+                                // 现在：主标题=供应商友好名（自定义时用用户起的名字），
+                                // 副标题=模型名 + 接口地址主机，两者都带标签，不会再混。
+                                Text(cfg.supplierTitle)
+                                    .font(.body.weight(.medium))
                                     .foregroundColor(.primary)
-                                Text("\(cfg.model) · \(cfg.provider)")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(1)
+                                HStack(spacing: 4) {
+                                    Text("模型")
+                                        .font(.system(size: 9, weight: .semibold))
+                                        .foregroundColor(.secondary)
+                                        .padding(.horizontal, 4)
+                                        .padding(.vertical, 1)
+                                        .background(Color.secondary.opacity(0.12))
+                                        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                                    Text(cfg.model)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                if let host = cfg.endpointHost, !host.isEmpty {
+                                    Text(host)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary.opacity(0.75))
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
                             }
                             if cfg.supportsVision {
                                 Image(systemName: "photo")
@@ -2068,6 +2127,10 @@ private struct MessageTapModifier: ViewModifier {
 
 struct MessageBubble: View {
     let message: ChatMessage
+    // 2026-11-03：正在快速滚动 → 正文降级为轻量 Text（见 ChatScrollState.isScrollingFast 的注释）。
+    // 由 ChatView 透传下来而不是让每个气泡各自订阅：气泡数量多，
+    // 每个都自带 @ObservedObject 会多出几十个订阅者，反而更重。
+    var fastScrolling: Bool = false
     // v4.3.77：安装进度——工具"执行中"气泡渲染实时进度条（引用处位于本 struct）
     @ObservedObject private var installRegistry = InstallationRegistry.shared
     // v7.2.3-fix23.1：参数展开状态每气泡自管（原 ChatView 级 @State 在独立 struct 内
@@ -2372,7 +2435,8 @@ struct MessageBubble: View {
         if isUser {
             // 2026-11-02：用户消息也换成 UITextView（SelectableText）——长按系统菜单里多一项
             // 「复制全文」，同时保留拖手柄划词。打字机阶段仍用轻量 Text 避免高频刷新闪跳。
-            if isStreaming || (forceType && !Self.doneTyping(for: message.id)) {
+            // 2026-11-03：快速滚动期间也降级为 Text（fastScrolling）——见下方 assistant 分支注释。
+            if isStreaming || (forceType && !Self.doneTyping(for: message.id)) || fastScrolling {
                 Text(AttributedString(shown))
                     .font(.body)
                     .textSelection(.enabled)
@@ -2413,7 +2477,8 @@ struct MessageBubble: View {
                             }.count,
                             nsBody: { self.attributedBody($0) },
                             copyAllTitle: L10n.t("i18n_1530"),
-                            onCopyAll: { onCopy?() }
+                            onCopyAll: { onCopy?() },
+                            fastScrolling: fastScrolling
                         )
                             // v7.2.2：引用角标 [N] 可点击 → 来源卡浮层（拦截 minis://source?n= 链接）
                             .environment(\.openURL, OpenURLAction { url in

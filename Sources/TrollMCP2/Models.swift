@@ -424,6 +424,65 @@ extension ModelConfig {
         ("Gemini", "google", "Gemini", "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-pro", "Query key")
     ]
 
+    /// 2026-11-03：provider 内部代号 → 用户看得懂的供应商名。
+    ///
+    /// 为什么必须有这张表：用户新建配置时 `name` 默认是空的，或直接沿用了模型名，
+    /// 于是「选择模型供应商」页里每一行的主标题都显示成 `deepseek-v4.1-flash`，
+    /// 副标题也是 `deepseek-v4.1-flash · custom` —— 整页一个供应商名都看不到，
+    /// 用户的原话就是「你显示的不是供应商而是模型」。
+    /// 主标题改为按 provider 代号查友好名，查不到再退回 name / provider 原文。
+    static func providerDisplayName(_ provider: String) -> String {
+        switch provider.lowercased() {
+        case "openai":      return "OpenAI"
+        case "deepseek":    return "DeepSeek"
+        case "anthropic":   return "Anthropic"
+        case "zhipu":       return "智谱 GLM"
+        case "moonshot":    return "Kimi (Moonshot)"
+        case "qwen":        return "通义千问 (Qwen)"
+        case "minimax":     return "MiniMax"
+        case "step":        return "阶跃星辰 (Step)"
+        case "doubao":      return "豆包 (火山)"
+        case "openrouter":  return "OpenRouter"
+        case "xai":         return "xAI"
+        case "groq":        return "Groq"
+        case "mistral":     return "Mistral"
+        case "ollama":      return "Ollama (本地)"
+        case "azure":       return "Azure OpenAI"
+        case "google":      return "Gemini"
+        case "custom":      return "自定义接口"
+        default:
+            let p = provider.trimmingCharacters(in: .whitespacesAndNewlines)
+            return p.isEmpty ? "自定义接口" : p
+        }
+    }
+
+    /// 这条配置在列表里该用哪个当「供应商」标题。
+    ///
+    /// 优先用 provider 友好名；但用户明确改过 name（跟模型名/供应商名都不同）时
+    /// 尊重用户自己起的名字——那才是他认得出来的标识。
+    var supplierTitle: String {
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = ModelConfig.providerDisplayName(provider)
+        guard !n.isEmpty else { return base }
+        // name 只是模型名或供应商代号的复制品 → 说明没被有意义地改过，用友好名
+        if n.caseInsensitiveCompare(model) == .orderedSame { return base }
+        if n.caseInsensitiveCompare(provider) == .orderedSame { return base }
+        if n.caseInsensitiveCompare(base) == .orderedSame { return base }
+        return n
+    }
+
+    /// 接口地址的主机名部分（只用于列表里的一行小字，方便区分「同一个模型名的两个环境」）。
+    /// 解析失败就返回空，调用方据此不显示这一行——宁可没有，也不显示一串看不懂的东西。
+    var endpointHost: String? {
+        let raw = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+        var s = raw
+        if !s.lowercased().hasPrefix("http") { s = "http://" + s }
+        guard let u = URL(string: s), let h = u.host, !h.isEmpty else { return nil }
+        if let port = u.port { return "\(h):\(port)" }
+        return h
+    }
+
     /// v4.4.17：Base URL 规范化——OpenAI 格式端点 (Chat/Responses) 自动补 /v1，
     /// 用户已填 v1/含版本路径(如 /api/paas/v4、/compatible-mode/v1) 则不重复补。
     /// Anthropic(/anthropic) 与自定义端点不自动补。
@@ -1234,8 +1293,19 @@ final class ConversationStore: ObservableObject {
             }
             if let d = decoded, !d.isEmpty {
                 DispatchQueue.main.async {
-                    self.applyLoaded(d)
+                    // 2026-11-03 崩溃循环自救：
+                    // 若本次是「安全模式」（连续闪退过），不自动打开上次会话。
+                    // 因为上次的会话内容很可能就是崩溃源——自动打开它 = 再崩一次，
+                    // 用户永远进不去。这里只放弃"自动选中"，不删任何数据：
+                    // 会话列表照常显示，用户能自己点开、处理有问题的消息。
+                    if CrashBreadcrumb.safeModeThisLaunch {
+                        self.diag("SAFE-MODE: 跳过自动打开上次会话（连续启动失败）")
+                        self.applyLoaded(d, autoSelect: false)
+                    } else {
+                        self.applyLoaded(d)
+                    }
                     self.isLoadingData = false
+                    CrashBreadcrumb.shared.markLaunchSucceeded()
                 }
                 return
             }
@@ -1243,6 +1313,7 @@ final class ConversationStore: ObservableObject {
                 self.diag("LOADED-LEGACY-JSON (JSONL 加载失败或 fallback_flag 存在)")
                 self.loadLegacy()
                 self.isLoadingData = false
+                CrashBreadcrumb.shared.markLaunchSucceeded()
             }
         }
     }
@@ -1434,6 +1505,30 @@ final class ConversationStore: ObservableObject {
         activeConvId = nil
     }
 
+    /// 2026-11-03 新增：一轮请求「非正常收尾」时的统一复位。
+    ///
+    /// 为什么放在类内部而不是 ChatDiagnostics.swift 里：
+    /// `currentClient` / `thinkBuffer` / `activeConvId` 等都是 `private`，
+    /// 外部扩展访问不到。放在这里才合法。
+    ///
+    /// 为什么需要它：以前每个提前 `return` 的收尾分支都要自己抄一遍复位代码，
+    /// 抄漏一个就会出现「停止了但按钮还在转」或「下一轮串到上一轮」。
+    /// 现在统一走这里，只写一份。
+    func finishTurnInternal() {
+        isLoading = false
+        statusText = nil
+        requestRound = 0
+        runningTool = nil
+        currentClient?.cancel()
+        currentClient = nil
+        streamingMessageId = nil
+        liveProducedID = nil
+        thinkBuffer = ""
+        thinkingStartAt = nil
+        activeConvId = nil
+        TaskNotify.shared.endBackground()
+    }
+
     func clearCurrent() {
         guard let idx = selectedIndex else { return }
         var conv = conversations[idx]
@@ -1475,6 +1570,10 @@ final class ConversationStore: ObservableObject {
 
     func send(_ text: String, using config: ModelConfig, imageDataURLs: [String]? = nil,
               reasoningLevel: Int = 0, smartSearch: Bool = true, personaPrompt: String? = nil) {
+        // 2026-11-03：崩溃现场留痕——用户反馈「点发送就闪退」，闪退瞬间进程直接死，
+        // 只有崩之前 fsync 落盘的面包屑能事后看出崩在哪一步。
+        CrashBreadcrumb.shared.markTurn("发送", text: text)
+        CrashBreadcrumb.shared.mark("模型:\(config.model) 地址:\(config.effectiveBaseURL)")
         // v7.4.0-fix73b：请求进行中用户发新消息 → 取消当前请求（-999 静默不弹错）再发新，
         // 根治并发请求导致的双流式 ID 竞争、结果丢失/错乱（用户实测"请求完成无结果"）
         if isLoading {
@@ -1964,6 +2063,9 @@ final class ConversationStore: ObservableObject {
                 self.statusText = nil
                 switch result {
                 case .success(.text(let text, let thinking)):
+                    // 2026-11-03：崩溃现场留痕——用户反馈「回复完直接卡闪退」，
+                    // 崩点就在这段收尾渲染里。记下正文长度，崩了能对上。
+                    CrashBreadcrumb.shared.mark("收尾 正文:\(text.count)字 流式ID:\(self.streamingMessageId == nil ? "无" : "有")")
                     self.isLoading = false
                     self.currentClient = nil
                     self.requestRound = 0
@@ -2083,6 +2185,25 @@ final class ConversationStore: ObservableObject {
                         self.runLoop(config: config, tools: tools, disclosed: disclosed, depth: depth + 1, reasoningLevel: reasoningLevel, personaPrompt: personaPrompt)
                         return
                     }
+                    // 2026-11-03 静默停止修复（第 2 处）：
+                    // 空回复纠错已经用满 2 次，模型还是不给正文 —— 以前这里直接往下走，
+                    // 用户看到的就是「工具跑完了，然后什么都没有，也不说为什么」。
+                    if trimmedFinal.isEmpty && lastMsgIsTool && self.emptyReplyCorrectionCount >= 2 {
+                        self.emptyReplyCorrectionCount = 0
+                        Self.reportStop(
+                            to: self,
+                            title: "AI 停下了：只跑了工具，没给结论",
+                            body: """
+                            模型把工具都执行完了，但连续两次都没写正文（只回了个空的）。\
+                            这通常是模型端的问题，不是你的操作有误。
+
+                            建议这样：直接回一句「把上面的结果总结一下」，或者换个模型再试。
+
+                            工具的执行结果都在上面的卡片里，没有丢。
+                            """,
+                            reason: "空回复纠错达上限（2 次）")
+                        return
+                    }
                     self.emptyReplyCorrectionCount = 0
                     // 2026-11-03 核心修复（用户连续反馈「底部全是英文」「罢工，得再发继续」）：
                     //
@@ -2122,7 +2243,43 @@ final class ConversationStore: ObservableObject {
                                               personaPrompt: personaPrompt)
                         return
                     }
+                    // 2026-11-03 静默停止修复（用户原话「不知道怎么就停止了，也没有原因」）：
+                    // 走到这里说明模型连续 8 轮都在把工具调用写成正文（DSML/XML 文本），
+                    // 说明「反解 + 重跑」这条路对它无效，再转下去只会一直烧 token。
+                    // 以前是直接 return —— 工具没执行、正文里一屏英文、界面就这么停住了，
+                    // 用户完全不知道发生了什么。现在必须写一条看得懂的中文说明 + 给出路。
+                    if !textualCalls.isEmpty {
+                        self.trailStep(.done(.note, "已停止自动重试", detail: "连续 8 轮把工具调用写成正文", ok: false))
+                        Self.reportStop(
+                            to: self,
+                            title: "AI 停下了：工具调用格式不对",
+                            body: """
+                            这个模型连续 8 轮把「工具调用」写成正文（形如 <tool.xxx name="..." />），\
+                            而不是正常的结构化调用，自动执行已经重试到上限，所以停在这里。
+
+                            这样处理最省事：
+                            1. 换一个支持工具调用的模型（DeepSeek、GLM-4、GPT 系列都正常）
+                            2. 或者把下面这段复制给它，让它改回来：「请用 function calling 调用工具，\
+                            不要把调用写成 XML 正文」
+
+                            原始内容已保留在下面的气泡里，没有丢。
+                            """,
+                            reason: "文本工具调用连续失败 \(self.textualToolCallCorrections) 次")
+                        self.textualToolCallCorrections = 0
+                        self.activeConvId = nil
+                        return
+                    }
                     self.textualToolCallCorrections = 0
+                    // 2026-11-03：一轮正常收尾 → 记进诊断日志。
+                    // 有了这条，诊断页才能区分「正常完成」和「一句话没说完就没了」。
+                    CrashBreadcrumb.shared.mark("完成 正文:\(text.count)字 轮次:\(depth)")
+                    ChatDiagnostics.shared.log(
+                        model: config.model,
+                        outcome: text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .emptyReply : .success,
+                        reason: text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "模型返回空正文" : "",
+                        detail: "轮次 \(depth + 1)",
+                        durationMs: 0,
+                        rounds: depth + 1)
                     // v3.5.3：文本工具调用兜底——模型把 shell.exec("...")/shell_exec(...) 写成文本
                     // (而非结构化 tool_call) 时，系统本不执行、任务卡死。这里检测最终文本里的文本式
                     // shell 调用，提取命令并真正执行，继续 agent 循环（提示词兜底不住，代码兜底保证）。
@@ -2243,6 +2400,10 @@ final class ConversationStore: ObservableObject {
                         TaskNotify.shared.endBackground()
                         // v3.1.70：用户取消——解除活动会话绑定
                         self.activeConvId = nil
+                        // 2026-11-03：手动停止也记一条，诊断页才能把「自己停的」和「自己停的以外」分开
+                        CrashBreadcrumb.shared.mark("用户手动停止 @轮次\(depth)")
+                        ChatDiagnostics.shared.log(model: config.model, outcome: .stopped,
+                                                   reason: "用户点了停止", rounds: depth + 1)
                         return
                     }
                     // v2.9.87：网络类错误 + 当前确认断网 → 等网络恢复自动重试一次
@@ -2361,7 +2522,14 @@ final class ConversationStore: ObservableObject {
     /// 是否包含文本形态的工具调用（DSML / antml / invoke）
     static func containsTextualToolCall(_ text: String) -> Bool {
         let t = normalizeDSML(text)
-        return t.contains("<|DSML|") || t.contains("<antml:invoke") || t.contains("<invoke")
+        if t.contains("<|DSML|") || t.contains("<antml:invoke") || t.contains("<invoke") {
+            return true
+        }
+        // 2026-11-03：自闭合短标签也算（`<tool.describe name="app" />`）。
+        // 少这一条的话，stripTextualToolCalls 会直接原样返回，
+        // 屏幕上那行 XML 永远清不掉——用户截图里就横在正文中间。
+        return t.range(of: #"<\s*(tool[.:][A-Za-z0-9_.\-]+|call)\b[^>]*?/\s*>"#,
+                       options: .regularExpression) != nil
     }
 
     /// 2026-11-03 核心修复：把正文里的**文本形态工具调用**解析成真正的 ToolCall 数组。
@@ -2374,7 +2542,20 @@ final class ConversationStore: ObservableObject {
     /// 返回空数组 = 没有可解析的文本调用。
     static func parseTextualToolCalls(_ text: String) -> [ToolCall] {
         let t = normalizeDSML(text)
-        guard t.contains("<|DSML|") || t.contains("<antml:invoke") || t.contains("<invoke") else {
+        // 2026-11-03 重要修复（用户截图：工具卡显示「未执行」，模型说"现在实际执行"却什么都没跑）：
+        //
+        // 原来的开场判断只有 <|DSML| / <antml:invoke / <invoke 三种，
+        // 而真机上模型大量使用的是**自闭合短标签** `<tool.describe name="app" />`。
+        // 它不含任何 invoke 字样 → 这里直接 return [] → 一个都不执行。
+        // 渲染侧（ContentBlocks）已经能把它画成工具卡了，但执行侧不认，
+        // 于是卡片停在「未执行」，模型那边以为已经调过了，任务就这么断掉。
+        //
+        // 判断条件补上自闭合形态的两种写法。
+        let hasSelfClosing = t.range(
+            of: #"<\s*(?:tool[.:]|call\s)[A-Za-z0-9_.\-]*"#,
+            options: .regularExpression) != nil
+        guard t.contains("<|DSML|") || t.contains("<antml:invoke")
+                || t.contains("<invoke") || hasSelfClosing else {
             return []
         }
         var out: [ToolCall] = []
@@ -2399,6 +2580,25 @@ final class ConversationStore: ObservableObject {
                 if bestRange == nil || full.lowerBound < bestRange!.lowerBound {
                     bestRange = full
                     bestName = String(remaining[nameR])
+                }
+            }
+            // 2026-11-03：自闭合短标签分支。
+            // `<tool.describe name="app" />` / `<call name="app" />` / `<tool:describe name="app" />`
+            // 没有闭合标签、没有 parameter 段，参数只能从标签属性里抠。
+            // 必须和上面那些 invoke 形态比"谁出现得更早"，否则同一段文本里
+            // 混用两种写法时会打乱顺序（模型是按顺序表达的意图）。
+            if let selfRange = firstSelfClosingRange(in: remaining) {
+                if bestRange == nil || selfRange.full.lowerBound < bestRange!.lowerBound {
+                    // 自闭合优先于 invoke
+                    let tagName = selfRange.name
+                    let attrs = selfRange.attrs
+                    if let call = makeSelfClosingCall(name: tagName, attrs: attrs) {
+                        out.append(call)
+                    }
+                    if selfRange.full.upperBound >= remaining.endIndex { break }
+                    remaining = String(remaining[selfRange.full.upperBound...])
+                    if remaining.isEmpty { break }
+                    continue
                 }
             }
             guard let open = bestRange else { break }
@@ -2461,6 +2661,73 @@ final class ConversationStore: ObservableObject {
         return out
     }
 
+    /// 2026-11-03 新增：找最早出现的「自闭合工具标签」。
+    ///
+    /// 需要它的原因见 parseTextualToolCalls 里的注释——模型大量使用
+    /// `<tool.describe name="app" />` 这种写法，它没有闭合标签也没有
+    /// parameter 段，用 invoke 那套正则永远匹配不到，工具就停在「未执行」。
+    ///
+    /// 返回：完整匹配范围 + 工具名 + 属性串（给 makeSelfClosingCall 抠参数）
+    private static func firstSelfClosingRange(_ s: String)
+        -> (full: Range<String.Index>, name: String, attrs: String)? {
+        let pat = #"<\s*(tool[.:][A-Za-z0-9_.\-]+|call)\b([^>]*?)/\s*>"#
+        guard let re = try? NSRegularExpression(pattern: pat, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let ns = s as NSString
+        guard let m = re.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)),
+              m.numberOfRanges > 2,
+              let full = Range(m.range, in: s),
+              let nameR = Range(m.range(at: 1), in: s),
+              let attrR = Range(m.range(at: 2), in: s) else { return nil }
+        let name = String(s[nameR]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+        return (full, name, String(s[attrR]))
+    }
+
+    /// 由自闭合标签构造一个 ToolCall。
+    ///
+    /// 工具名有讲究：`<call name="app" />` 里工具名在 name 属性上，
+    /// 而 `<tool.describe name="app" />` 里工具名是标签名本身（tool.describe），
+    /// name 属性反而表示"对哪个对象操作"。两种情况都要能跑。
+    private static func makeSelfClosingCall(name tagName: String, attrs: String) -> ToolCall? {
+        var params: [String: String] = [:]
+        let attrPat = #"([A-Za-z_][A-Za-z0-9_\-]*)\s*=\s*["']([^"']*)["']"#
+        if let re = try? NSRegularExpression(pattern: attrPat) {
+            let ns = attrs as NSString
+            for m in re.matches(in: attrs, range: NSRange(location: 0, length: ns.length))
+            where m.numberOfRanges > 2 {
+                let k = ns.substring(with: m.range(at: 1))
+                let v = ns.substring(with: m.range(at: 2))
+                params[k] = v
+            }
+        }
+        // 工具名的决定规则
+        let lower = tagName.lowercased()
+        let finalName: String
+        if lower == "call" || lower == "tool" || lower.hasPrefix("call.") || lower.hasPrefix("call:") {
+            // <call name="app" /> → 工具名取 name 属性
+            guard let n = params["name"], !n.isEmpty else { return nil }
+            finalName = n
+            params.removeValue(forKey: "name")
+        } else {
+            // <tool.describe name="app" /> → 工具名就是 tool.describe
+            finalName = tagName
+        }
+        let argsJSON: String
+        if let d = try? JSONSerialization.data(withJSONObject: params as [String: Any],
+                                               options: [.sortedKeys]),
+           let s = String(data: d, encoding: .utf8) {
+            argsJSON = s
+        } else {
+            argsJSON = "{}"
+        }
+        return ToolCall(id: "textual-" + UUID().uuidString,
+                        name: finalName,
+                        arguments: argsJSON,
+                        toolTitle: ToolCall.extractTitle(from: argsJSON))
+    }
+
     /// 2026-11-03：把正文里的文本形态工具调用**剔除掉**，只留真正的自然语言说明。
     ///
     /// parseTextualToolCalls 已经把 XML 反解成 ToolCall 去真执行了，但屏幕上那段
@@ -2504,6 +2771,11 @@ final class ConversationStore: ObservableObject {
             #"<\|DSML\|\s*parameter\b[\s\S]*?</\|\s*DSML\s*\|?\s*parameter\s*>"#,
             #"</\|\s*DSML\s*\|?\s*>"#,
             #"<\|DSML\|\s*>"#,
+            // 2026-11-03 新增：自闭合短标签本身也要剥掉。
+            // 用户截图中 `<|DSML|calls>` 和 `</|DSML|calls>` 之间横着一个
+            // `<tool.describe name="app" />`，外壳被剥了、中间那行还留着，
+            // 于是正文里孤零零一行 XML —— 这条正则把它一起清掉。
+            #"<\s*(tool[.:][A-Za-z0-9_.\-]+|call)\b[^>]*?/\s*>"#,
         ]
         for p in strayPats {
             if let re = try? NSRegularExpression(pattern: p, options: [.dotMatchesLineSeparators]) {
@@ -2702,8 +2974,12 @@ final class ConversationStore: ObservableObject {
             // dispatch 在后台执行，结果/授权/错误统一回主线程继续递归。
             DispatchQueue.global().async {
                 let result: Result<[String: Any], Error>
+                // 2026-11-03：崩溃现场留痕——工具是崩溃高发区（越狱环境下权限/内存问题多），
+                // 记下「正在跑哪个工具」，崩了就知道是哪个工具带崩的。
+                CrashBreadcrumb.shared.mark("工具执行 → \(call.name)")
                 do { result = .success(try ToolRegistry.shared.dispatch(name: call.name, params: params)) }
                 catch { result = .failure(error) }
+                CrashBreadcrumb.shared.mark("工具结束 ← \(call.name)")
                 let toolDuration = CFAbsoluteTimeGetCurrent() - toolStart
                 DispatchQueue.main.async {
                     self.runningTool = nil
@@ -3581,14 +3857,20 @@ final class ConversationStore: ObservableObject {
         return try? JSONDecoder().decode([ChatConversation].self, from: data)
     }
 
-    private func applyLoaded(_ decoded: [ChatConversation]) {
+    /// - Parameter autoSelect: 是否自动选中第一个会话并打开。
+    ///   2026-11-03 新增：崩溃循环自救时传 false——不自动打开上次会话，
+    ///   让用户停在会话列表自己选。数据不删，只是不自动进。
+    private func applyLoaded(_ decoded: [ChatConversation], autoSelect: Bool = true) {
         diag("LOADED-JSONL: convs=\(decoded.count) msgs=\(decoded.reduce(0) { $0 + $1.messages.count })")
         var convs = decoded.sorted { $0.updatedAt > $1.updatedAt }
         // fix73j-p5：职责拆分——applyLoaded 只做"加载 + 调崩溃恢复"；
         // 崩溃残留标记/悬空序列修补独立为 repairCrashResidue（单一职责，可单测）。
         let cleaned = repairCrashResidue(&convs)
         conversations = convs
-        selectedId = conversations.first?.id
+        // 2026-11-03：安全模式不自动选中。
+        // 以前无条件 `conversations.first?.id`，而列表按 updatedAt 降序 →
+        // 第一条正是"刚崩过的那个会话"→ 每次启动都自动重开它 → 再崩 → 被锁在门外。
+        selectedId = autoSelect ? conversations.first?.id : nil
         // fix73j-p3f：清理必须固化落盘——旧代码 save() 异步 + 未标 dirty → persist 增量
         // 不写（count 不变），isRunning=false/isError=true 清理结果不落盘，每次启动重复
         // 改写（幂等但无效）。标全部 dirty + 同步 flush，让崩溃恢复结果真正写盘。
