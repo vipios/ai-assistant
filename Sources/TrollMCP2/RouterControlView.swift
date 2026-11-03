@@ -483,9 +483,9 @@ struct RouterControlView: View {
             case .success(let d):
                 device = d
                 deviceError = ""
-            case .failure(let msg):
+            case .failure(let err):
                 // 静默刷新失败时不覆盖上一次的好数据，避免状态卡闪来闪去
-                if !silent || device == nil { deviceError = msg }
+                if !silent || device == nil { deviceError = err.message }
             }
         }
     }
@@ -500,8 +500,8 @@ struct RouterControlView: View {
             case .success(let p):
                 publicAddr = p
                 publicError = ""
-            case .failure(let msg):
-                if publicAddr == nil { publicError = msg }
+            case .failure(let err):
+                if publicAddr == nil { publicError = err.message }
             }
         }
     }

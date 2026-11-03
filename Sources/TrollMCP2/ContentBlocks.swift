@@ -92,8 +92,9 @@ enum ContentBlocks {
                         continue
                     }
                     // ② 成对形态（原有行为，不变）
-                    if let closeIdx = findCloseTag(chars, endIdx) {
-                        let segment = String(chars[endIdx..<closeIdx])
+                    if let close = findCloseTag(chars, endIdx) {
+                        // 参数段只取「开头标签之后 → 闭合标签之前」，不含闭合标签本身
+                        let segment = String(chars[endIdx..<close.start])
                         let (args, title) = parseParams(segment)
                         if !textBuf.isEmpty {
                             blocks.append(ContentBlock(kind: .text, text: textBuf))
@@ -101,11 +102,13 @@ enum ContentBlocks {
                         }
                         blocks.append(ContentBlock(
                             kind: .tool,
-                            text: String(chars[i...closeIdx]),
+                            // 工具块文本含完整一对标签：从 `<` 到闭合标签最后一个字符
+                            text: String(chars[i..<close.end]),
                             toolName: name,
                             toolArgs: args,
                             toolTitle: title))
-                        i = closeIdx + 1
+                        // 从闭合标签**之后**继续，不吞正文
+                        i = close.end
                         didStrip = true
                         continue
                     }
@@ -259,7 +262,14 @@ enum ContentBlocks {
     /// "</|DSML|invoke>" / "</|DSML| invoke>"（带 invoke 字样），
     /// 于是 findCloseTag 永远返回 nil → 整块工具段被当正文打印。
     /// 这里按"竖线结尾 + 可选 invoke/空 + >"统一匹配。
-    private static func findCloseTag(_ chars: [Character], _ from: Int) -> Int? {
+    /// 2026-11-03 **语义修复**：原来返回 `j + c.count`（闭合标签**之后**的位置），
+    /// 但调用方是按「闭合标签本身的末尾」在用，于是：
+    ///   · 参数段多带了整段闭合标签 → parseParams 里混入 `</invoke>` 之类
+    ///   · `i = closeIdx + 1` 多跳一位 → **闭合标签后面第一个正文字符被吞掉**
+    ///     （典型表现：工具调用后面那句话开头少一个字）
+    /// 现在明确返回 (闭合标签起点, 闭合标签终点)，调用方一律用半开区间 [start, end)，
+    /// 不再有任何「差一位」的猜测空间。
+    private static func findCloseTag(_ chars: [Character], _ from: Int) -> (start: Int, end: Int)? {
         var j = from
         while j < chars.count {
             if chars[j] == "<" {
@@ -271,7 +281,7 @@ enum ContentBlocks {
                     "</|DSML|calls>", "</|DSML| calls>",
                 ]
                 for c in candidates where rest.hasPrefix(c) {
-                    return j + c.count
+                    return (j, j + c.count)
                 }
             }
             j += 1

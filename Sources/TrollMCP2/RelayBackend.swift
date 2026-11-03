@@ -80,6 +80,17 @@ struct RelayPublicAddress {
     }
 }
 
+// MARK: 错误类型
+//
+// 为什么不用 Result<_, String>：Swift 的 Result 要求 Failure: Error，
+// String 不符合 Error 协议，直接写 Result<T, String> 是**编译错误**。
+// 这里用一个极薄的包装，调用方读 err.message 拿到那句中文提示。
+
+struct RelayError: Error {
+    let message: String
+    init(_ message: String) { self.message = message }
+}
+
 // MARK: 网络层
 
 enum RelayBackend {
@@ -122,15 +133,15 @@ enum RelayBackend {
     /// GET {base}/admin/api/device —— 失败时返回中文原因，页面直接展示
     static func fetchDeviceStatus(base: String,
                                   key: String,
-                                  done: @escaping (Result<RelayDeviceStatus, String>) -> Void) {
+                                  done: @escaping (Result<RelayDeviceStatus, RelayError>) -> Void) {
         guard let b = normalize(base), let url = URL(string: b + "/admin/api/device") else {
-            done(.failure("后台地址格式不对"))
+            done(.failure(RelayError("后台地址格式不对")))
             return
         }
         get(url, key: key) { data in
             guard let data = data,
                   let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                done(.failure("连不上后台。在家请确认连着 WiFi，在外面先开 ZeroTier；密钥错也会这样。"))
+                done(.failure(RelayError("连不上后台。在家请确认连着 WiFi，在外面先开 ZeroTier；密钥错也会这样。")))
                 return
             }
             var d = RelayDeviceStatus()
@@ -157,16 +168,16 @@ enum RelayBackend {
     /// 后者对 `raw/<文件名>` 这种路径会 404，我之前踩过。
     static let gistID = "a96bdb5d96de46975334ca3276476901"
 
-    static func fetchPublicAddress(done: @escaping (Result<RelayPublicAddress, String>) -> Void) {
+    static func fetchPublicAddress(done: @escaping (Result<RelayPublicAddress, RelayError>) -> Void) {
         guard let url = URL(string: "https://api.github.com/gists/" + gistID) else {
-            done(.failure("Gist 地址无效"))
+            done(.failure(RelayError("Gist 地址无效")))
             return
         }
         get(url, key: nil, timeout: 12) { data in
             guard let data = data,
                   let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let files = doc["files"] as? [String: Any] else {
-                done(.failure("取不到公网地址（可能是网络问题）。这不影响在家用内网地址。"))
+                done(.failure(RelayError("取不到公网地址（可能是网络问题）。这不影响在家用内网地址。")))
                 return
             }
             // 文件名不写死：设备端以后改名字也不该让这里瞎掉
@@ -182,7 +193,7 @@ enum RelayBackend {
                   let text = f["content"] as? String,
                   let raw = text.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
-                done(.failure("Gist 内容看不懂，设备可能还没写过地址"))
+                done(.failure(RelayError("Gist 内容看不懂，设备可能还没写过地址")))
                 return
             }
             var p = RelayPublicAddress()
