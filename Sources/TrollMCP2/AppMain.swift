@@ -214,18 +214,37 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     // v2.9.10：进后台时申请后台任务，让正在进行的请求有保活窗口（最多 3 分钟）
     func applicationDidEnterBackground(_ application: UIApplication) {
-        // v7.4.0-fix73c：后台代传**绑到窗口耗尽时刻**（不是 3 秒延迟）——
-        // iOS 事实：beginBackgroundTask 窗口内普通 URLSession 继续正常传输（Apple Forums 确认：
-        // app remains running until you complete the request or run out of background time）。
-        // 因此原请求在窗口内（最长 180s）一直活着，过早 cancel = 杀活请求、白白重发。
-        // 正确时机：窗口耗尽（expirationHandler）→ 系统即将冻结 → 此刻原请求必死 → 代传保住。
-        // 窗口内完成/回前台 → 零浪费；系统内存强杀（Jetsam）→ handler 不触发 → fix72 前台兜底。
+        // 2026-11-03 修「切到别的 App 再回来，AI 自己停工了」（用户连续多次反馈）：
+        //
+        // 以前只有 beginBackgroundTask 给 180 秒窗口，窗口一耗尽就
+        // handoffActiveRequestToBackground() → currentClient.cancel()，把正在跑的
+        // 请求掐掉改成「后台代传」。而代传拿不到流式增量、也无法继续跑工具链
+        // （多轮 agent 循环直接中断）——用户看到的就是「切出去一会儿，回来活干到
+        // 一半停了，还得我再催一次」。
+        //
+        // 现在的策略：只要本轮还活着（isLoading 或有子代理在跑），就开静音音频保活。
+        // AVAudioSession(.playback) + 持续静音输出能让进程真正不被挂起
+        // （TrollStore 安装不受 App Store 审核限制），请求/工具链在后台照常推进，
+        // 回前台就是接着往下走，不重发、不断档。
+        //
+        // 代传只在「确实没保住」时兜底（expirationHandler），且先确认音频保活
+        // 没在跑，避免把还活着的请求误杀。
+        let workInFlight = ConversationStore.shared.isLoading
+            || ConversationStore.shared.selectedIsRequesting
+            || SubAgentManager.shared.hasRunningTasks
+        if workInFlight {
+            BackgroundKeepAlive.shared.start()
+            UserDefaults.standard.set(true, forKey: "trollagent.keepalive_global")
+        }
         backgroundTask = application.beginBackgroundTask(withName: "trollmcp2.network") {
-            // 窗口耗尽前一刻（系统在主线程同步调用，短暂阻止暂停）→ 轻量代传
-            ConversationStore.shared.handoffActiveRequestToBackground()
-            // v7.4.0-fix73d：子代理请求不在主会话 currentClient 管辖内（独立 OpenAIClient），
-            // 代传覆盖不到——标记"后台挂起"，失败回调判 interrupted（可重派发）而非误报 failed
-            SubAgentManager.shared.suspendAllForBackground()
+            // 走到这里说明后台任务窗口（最长 180s）已耗尽——但若音频保活已生效，
+            // 进程并不会被挂起，请求仍然活着，绝不能 cancel。
+            if !BackgroundKeepAlive.shared.running {
+                ConversationStore.shared.handoffActiveRequestToBackground()
+                // v7.4.0-fix73d：子代理请求不在主会话 currentClient 管辖内（独立 OpenAIClient），
+                // 代传覆盖不到——标记"后台挂起"，失败回调判 interrupted（可重派发）而非误报 failed
+                SubAgentManager.shared.suspendAllForBackground()
+            }
             application.endBackgroundTask(self.backgroundTask)
             self.backgroundTask = .invalid
         }
@@ -233,12 +252,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // 被丢弃，重启崩溃恢复误判成功结果为失败（"Execution interrupted"）。强制 flush
         // 保证最新结果状态/内容落盘；用户手动 swipe kill 发生在进后台之后，必被覆盖。
         ConversationStore.shared.flush()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 180) {
-            if self.backgroundTask != .invalid {
-                application.endBackgroundTask(self.backgroundTask)
-                self.backgroundTask = .invalid
-            }
-        }
+        // 2026-11-03：不再在 180 秒后无条件 endBackgroundTask——那是「主动放弃保活」。
+        // 让系统按自己的节奏回收；音频保活在跑时进程本就不受限。
         // v2.9.136：切后台提交 BGTask 周期刷新（系统调度窗口内保持存活）
         BackgroundKeepAlive.scheduleRefresh()
     }
@@ -247,6 +262,19 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         if backgroundTask != .invalid {
             application.endBackgroundTask(backgroundTask)
             backgroundTask = .invalid
+        }
+        // 2026-11-03：回前台只在「没活干」时才停掉音频保活——
+        // 以前无条件 stop，导致用户切回来一下又切走时保活被反复启停
+        // （每次重建 AVAudioEngine 有 100~300ms 抖动，且中间窗口会被挂起）。
+        // 现在活干完了才停；还在跑就让它继续保着，切出去照样不断。
+        let stillWorking = ConversationStore.shared.isLoading
+            || ConversationStore.shared.selectedIsRequesting
+            || SubAgentManager.shared.hasRunningTasks
+        if stillWorking {
+            BackgroundKeepAlive.shared.start()
+        } else {
+            BackgroundKeepAlive.shared.stop()
+            UserDefaults.standard.set(false, forKey: "trollagent.keepalive_global")
         }
         BackgroundKeepAlive.cancelRefresh()
         // v7.4.0-fix73：收取后台代传结果（完整回复/工具调用继续执行）

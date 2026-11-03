@@ -26,9 +26,13 @@ enum ContentBlocks {
         return result
     }
     private static func splitRaw(_ text: String) -> [ContentBlock] {
+        // 2026-11-03：先把 DeepSeek 系特殊 token 归一化（全角竖线 U+FF5C、双竖线 ||DSML||、
+        // 零宽空格等）成半角 <|DSML|…>。否则下面 matchStartTag / findCloseTag 一条都匹配
+        // 不到，整段 XML 会被当成正文原样打到气泡里——用户看到的就是「底部全是英文」。
+        let normalized = ConversationStore.normalizeDSML(text)
         var blocks: [ContentBlock] = []
         var textBuf = ""
-        let chars = Array(text)
+        let chars = Array(normalized)
         var i = 0
         while i < chars.count {
             if chars[i] == "<" {
@@ -57,6 +61,7 @@ enum ContentBlocks {
             blocks.append(ContentBlock(kind: .text, text: textBuf))
         }
         if blocks.isEmpty {
+            // 用原文（不是归一化后的）——没切出块时保持用户看到的原样
             blocks.append(ContentBlock(kind: .text, text: text))
         }
         return blocks
@@ -66,7 +71,10 @@ enum ContentBlocks {
     private static func matchStartTag(_ chars: [Character], _ startIdx: Int) -> (String, Int)? {
         let s = String(chars[startIdx...])
         let patterns = [
-            #"^<\|DSML\| invoke\s+name="([^"]+)"[^>]*>"#,
+            // 2026-11-03 关键：归一化后是 "<|DSML|invoke ...>"（竖线后**没有**空格），
+            // 原正则写成 "\| invoke" 强制要求空格 → 一条都匹配不到 → 整段 XML 当正文打印。
+            // 这里改成 \s* 容忍零个或多个空格。
+            #"^<\|DSML\|\s*invoke\s+name="([^"]+)"[^>]*>"#,
             #"^<antml:invoke\s+name="([^"]+)"[^>]*>"#,
             #"^<invoke\s+name="([^"]+)"[^>]*>"#,
         ]
@@ -81,19 +89,25 @@ enum ContentBlocks {
         return nil
     }
 
-    /// 从 endIdx 找闭合标签位置（三选一）
+    /// 从 endIdx 找闭合标签位置（多形态）
+    ///
+    /// 2026-11-03：原来只认 "</|DSML|>"，但模型真实输出的是
+    /// "</|DSML|invoke>" / "</|DSML| invoke>"（带 invoke 字样），
+    /// 于是 findCloseTag 永远返回 nil → 整块工具段被当正文打印。
+    /// 这里按"竖线结尾 + 可选 invoke/空 + >"统一匹配。
     private static func findCloseTag(_ chars: [Character], _ from: Int) -> Int? {
         var j = from
-        let close1 = "</|DSML|>"
-        let close2 = "</antml:invoke>"
-        let close3 = "</invoke>"
         while j < chars.count {
             if chars[j] == "<" {
                 let rest = String(chars[j...])
-                if rest.hasPrefix(close1) || rest.hasPrefix(close2) || rest.hasPrefix(close3) {
-                    let len = rest.hasPrefix(close1) ? close1.count
-                        : (rest.hasPrefix(close2) ? close2.count : close3.count)
-                    return j + len
+                let candidates = [
+                    "</|DSML|invoke>", "</|DSML| invoke>", "</|DSML|>",
+                    "</antml:invoke>", "</invoke>",
+                    // 也允许里外多一层 calls 包裹
+                    "</|DSML|calls>", "</|DSML| calls>",
+                ]
+                for c in candidates where rest.hasPrefix(c) {
+                    return j + c.count
                 }
             }
             j += 1
@@ -105,25 +119,41 @@ enum ContentBlocks {
     /// 字符扫描版（闭合标签用拼接，字面量闭合序列会截断外层参数）
     private static func parseParams(_ segment: String) -> (String?, String?) {
         var dict: [String: String] = [:]
-        let closeTag = "</" + "parameter>"
-        let marker = "<parameter name="
+        // 2026-11-03：闭合标签有多种写法——</parameter> / </|DSML|parameter> / </antml:parameter>
+        let closeTags = ["</" + "parameter>", "</|DSML|parameter>", "</|DSML| parameter>", "</antml:parameter>"]
+        // 起始标记同理：<parameter name= / <|DSML|parameter name= / <antml:parameter name=
+        let markers = ["<parameter name=", "<|DSML|parameter name=", "<|DSML| parameter name=",
+                       "<antml:parameter name="]
         let chars = Array(segment)
         var i = 0
         while i < chars.count {
-            if String(chars[i...]).hasPrefix(marker) {
-                var j = i + marker.count
-                var pname = ""
-                while j < chars.count, chars[j] != "\"" { pname.append(chars[j]); j += 1 }
-                j += 1
-                while j < chars.count, chars[j] != ">" { j += 1 }
-                j += 1
-                let tail = String(chars[j...])
-                if let closeRange = tail.range(of: closeTag) {
-                    let value = String(tail[..<closeRange.lowerBound])
-                    dict[pname] = value
-                    i = j + closeRange.lowerBound.utf16Offset(in: tail) + closeTag.count
-                    continue
+            let rest = String(chars[i...])
+            guard let marker = markers.first(where: { rest.hasPrefix($0) }) else {
+                i += 1
+                continue
+            }
+            var j = i + marker.count
+            var pname = ""
+            while j < chars.count, chars[j] != "\"" { pname.append(chars[j]); j += 1 }
+            j += 1
+            while j < chars.count, chars[j] != ">" { j += 1 }
+            j += 1
+            guard j <= chars.count else { break }
+            let tail = String(chars[j...])
+            // 取最近的一个闭合标签（不同写法混用也能正确切）
+            var hit: (Range<String.Index>, Int)?
+            for c in closeTags {
+                if let r = tail.range(of: c) {
+                    if hit == nil || r.lowerBound < hit!.0.lowerBound {
+                        hit = (r, c.count)
+                    }
                 }
+            }
+            if let h = hit {
+                let value = String(tail[..<h.0.lowerBound])
+                dict[pname] = value
+                i = j + h.0.lowerBound.utf16Offset(in: tail) + h.1
+                continue
             }
             i += 1
         }

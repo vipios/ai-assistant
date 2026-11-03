@@ -58,9 +58,15 @@ struct ChatView: View {
     @State private var showToast = false
     @State private var toastText = L10n.t("i18n_1197")
     // v7.4.0-fix73d：悬浮滚动按钮状态（对齐 Minis：up 只在中间显示、down 非底部显示）
-    @State private var chatScrollOffset: CGFloat = 0
-    @State private var chatContentHeight: CGFloat = 0
-    @State private var chatViewportHeight: CGFloat = 0
+    /// 2026-11-03 性能核心：滚动位置/内容高度/视口高度不再用 @State，改为独立 ObservableObject。
+    ///
+    /// 原因（用户反馈「一直停在聊天页看它干活，手机非常热、滑动卡」）：
+    /// ScrollGeometryBridge 是 UIKit KVO，滚动时**每一帧**都回调一次。
+    /// 写 @State 就等于每帧让 ChatView 的整个 body 重新求值——里面有
+    /// ChatListGrouping.group()、全部 MessageBubble、ContentBlocks.split，
+    /// 手指轻轻一滑就变成每帧一次全量重建 → 帧率崩、CPU 满载、手机发烫。
+    /// 现在只有 FloatingScrollButtons 这一个小组件订阅它，主 body 完全不读。
+    @StateObject private var scroll = ChatScrollState()
     var body: some View {
         CompatNav {
             VStack(spacing: 0) {
@@ -606,9 +612,9 @@ struct ChatView: View {
                     // superview 链直达底层 UIScrollView，KVO 精确上报 contentOffset/contentSize/bounds。
                     // offset 已按原 marker 语义转换（顶部=0，向下为负），下方显示矩阵判断无需改动。
                     ScrollGeometryBridge(
-                        onOffset: { chatScrollOffset = $0 },
-                        onContentHeight: { chatContentHeight = $0 },
-                        onViewportHeight: { chatViewportHeight = $0 }
+                        onOffset: { scroll.offset = $0 },
+                        onContentHeight: { scroll.contentHeight = $0 },
+                        onViewportHeight: { scroll.viewportHeight = $0 }
                     )
                     .frame(height: 0)
                     LazyVStack(spacing: 12) {
@@ -635,7 +641,13 @@ struct ChatView: View {
                                 )
                                 .id(msg.id)
                             case .tools(let msgs):
+                                // 2026-11-03 修「怎么滑都回不到最底部 / 上滑到底内容还在动」：
+                                // 这个分支以前没有 .id()。scrollToBottom 用 last.id 定位，
+                                // 最后一条若刚好落在折叠组里就找不到锚点 → 表现为滑不到底；
+                                // 缺 id 时 LazyVStack 复用还会把整组子视图当新内容重建
+                                // → 滚动过程中持续重排 = 视觉上内容在跳。
                                 toolsRunGroup(msgs)
+                                    .id(ChatListGrouping.Item.tools(msgs).id)
                             }
                         }
                         if store.isLoading {
@@ -718,10 +730,11 @@ struct ChatView: View {
                 // 关键修复：contentHeight 未知（LazyVStack 惰性 marker 未渲染=0）时
                 // 旧逻辑仍无条件滚——改为按滚动偏移判断：顶部附近(offset>-50)才跟随，
                 // 上滑/中间停留（offset 远离 0）绝不抢。已知时：底部 40pt 内才滚。
-                let bottomThreshold = -(chatContentHeight - chatViewportHeight) + 40
-                let nearBottom = chatContentHeight > 0 && chatScrollOffset <= bottomThreshold
-                let atTopUnknown = chatContentHeight <= 0 && chatScrollOffset > -50
-                if nearBottom || atTopUnknown {
+                // 2026-11-03：改用 ChatScrollState 的判定方法。
+                // 注意：这里在 onChange 闭包内（消息条数变化时才跑一次），不在 body
+                // 求值路径上，读属性不会造成每帧重算；但统一走方法便于以后维护。
+                let shouldFollow = scroll.shouldAutoFollow()
+                if shouldFollow {
                     if let last = store.currentMessages.last {
                         withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                     }
@@ -756,51 +769,23 @@ struct ChatView: View {
 
     // v7.4.0-fix73d：悬浮按钮（独立函数——减主表达式 type-check 负担）
     // v7.1.281-fix：箭头 ↑↓ 改 ︿﹀（chevron 风格，用户指定）
+    // 2026-11-03：改为独立订阅 ChatScrollState 的子视图——ChatView.body 本身不读滚动状态，
+    // 这样滚动每帧只重算这一个 40pt 圆钮，不再牵动整个聊天列表。
     private func floatingButtons(_ proxy: ScrollViewProxy) -> some View {
-        VStack(spacing: 10) {
-            if chatCanScrollUp && chatCanScrollDown {
-                chatFloatingButton("chevron.up") {
-                    if let first = store.currentMessages.first {
-                        withAnimation { proxy.scrollTo(first.id, anchor: .top) }
-                    }
+        FloatingScrollButtons(
+            scroll: scroll,
+            onUp: {
+                if let first = store.currentMessages.first {
+                    withAnimation { proxy.scrollTo(first.id, anchor: .top) }
                 }
-            }
-            if chatCanScrollDown {
-                chatFloatingButton("chevron.down") { scrollToBottom(proxy) }
-            }
-        }
-        .padding(.trailing, 12)
-        .padding(.bottom, 14)
+            },
+            onDown: { scrollToBottom(proxy) }
+        )
     }
 
-    // v7.4.0-fix73f-3：悬浮按钮显示条件——Minis 矩阵：up 只在"中间"（可上可下）显示，
-    // down 只在"非底部"（可下）显示；底部两者全隐，顶部只显 down。
-    // 关键修复：chatContentHeight 由 LazyVStack 末尾的 marker 上报——LazyVStack 惰性渲染，
-    // 未滚动到接近底部时 marker 不渲染 → contentHeight=0 → 旧逻辑 down 永远不显示（用户实测
-    // "只有接近底部才出现按钮"的根因）。修复：contentHeight 未知时按默认显示，已知时精确判断。
-    private var chatCanScrollUp: Bool {
-        guard chatContentHeight > 0 else { return chatScrollOffset < -2 }
-        let bottom = -(chatContentHeight - chatViewportHeight)
-        return chatScrollOffset < -2 && chatScrollOffset > bottom + 2
-    }
-    private var chatCanScrollDown: Bool {
-        guard chatContentHeight > 0 else { return true }
-        let bottom = -(chatContentHeight - chatViewportHeight)
-        return chatScrollOffset > bottom + 2
-    }
-
-    private func chatFloatingButton(_ icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundColor(.primary)
-                .frame(width: 40, height: 40)
-                .background(Color(.systemGray5).opacity(0.92))
-                .clipShape(Circle())
-                .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
-        }
-        .buttonStyle(PlainButtonStyle())
-    }
+    // 2026-11-03：原来的 chatCanScrollUp / chatCanScrollDown / chatFloatingButton 三个成员
+    // 已整体迁入 FloatingScrollButtons（见下方 struct）——它们是唯一需要订阅滚动状态的视图，
+    // 留在 ChatView 里会让 body 每帧重算。
 
     /// v2.9.12：滚到当前会话最新一条
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
@@ -1636,6 +1621,46 @@ struct ChatView: View {
             }
         }
         .padding(.horizontal, 16)   // fix39：与 MessageBubble 外层 16 对齐，胶囊不贴屏幕两端
+    }
+}
+
+/// 2026-11-03：悬浮滚动按钮——**唯一**订阅 ChatScrollState 的视图。
+///
+/// 关键点：ChatView.body 本身**不读** scroll 的任何属性，否则滚动每一帧都会让
+/// 整个聊天体重新求值（含分组、全部气泡、正文分块），性能修复就白做了。
+/// 把订阅面收窄到这一颗 40pt 的圆钮，滚动开销从「整页」降到「两个小圆点」。
+struct FloatingScrollButtons: View {
+    @ObservedObject var scroll: ChatScrollState
+    var onUp: () -> Void
+    var onDown: () -> Void
+
+    var body: some View {
+        VStack(spacing: 10) {
+            if scroll.canScrollUp && scroll.canScrollDown {
+                button("chevron.up", action: onUp)
+            }
+            if scroll.canScrollDown {
+                button("chevron.down", action: onDown)
+            }
+        }
+        .padding(.trailing, 12)
+        .padding(.bottom, 14)
+        // 按钮显隐不要动画：滚动中反复触发会额外增加布局开销
+        .animation(nil, value: scroll.canScrollUp)
+        .animation(nil, value: scroll.canScrollDown)
+    }
+
+    private func button(_ icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(.primary)
+                .frame(width: 40, height: 40)
+                .background(Color(.systemGray5).opacity(0.92))
+                .clipShape(Circle())
+                .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
+        }
+        .buttonStyle(PlainButtonStyle())
     }
 }
 

@@ -31,6 +31,31 @@ enum ChatListGrouping {
     }
 
     static func group(_ messages: [ChatMessage]) -> [Item] {
+        // 2026-11-03 性能：加一级缓存。
+        //
+        // group() 被放在 ChatView.body 的 ForEach 里，body 每次重算都会调用它，
+        // 而它是 O(n) 全量遍历 + 构造新数组。长会话（几百上千条消息）时，
+        // 每次微小状态变化（打字机 tick、滚动、工具卡刷新）都要重跑一遍，
+        // 这是「看 AI 干活时手机发烫」的主要来源之一。
+        //
+        // 缓存键不比对整份数组内容（那本身就是 O(n)），而是用三个便宜且可靠的
+        // 特征量判定「消息列表有没有变」：
+        //   · 条数
+        //   · 首条 id
+        //   · 末条 id + 末条内容长度（覆盖"最后一条还在流式增长"的情况）
+        // 这三者任一变化就重算，否则直接返回上次结果。
+        // 注意：必须在主线程访问（SwiftUI body 恒在主线程），所以不加锁。
+        let count = messages.count
+        let firstId = messages.first?.id
+        let lastId = messages.last?.id
+        let lastLen = messages.last?.content.count ?? 0
+        let lastRunning = messages.last?.isRunning ?? false
+        if let c = _cache,
+           c.count == count, c.firstId == firstId, c.lastId == lastId,
+           c.lastLen == lastLen, c.lastRunning == lastRunning {
+            return c.items
+        }
+
         var out: [Item] = []
         var run: [ChatMessage] = []
         func flush() {
@@ -50,6 +75,11 @@ enum ChatListGrouping {
             }
         }
         flush()
+        _cache = (count, firstId, lastId, lastLen, lastRunning, out)
         return out
     }
+
+    /// 最近一次分组结果 + 判定用的特征量
+    private static var _cache: (count: Int, firstId: UUID?, lastId: UUID?,
+                                lastLen: Int, lastRunning: Bool, items: [Item])?
 }

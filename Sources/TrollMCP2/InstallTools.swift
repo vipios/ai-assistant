@@ -280,11 +280,19 @@ final class ToolInstallTool: MCPTool {
     ]
 
     /// 逆向/开发/网络 三档 curated 批量（Alpine 包）
+    ///
+    /// 2026-11-03 用户要求「需要完整的编译链，别到时候又出现各种调用工具不对的提示」：
+    /// rootfs 已预装 build-base/gcc/make/cmake 等，这里同步补齐运行时按需安装的清单，
+    /// 保证「预装被清理」或「需要额外头文件」时 apk add 能一次凑齐，不用反复补包。
     private static let profiles: [String: [String]] = [
         "re": ["binutils", "file", "python3", "sqlite", "openssl", "curl", "git", "jq",
                "zip", "unzip", "xz", "7zip", "tree", "gawk", "coreutils", "findutils", "vim",
                "tcpdump", "netcat-openbsd"],
-        "dev": ["build-base", "git", "python3", "vim", "curl", "jq", "cmake", "nodejs"],
+        // build-base = gcc + g++ + make + musl-dev + binutils（Alpine 的编译链元包）
+        "dev": ["build-base", "gcc", "g++", "make", "cmake", "pkgconf", "linux-headers",
+                "autoconf", "automake", "libtool", "patch", "diffutils",
+                "zlib-dev", "openssl-dev", "libffi-dev", "readline-dev", "sqlite-dev", "ncurses-dev",
+                "git", "python3", "vim", "curl", "wget", "jq", "nodejs", "which"],
         "network": ["curl", "wget", "jq", "openssl", "ca-certificates", "bind-tools", "tcpdump"]
     ]
 

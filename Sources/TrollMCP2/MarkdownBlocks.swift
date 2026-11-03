@@ -36,6 +36,10 @@ enum MarkdownBlocks {
     }
 
     static func parse(_ text: String) -> [Block] {
+        // 2026-11-03：归一瞬间——模型偶发吐全角竖线（U+FF5C）/双竖线 ||DSML|| /
+        // 零宽空格的 DSML 特殊 token，这里不归一就识别不到工具段，整块 XML 会被
+        // 当普通文本原样渲染成一大片英文（用户反馈「下面全是英文，把中文都顶走了」）。
+        let text = ConversationStore.normalizeDSML(text)
         let lines = text.components(separatedBy: "\n")
         var blocks: [Block] = []
         var i = 0

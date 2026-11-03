@@ -450,6 +450,14 @@ final class SubAgentManager {
         lock.lock(); defer { lock.unlock() }
         return tasks[id]?.displayName
     }
+    /// 2026-11-03：是否还有子代理在跑——AppMain 判断「切后台要不要开音频保活」用。
+    /// 之前只看 runningCount（无锁直读、只在 start/finish 改），这里加锁读一次给稳定结果。
+    /// 调用点是 didEnterBackground / willEnterForeground，频率极低，锁开销可忽略。
+    var hasRunningTasks: Bool {
+        lock.lock(); defer { lock.unlock() }
+        if runningCount > 0 { return true }
+        return tasks.values.contains { $0.status == .running }
+    }
     /// v7.4.0-fix73g：在途 LLM 请求的真 abort 处理器——watchdog/stop/软超时到点必须
     /// cancel 掉 runner 的 OpenAIClient（此前只改任务状态，请求永远在后台挂住 → send_state 卡 sent）。
     private var cancellers: [String: () -> Void] = [:]

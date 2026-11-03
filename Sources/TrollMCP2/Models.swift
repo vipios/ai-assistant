@@ -1194,6 +1194,9 @@ final class ConversationStore: ObservableObject {
     private var pendingEmptyReplyCorrection: String? = nil
     /// v4.3.25：空回复纠正连续次数——最多 2 次仍空就停止，避免无限重跑。
     private var emptyReplyCorrectionCount = 0
+    /// 2026-11-03：文本式工具调用自动纠正次数——模型把 DSML/XML 调用当正文打印时，
+    /// 代码层直接反解成 ToolCall 执行。连续 8 次仍反复同样写法就停手（防死循环烧 token）。
+    private var textualToolCallCorrections = 0
     /// v3.1.70：活动请求绑定的会话 ID——请求由哪个会话发起就写回哪个会话。
     /// 修复"请求进行中切换会话，AI 输出错位/写错会话" (用户实测：老会话未暂停，切换新会话后输出仍乱）。
     private var activeConvId: UUID?
@@ -1510,6 +1513,8 @@ final class ConversationStore: ObservableObject {
         // v4.3.25：重置空回复纠正状态（跨任务不残留）
         emptyReplyCorrectionCount = 0
         pendingEmptyReplyCorrection = nil
+        // 2026-11-03：重置文本式工具调用自动纠正计数（新任务从零计，别被上轮计数拦住）
+        textualToolCallCorrections = 0
         var msg = ChatMessage(role: "user", content: text)
         if let imgs = imageDataURLs, !imgs.isEmpty {
             msg.imageDataURLs = imgs
@@ -1697,7 +1702,7 @@ final class ConversationStore: ObservableObject {
             // v7.4.0-fix73c：后台代传一次性语义固化——结果已消费，后台状态已清空，
             // 下一轮 send() 走正常流式（用户发下一条消息即恢复流式）
             NetworkLog.shared.log("background handoff result consumed — next request returns to streaming")
-            trailStep(.done(.note, "AI reply done (background)", detail: String(result.text.prefix(80))))
+            trailStep(.done(.note, "AI 回复完成（后台）", detail: String(result.text.prefix(80))))
             attachTrail(to: msg.id)
             return
         }
@@ -1976,7 +1981,7 @@ final class ConversationStore: ObservableObject {
                             tools: Array(Set(usedTools)).sorted().suffix(8))
                     }
                     // v2.9.127：轨迹——回复done，附到消息持久化
-                    self.trailStep(.done(.note, "AI reply done", detail: String(text.prefix(80))))
+                    self.trailStep(.done(.note, "AI 回复完成", detail: String(text.prefix(80))))
                     // v2.9.82：done通知 (后台时）
                     TaskNotify.shared.endBackground()
                     TaskNotify.shared.notifyIfBackground(title: "✅ AI replied", body: String(text.prefix(60)))
@@ -2059,7 +2064,7 @@ final class ConversationStore: ObservableObject {
                     if trimmedFinal.isEmpty && lastMsgIsTool && self.emptyReplyCorrectionCount < 2 {
                         self.emptyReplyCorrectionCount += 1
                         self.pendingEmptyReplyCorrection = "You just ran tools but your reply body is empty. Based on the returned tool results, give the user a clear 1-2 sentence conclusion (or say what to do next) — don't reply blank or just 'Done'."
-                        self.trailStep(.done(.note, "Empty-reply correction", detail: "Model returned empty text, injected a correction and reran", ok: false))
+                        self.trailStep(.done(.note, "空回复已纠正", detail: "模型这轮没写正文，已自动补一轮让它给结论", ok: false))
                         // 清掉刚渲染的空 assistant 消息，避免界面残留空白气泡
                         if let sid = self.streamingMessageId {
                             self.removeMessage(id: sid)
@@ -2079,6 +2084,45 @@ final class ConversationStore: ObservableObject {
                         return
                     }
                     self.emptyReplyCorrectionCount = 0
+                    // 2026-11-03 核心修复（用户连续反馈「底部全是英文」「罢工，得再发继续」）：
+                    //
+                    // 模型把工具调用**当正文打印**（DSML 特殊 token 原样输出，截图形态为
+                    // <｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="shell.exec">…），
+                    // 客户端只认结构化 tool_calls → 这段就成了「一屏英文」，工具根本没跑
+                    // → 本轮结束 → 停工。光注入提示词纠正治不住（实测连续纠正照样这么写）。
+                    //
+                    // 现在：直接把这段文本**反解成 ToolCall 并执行**，模型用什么格式写都能
+                    // 接着干下去，不需要用户再说「继续」。
+                    let textualCalls = Self.parseTextualToolCalls(text)
+                    // 防死循环：万一模型每轮都吐同样的调用、工具又毫无进展，会无限烧 token。
+                    // 连续 8 次就停止自动执行，剩下的交给用户判断。
+                    if !textualCalls.isEmpty && self.textualToolCallCorrections < 8 {
+                        self.textualToolCallCorrections += 1
+                        self.trailStep(.done(.note, "自动解析文本形式的工具调用",
+                                             detail: "模型把调用写成了正文，已解析出 \(textualCalls.count) 个并直接执行",
+                                             ok: true))
+                        // 把这段 XML 从可见正文里抹掉，换成正常的工具卡（避免再看到一屏英文）
+                        let cleaned = Self.stripTextualToolCalls(text)
+                        if let sid = self.streamingMessageId,
+                           let ci = self.activeConvIndex,
+                           ci < self.conversations.count {
+                            _ = self.updateMessage(in: self.conversations[ci].id, msgId: sid) { m in
+                                m.content = Self.stripTextualToolCalls(m.content)
+                            }
+                        }
+                        // 纯 XML 时 strip 会给占位文案，别把它当解说塞进工具卡
+                        let narration = cleaned.hasPrefix("（已自动执行") ? "" : cleaned
+                        self.thinkBuffer = ""
+                        // 走与结构化调用完全相同的执行链路
+                        self.processToolCalls(textualCalls, index: 0, toolMessages: [],
+                                              newlyDisclosed: [], config: config, tools: tools,
+                                              disclosed: disclosed, depth: depth,
+                                              reasoningLevel: reasoningLevel,
+                                              thinkText: narration,
+                                              personaPrompt: personaPrompt)
+                        return
+                    }
+                    self.textualToolCallCorrections = 0
                     // v3.5.3：文本工具调用兜底——模型把 shell.exec("...")/shell_exec(...) 写成文本
                     // (而非结构化 tool_call) 时，系统本不执行、任务卡死。这里检测最终文本里的文本式
                     // shell 调用，提取命令并真正执行，继续 agent 循环（提示词兜底不住，代码兜底保证）。
@@ -2164,7 +2208,7 @@ final class ConversationStore: ObservableObject {
                     self.thinkingStartAt = nil // v7.1.109-peers：思考计时重置
                     self.streamingMessageId = nil
                     // v2.9.127：轨迹——AI 决定调用一批工具
-                    self.trailStep(.done(.tool, "AI chose to call \(calls.count) tools",
+                    self.trailStep(.done(.tool, "准备调用 \(calls.count) 个工具",
                                          detail: calls.map { $0.name }.joined(separator: "、")))
                     // v2.9.31：递归处理一批工具调用 (后台执行，无授权弹窗）
                     // v3.1.72：thinkText 传可见文本 (工具调用前的说明），不再写入 tool 消息 thinking
@@ -2223,7 +2267,7 @@ final class ConversationStore: ObservableObject {
                     }
                     let errMsg = ChatMessage(role: "assistant", content: "⚠️ \(error.localizedDescription)", isError: true)
                     self.appendToCurrent(errMsg)
-                    self.trailStep(.done(.note, "Request failed", detail: String(error.localizedDescription.prefix(200)), ok: false))
+                    self.trailStep(.done(.note, "请求失败", detail: String(error.localizedDescription.prefix(200)), ok: false))
                     self.attachTrail(to: errMsg.id)
                     // v3.1.70：请求链结束——解除活动会话绑定
                     self.activeConvId = nil
@@ -2260,12 +2304,256 @@ final class ConversationStore: ObservableObject {
         return entries.joined(separator: ", ")
     }
 
+    // MARK: - 2026-11-03 DSML 特殊 token 归一化 + 文本式工具调用解析
+    //
+    // 背景（用户连续多次反馈「底部全是英文」「罢工，得再发继续」）：
+    // DeepSeek 系模型把工具调用以**特殊 token 的原始文本**吐出来，而不是结构化
+    // tool_calls。真机截图里的形态是（全角竖线 U+FF5C，且渲染时竖线之间看着有空格）：
+    //
+    //   <｜｜DSML｜｜ calls>
+    //   <｜｜DSML｜｜ invoke name="shell.exec">
+    //   <｜｜DSML｜｜ parameter name="command" string="true">ls -la</｜｜DSML｜｜ parameter>
+    //   </｜｜DSML｜｜ invoke>
+    //   </｜｜DSML｜｜ calls>
+    //
+    // 所有解析器的基准形态都是半角单竖线 `<|DSML|`，所以这里先做一次归一化，
+    // 把全角/双竖线/零宽字符/夹空格等所有变体统一成 `<|DSML|`，后续只处理一种形态。
+
+    /// 把模型输出的各种 DSML 特殊 token 变体统一成半角单竖线 `<|DSML|` 形态。
+    static func normalizeDSML(_ s: String) -> String {
+        var t = s
+        // ① 零宽字符会夹在竖线之间（截图里"｜ ｜"的视觉效果一部分来自它），先清掉
+        for zw in ["\u{200B}", "\u{200C}", "\u{200D}", "\u{FEFF}", "\u{2060}"] {
+            t = t.replacingOccurrences(of: zw, with: "")
+        }
+        // ② 全角竖线 → 半角；全角尖括号也一并归一
+        t = t.replacingOccurrences(of: "\u{FF5C}", with: "|")
+        t = t.replacingOccurrences(of: "\u{FF1C}", with: "<")
+        t = t.replacingOccurrences(of: "\u{FF1E}", with: ">")
+        // ③ 关键：真机是**双竖线** "||DSML||"，而解析基准是单竖线 "|DSML|"。
+        //    只做全角→半角会得到 "||DSML||"，依旧匹配不上（实测确认）——
+        //    必须在这里折叠成单竖线。
+        for pair in [("||DSML||", "|DSML|"), ("||DSML|", "|DSML|"),
+                     ("|DSML||", "|DSML|"),
+                     ("</||DSML||", "</|DSML|"), ("</||DSML|", "</|DSML|"),
+                     ("</|DSML||", "</|DSML|")] {
+            t = t.replacingOccurrences(of: pair.0, with: pair.1)
+        }
+        // ④ 再收一遍残余（前面的替换顺序可能留下新的双竖线）
+        t = t.replacingOccurrences(of: "||DSML||", with: "|DSML|")
+        // ⑤ 竖线之间夹空格："| DSML |"、"< | | DSML | |" 这类渲染形态
+        if let re = try? NSRegularExpression(pattern: #"<\s*\|\s*\|?\s*DSML\s*\|?\s*\|?\s*"#) {
+            let ns = t as NSString
+            t = re.stringByReplacingMatches(in: t,
+                                            range: NSRange(location: 0, length: ns.length),
+                                            withTemplate: "<|DSML|")
+        }
+        // ⑥ 闭合形态同理：</ | | DSML | | → </|DSML|
+        if let re = try? NSRegularExpression(pattern: #"<\s*/\s*\|\s*\|?\s*DSML\s*\|?\s*\|?\s*"#) {
+            let ns = t as NSString
+            t = re.stringByReplacingMatches(in: t,
+                                            range: NSRange(location: 0, length: ns.length),
+                                            withTemplate: "</|DSML|")
+        }
+        return t
+    }
+
+    /// 是否包含文本形态的工具调用（DSML / antml / invoke）
+    static func containsTextualToolCall(_ text: String) -> Bool {
+        let t = normalizeDSML(text)
+        return t.contains("<|DSML|") || t.contains("<antml:invoke") || t.contains("<invoke")
+    }
+
+    /// 2026-11-03 核心修复：把正文里的**文本形态工具调用**解析成真正的 ToolCall 数组。
+    ///
+    /// 为什么非做不可：客户端只认结构化 tool_calls，模型把调用写成正文时，
+    /// 这段就成了「一屏英文 XML」，工具根本没跑，模型以为已经调用了 → 本轮结束
+    /// → 用户看到的就是「罢工，得再发一次继续」。光靠提示词纠正治不住（实测确认），
+    /// 这里直接在代码层反解成 ToolCall 去执行，模型用什么格式写都能跑下去。
+    ///
+    /// 返回空数组 = 没有可解析的文本调用。
+    static func parseTextualToolCalls(_ text: String) -> [ToolCall] {
+        let t = normalizeDSML(text)
+        guard t.contains("<|DSML|") || t.contains("<antml:invoke") || t.contains("<invoke") else {
+            return []
+        }
+        var out: [ToolCall] = []
+        let invokeOpen = #"<\|DSML\|\s*invoke\s+name=["']([^"']+)["'][^>]*>"#
+        let antmlOpen  = #"<antml:invoke\s+name=["']([^"']+)["'][^>]*>"#
+        let plainOpen  = #"<invoke\s+name=["']([^"']+)["'][^>]*>"#
+        var remaining = t
+        // 最多解析 32 个，防病态输入把主线程卡住
+        var guardCount = 0
+        while guardCount < 32 {
+            guardCount += 1
+            // 找最早出现的 invoke 起始
+            var bestRange: Range<String.Index>?
+            var bestName = ""
+            for p in [invokeOpen, antmlOpen, plainOpen] {
+                guard let re = try? NSRegularExpression(pattern: p) else { continue }
+                let ns = remaining as NSString
+                guard let m = re.firstMatch(in: remaining, range: NSRange(location: 0, length: ns.length)),
+                      m.numberOfRanges > 1,
+                      let full = Range(m.range, in: remaining),
+                      let nameR = Range(m.range(at: 1), in: remaining) else { continue }
+                if bestRange == nil || full.lowerBound < bestRange!.lowerBound {
+                    bestRange = full
+                    bestName = String(remaining[nameR])
+                }
+            }
+            guard let open = bestRange else { break }
+            let afterOpen = remaining[open.upperBound...]
+            // 找对应闭合标签
+            var closeRange: Range<String.Index>?
+            for close in ["</|DSML| invoke>", "</|DSML|invoke>",
+                          "</antml:invoke>", "</invoke>"] {
+                if let r = afterOpen.range(of: close) {
+                    if closeRange == nil || r.lowerBound < closeRange!.lowerBound {
+                        closeRange = r
+                    }
+                }
+            }
+            let body: String
+            let nextStart: String.Index
+            if let close = closeRange {
+                body = String(afterOpen[..<close.lowerBound])
+                nextStart = close.upperBound
+            } else {
+                // 没闭合（流式截断/模型漏写）：吃到文本结尾
+                body = String(afterOpen)
+                nextStart = remaining.endIndex
+            }
+            // 解析 body 里的 parameter
+            var params: [String: String] = [:]
+            let paramPat = #"parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)</(?:\|DSML\||antml:)?\s*parameter>"#
+            if let re = try? NSRegularExpression(pattern: paramPat, options: [.dotMatchesLineSeparators]) {
+                let ns = body as NSString
+                let matches = re.matches(in: body, range: NSRange(location: 0, length: ns.length))
+                for m in matches where m.numberOfRanges > 2 {
+                    let k = ns.substring(with: m.range(at: 1))
+                    var v = ns.substring(with: m.range(at: 2))
+                    for junk in ["</|DSML| parameter>", "</|DSML|parameter>",
+                                 "</antml:parameter>", "</parameter>"] {
+                        v = v.replacingOccurrences(of: junk, with: "")
+                    }
+                    params[k] = v.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+            if !bestName.isEmpty {
+                // 参数还原成 JSON（与结构化 tool_calls 完全同构，后续链路零改动）
+                let argsJSON: String
+                if let d = try? JSONSerialization.data(withJSONObject: params as [String: Any],
+                                                       options: [.sortedKeys]),
+                   let s = String(data: d, encoding: .utf8) {
+                    argsJSON = s
+                } else {
+                    argsJSON = "{}"
+                }
+                out.append(ToolCall(id: "textual-" + UUID().uuidString,
+                                    name: bestName,
+                                    arguments: argsJSON,
+                                    toolTitle: ToolCall.extractTitle(from: argsJSON)))
+            }
+            if nextStart >= remaining.endIndex { break }
+            remaining = String(remaining[nextStart...])
+            if remaining.isEmpty { break }
+        }
+        return out
+    }
+
+    /// 2026-11-03：把正文里的文本形态工具调用**剔除掉**，只留真正的自然语言说明。
+    ///
+    /// parseTextualToolCalls 已经把 XML 反解成 ToolCall 去真执行了，但屏幕上那段
+    /// 还留着 → 用户看到「上面能看懂的中文 + 下面一大片英文 XML」，英文还会不断
+    /// 刷屏把中文顶走。执行完必须把这段从气泡内容里删干净。
+    ///
+    /// 不改变正常正文：只有真的匹配到 invoke/DSML token 才动手。
+    static func stripTextualToolCalls(_ text: String) -> String {
+        guard containsTextualToolCall(text) else { return text }
+        var t = normalizeDSML(text)
+
+        // ① 整块 invoke（含 calls 外层包裹）
+        let blockPats = [
+            #"<\|DSML\|\s*invoke\b[\s\S]*?</\|\s*DSML\s*\|?\s*invoke\s*>"#,
+            #"<antml:invoke\b[\s\S]*?</antml:invoke\s*>"#,
+            #"<invoke\b[\s\S]*?</invoke\s*>"#,
+        ]
+        for p in blockPats {
+            if let re = try? NSRegularExpression(pattern: p, options: [.dotMatchesLineSeparators]) {
+                let ns = t as NSString
+                t = re.stringByReplacingMatches(in: t,
+                                                range: NSRange(location: 0, length: ns.length),
+                                                withTemplate: "")
+            }
+        }
+        // ② 未闭合的最后一个 invoke（流式截断/模型漏写）
+        for p in [#"<\|DSML\|\s*invoke\b[\s\S]*$"#, #"<antml:invoke\b[\s\S]*$"#] {
+            if let re = try? NSRegularExpression(pattern: p, options: [.dotMatchesLineSeparators]) {
+                let ns = t as NSString
+                if let m = re.firstMatch(in: t, range: NSRange(location: 0, length: ns.length)),
+                   let r = Range(m.range, in: t) {
+                    t = String(t[..<r.lowerBound])
+                }
+            }
+        }
+        // ③ 孤立残留的包裹/参数标签（含 calls 外层、闭合形态 </|DSML|calls>）
+        //    注意顺序：带 "/" 的闭合标签必须先匹配掉，否则残留成 "</|DSML|calls>"
+        let strayPats = [
+            #"</\s*\|DSML\|\s*/?\s*(calls|invoke|parameter|call|function_calls|function_results)\s*>"#,
+            #"<\s*\|DSML\|\s*/?\s*(calls|invoke|parameter|call|function_calls|function_results)\s*>"#,
+            #"<\|DSML\|\s*parameter\b[\s\S]*?</\|\s*DSML\s*\|?\s*parameter\s*>"#,
+            #"</\|\s*DSML\s*\|?\s*>"#,
+            #"<\|DSML\|\s*>"#,
+        ]
+        for p in strayPats {
+            if let re = try? NSRegularExpression(pattern: p, options: [.dotMatchesLineSeparators]) {
+                let ns = t as NSString
+                t = re.stringByReplacingMatches(in: t,
+                                                range: NSRange(location: 0, length: ns.length),
+                                                withTemplate: "")
+            }
+        }
+        // ④ 收拾删除后留下的连续空行
+        while t.contains("\n\n\n") {
+            t = t.replacingOccurrences(of: "\n\n\n", with: "\n\n")
+        }
+        t = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        // ⑤ 全被削光就留一句提示，别让气泡空白（看起来像 Bug）
+        return t.isEmpty ? "（已自动执行上面的工具调用）" : t
+    }
+
     /// v2.9.31：递归处理一批工具调用。工具在后台线程执行 (避免耗时操作阻塞主线程），
     /// 结果经 handleDispatchResult 回主线程继续。
     /// v3.5.3：文本工具调用兜底——从最终文本里提取文本式 shell 调用命令（shell.exec("...") /
     /// shell_exec(command="...") 等）。模型把调用写成文本(而非结构化 tool_call)时系统不执行，
     /// 这里兜底提取出真实命令让 runTextualShellIfNeeded 真正执行。
+    ///
+    /// 2026-11-03：入口先做 DSML 归一化，否则全角双竖线的 `<｜｜DSML｜｜ parameter ...>`
+    /// 用半角正则一条都匹配不到 → 命令提取失败 → 工具根本没执行。
     private static func extractTextualShellCommand(from text: String) -> String? {
+        let normalized = normalizeDSML(text)
+        // ① DSML / antml 参数块里的 command（真机截图那形态）
+        let dsmlPatterns = [
+            #"parameter\s+name=["']command["'][^>]*>([\s\S]*?)</\|\s*DSML\s*\|?\s*parameter>"#,
+            #"parameter\s+name=["']command["'][^>]*>([\s\S]*?)</antml:parameter>"#,
+            #"parameter\s+name=["']command["'][^>]*>([\s\S]*?)</parameter>"#,
+            #"parameter\s+name=["']command["'][^>]*>([\s\S]*?)<"#,
+        ]
+        for p in dsmlPatterns {
+            guard let re = try? NSRegularExpression(pattern: p, options: [.dotMatchesLineSeparators]) else { continue }
+            let ns = normalized as NSString
+            if let m = re.firstMatch(in: normalized, range: NSRange(location: 0, length: ns.length)),
+               m.numberOfRanges > 1 {
+                var c = ns.substring(with: m.range(at: 1))
+                for junk in ["</|DSML| parameter>", "</|DSML|parameter>",
+                             "</antml:parameter>", "</parameter>", "</|DSML|>"] {
+                    c = c.replacingOccurrences(of: junk, with: "")
+                }
+                c = c.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !c.isEmpty { return c }
+            }
+        }
+        // ② 老的自然写法
         let patterns = [
             #"shell\.exec\s*\(\s*["']([^"']+?)["']\s*\)"#,          // shell.exec("cmd") / shell.exec('cmd')
             #"shell_exec\s*\(\s*command\s*[:=]\s*["']([^"']+?)["']"#, // shell_exec(command="cmd")
@@ -2273,8 +2561,8 @@ final class ConversationStore: ObservableObject {
         ]
         for p in patterns {
             guard let re = try? NSRegularExpression(pattern: p, options: []) else { continue }
-            let ns = text as NSString
-            if let m = re.firstMatch(in: text, options: [], range: NSRange(location: 0, length: ns.length)),
+            let ns = normalized as NSString
+            if let m = re.firstMatch(in: normalized, range: NSRange(location: 0, length: ns.length)),
                m.numberOfRanges > 1 {
                 let c = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !c.isEmpty { return c }
@@ -2365,7 +2653,7 @@ final class ConversationStore: ObservableObject {
             if !missing.isEmpty && self.paramCorrectionCount < 2 {
                 self.paramCorrectionCount += 1
                 self.pendingParamCorrection = "The tool \(call.name) you want to call is missing required params: \(missing.joined(separator: ", ")). Fill them in and call again; don't keep retrying the same missing-param call in the same way."
-                self.trailStep(.done(.note, "Missing tool params", detail: "\(call.name) missing: \(missing.joined(separator: ", "))", ok: false))
+                self.trailStep(.done(.note, "工具缺少参数", detail: "\(call.name) 缺少：\(missing.joined(separator: "、"))", ok: false))
                 // v7.1.101：缺参不再剥离回模型——v7.1.99 多条合批后，剥离会留下
                 // "assistant 带 N 条 toolCalls 却只有部分 tool 结果"的非法序列（API 拒）。
                 // 改为：缺参作为错误 tool 消息 append（toolCallId 匹配），继续执行下一条，
@@ -2480,7 +2768,7 @@ final class ConversationStore: ObservableObject {
             if let ci = self.activeConvIndex { self.pendingToolConvIDs[call.id] = self.conversations[ci].id }
             self.diag("APPEND-PLACEHOLDER: call=\(call.id) conv=\(self.activeConvIndex.map { self.conversations[$0].id.uuidString } ?? "nil")")
         }
-        self.trailStep(.running(.tool, "parallel batch", detail: calls.map { $0.name }.joined(separator: "、")))
+        self.trailStep(.running(.tool, "并行执行一批工具", detail: calls.map { $0.name }.joined(separator: "、")))
         // 2) 分波并发执行（v7.1.108-minis：全执行不截断，≤4 个一波自动续，等价 OpenMinis
         // in-flight 排队；结果按 (index, result, duration) 收集，最终按原序回填）
         let allIndices = calls.indices.filter { preErrors[$0] == nil }
@@ -2500,7 +2788,7 @@ final class ConversationStore: ObservableObject {
                             // 缺参：错误消息直接进序列（toolCallId 匹配，序列始终完整合法），并更新对应 running 卡
                             next.append(pre)
                             self.resolvePendingTool(callId: call.id, content: pre.content, toolDuration: 0, isError: true, narration: nil)
-                            self.trailStep(.done(.note, "Missing tool params",
+                            self.trailStep(.done(.note, "工具缺少参数",
                                                  detail: "\(call.name) missing required params", ok: false))
                             continue
                         }
@@ -2848,7 +3136,8 @@ final class ConversationStore: ObservableObject {
         let compactLine = ModelConfig.contextCompactLine(for: budget)
         let ratio = UsageRecorder.shared.lastRealRatio
         // 预算预留 20% 给 tools schema + 系统/开发者指令 + 请求开销（分档线已含余量，0.7→0.8）
-        let theBudget = max(Int(Double(compactLine) * 0.8), 2000)
+        // 2026-11-03：0.8 → 0.85（给上下文多留 5%，配合保底条数提升，减少「AI 忘了前文」）
+        let theBudget = max(Int(Double(compactLine) * 0.85), 2000)
         // fix73j-审计 M-12：裁剪基于"非状态卡消息"（core），[SUBAGENT-DONE] 卡
         // （toolName=subagent.complete）永远附加在 result 末尾——若让卡占 suffix(6/2)
         // 保留槽，多子代理完成后用户最新提问/最近轮次被删，主 agent 答非所问。
@@ -2865,12 +3154,19 @@ final class ConversationStore: ObservableObject {
         // 长会话：从旧到新裁剪，但始终保留最后 N 条核心消息
         // v7.1.109-peers：极限压缩（对齐 OpenMinis 硬停思想但适配 Agent 长任务）——
         // 保底 6 条仍超预算时降为 2 条（只留最新提问），宁可裁到极限也不硬停卡住任务。
-        var keepMin = 6
+        //
+        // 2026-11-03 修用户反馈「查看聊天记录不能查看全部，只能查看几条」：
+        // 界面其实显示全量，真正被砍的是**发给模型的上下文**——旧逻辑预算吃紧时
+        // 保底只留 2 条（相当于只记得最后一问），模型自然「忘了」前面聊过什么，
+        // 表现就是「翻了半天记录，它还问你要背景」。
+        // 现在：保底从 6 提到 10，极限兜底从 2 提到 4，并把预算预留从 0.8 提到 0.85
+        // （分档线本身已含余量，实测不会超发）。
+        var keepMin = 10
         var suffix = Array(core.suffix(keepMin))
         var prefix = Array(core.prefix(core.count - keepMin))
         var used = suffix.reduce(0) { $0 + Self.estimateTokens($1) }
-        if used > theBudget, core.count > 2 {
-            keepMin = 2
+        if used > theBudget, core.count > 4 {
+            keepMin = 4
             suffix = Array(core.suffix(keepMin))
             prefix = Array(core.prefix(core.count - keepMin))
             used = suffix.reduce(0) { $0 + Self.estimateTokens($1) }

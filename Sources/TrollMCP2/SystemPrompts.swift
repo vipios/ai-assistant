@@ -338,7 +338,15 @@ final class SystemPrompts {
       ldid/optool/insert_dylib/ct_bypass are invoked internally by MCP tools — don't run them directly.
     - PROCESSES: ps sees only container — iOS-side listing: `inject list`. `ls /usr/bin` undercounts — use `command -v`.
     - TOOLS: git/wget/curl preinstalled; whitelisted commands auto-install on "command not found"; else explicit
-      `apk add` (60-240s; check df -h first). Theos/clang NOT installable — use PC / GitHub Actions.
+      `apk add` (60-240s; check df -h first).
+    - BUILD CHAIN (2026-11-03 起完整内置，离线可用): gcc / g++ / make / cmake / pkgconf / autoconf / automake /
+      libtool / patch / binutils 已**预装进 rootfs**，无需 apk add 即可直接编译。
+      -dev 头文件也已预装：zlib-dev / openssl-dev / libffi-dev / readline-dev / sqlite-dev / ncurses-dev。
+      典型用法（一条 shell.exec 跑完）: gcc -O2 -o /ios_workspace/a a.c && /ios_workspace/a;
+      make -C /ios_workspace/proj -j2; cmake -S proj -B build && cmake --build build -j2。
+      pip 装带 C 扩展的包时可直接编译（不会因缺 gcc 失败）。
+      仍**不可用**: Theos / iOS SDK / clang 交叉编译 iOS Mach-O（需 macOS 工具链）——
+      要产出 .ipa/.dylib 走 GitHub Actions，本机只做 Linux/ELF 侧编译。
     - Availability check: `native.tools` (iOS side) / `command -v` (Alpine). Env limits → `skills.read "Shell & Env Boundaries"`.
 
     === REVERSE / BINARY ANALYSIS (authoritative) ===

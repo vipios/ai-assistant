@@ -242,10 +242,21 @@ provision_rootfs_tar() {
     # py3-numpy/py3-pandas 按需 apk add（重包不预装——tool.install 手动）。
     # v6.5.2：补全基础集（wget/jq/openssl/bash/bind-tools）——对齐 InstallTools network 组，
     # 根治"运行时 apk 联网装工具缺证书鸡生蛋"。
+    #
+    # 2026-11-03 用户明确要求「需要完整的编译链，别到时候又出现各种调用工具不对的提示」：
+    # 之前只预装 python3/binutils/git/... 而**没有 gcc/make/g++/clang**，
+    # 于是任何需要编译的动作（pip 装带 C 扩展的包、configure && make、gcc 编译）
+    # 全部报 command not found —— 这就是「调用工具不对」的根源。
+    # 这里把 build-base（gcc/g++/make/binutils/libc-dev）+ cmake + pkgconf 全部预装进 rootfs，
+    # 做到**离线即可编译**，不依赖运行时 apk 联网。
     qemu-aarch64 "$CACHE_DIR/sbin/apk.static" add --root "$STAGE" --arch "$ALPINE_ARCH" --no-scripts \
         --repository "https://mirrors.aliyun.com/alpine/v${ALPINE_VERSION}/main" \
         --repository "https://mirrors.aliyun.com/alpine/v${ALPINE_VERSION}/community" \
         python3 py3-pip binutils git file sqlite3 tar unzip curl wget jq openssl bash bind-tools ca-certificates \
+        build-base gcc g++ make cmake pkgconf linux-headers \
+        autoconf automake libtool patch diffutils \
+        zlib-dev openssl-dev libffi-dev readline-dev sqlite-dev ncurses-dev \
+        xz zip coreutils findutils gawk sed grep less which \
         > "$CACHE_DIR/provision.log" 2>&1
     local RC=$?
     if [ $RC -ne 0 ]; then
