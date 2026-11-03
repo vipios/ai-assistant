@@ -29,6 +29,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 2026-11-03：**从根上关掉换行归一**。
+      #
+      # 症状（连续两次红，报错一模一样）：
+      #   error: cannot pull with rebase: You have unstaged changes.
+      # 而前面明明刚做完 `git checkout -- .` + `git reset --hard HEAD`，工作区是干净的。
+      #
+      # 真因：仓库有 .gitattributes（*.swift text eol=lf 等）。Git 在**每次操作时**
+      # 都会按 attributes 重新检查工作区文件是否需要归一换行，于是 `git pull` 一启动
+      # 就把那些 CRLF 文件标记为"已修改"，rebase 的前置检查直接失败。
+      # 这不是脏工作区，是 attributes 规则的副作用——reset 治不了它。
+      #
+      # 修法：把这个 checkout 出来的工作副本的换行处理彻底关掉
+      # （core.autocrlf=false + core.eol=lf），让它跟 attributes 的期望一致，
+      # 不再出现"每次操作都冒出一堆改动"。只影响本 runner，不影响仓库本身。
+      - name: Normalize git eol settings (CI only)
+        run: |
+          set -x
+          git config core.autocrlf false
+          git config core.eol lf
+          git config core.safecrlf false
+          # 让工作区与索引彻底一致：先清掉未跟踪/改动，再重新检出
+          git reset --hard HEAD
+          git status --porcelain | head -20 || true
+          echo ">>> 工作区已清空"
+
       # v4.5.x: bump 版本号（patch +1，CFBundleVersion +1），commit [skip ci] 写回 main。
       # 目的：构建产物版本每次递增（7.1.0 → 7.1.1 → ...），App 内"检查更新"（读 main 分支
       # Support/Info.plist / jsDelivr @main / release title）能识别新版。[skip ci] 防循环触发。
@@ -70,11 +95,21 @@ jobs:
           # 不影响任何人本地工作区）。
           # 注意顺序：bump 已经在上面 commit 过了，所以 --hard HEAD 只会丢掉
           # 归一化产生的换行噪音，不会丢版本号修改。
-          git checkout -- .
+          git checkout -- . || true
           git reset --hard HEAD
 
-          git pull --rebase "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
+          # 用 fetch + rebase --autostash 替代 `git pull --rebase`：
+          # `pull --rebase` 只要看到一点点未暂存改动就直接拒绝（上面两次都是这么红的），
+          # 而 --autostash 会自己 stash → rebase → pop，不会因为换行噪音卡死。
+          git fetch "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
+          git -c rebase.autoStash=true rebase FETCH_HEAD || {
+            echo ">>> rebase 失败，放弃版本回写（不让它拖死整个构建）"
+            git rebase --abort || true
+          }
+          # push 也允许失败：版本号没写回去只是编号不递增，
+          # 绝不能因此让 25 个编译步骤全部 skipped
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main || \
+            echo ">>> WARN: 版本号推送失败，但继续构建（不影响产物）"
           echo ">>> version bumped to $NEW (build $((BUILD+1)))"
 
       - name: Install tools
