@@ -26,7 +26,7 @@ enum RouterControl {
     static let probeTimeout: TimeInterval = 1.2
 
     /// 内网候选地址（按可信度排序）。
-    /// 用户手动填的 > 真的连通过的历史地址 > 当前 WiFi 网段推导 > 已知固定地址。
+    /// 用户手动填的 > 当前 WiFi 网段推导（.88 优先）> 历史地址池 > 已知固定地址。
     static func lanCandidates() -> [String] {
         var list: [String] = []
         func add(_ h: String) {
@@ -38,20 +38,30 @@ enum RouterControl {
         // 1) 用户手动填的，最可信
         add(UserDefaults.standard.string(forKey: "router.custom_host") ?? "")
 
-        // 2) 学到过的地址池（真的连通过的，比任何猜测可靠）
-        if let pool = UserDefaults.standard.array(forKey: "router.host_pool") as? [String] {
-            for h in pool { add(h) }
-        }
-
-        // 3) 当前 WiFi 网段推导——家用路由常见尾号都列上；
-        //    并发探测，多一个候选不增加总耗时（最坏等最慢那个）
-        if let myIP = RouterControl.wifiIPv4() {
+        // 2) 当前 WiFi 网段推导——家用路由常见尾号按可信度排（.88 在第一位）。
+        //    **排在历史地址池前面**：这样在家永远是 .88，不会因为池子里存过 .250
+        //    或 ZeroTier 地址就换一个显示。误判风险也低——只有自家路由会回 airboot 签名。
+        // en0 拿不到（个别机型 WiFi 不叫 en0）就退回「第一个非蜂窝内网地址」
+        let myIP = RouterControl.wifiIPv4() ?? BaseURLRouter.localPrivateIPv4s().first
+        if let myIP = myIP {
             let p = myIP.split(separator: ".")
             if p.count == 4 {
                 let seg = "\(p[0]).\(p[1]).\(p[2])"
                 for tail in ["88", "250", "1", "2", "254", "100", "10", "8", "18", "3"] {
                     add("\(seg).\(tail)")
                 }
+            }
+        }
+
+        // 3) 学到过的地址池（非当前网段的老地址仍可能有用，比如换了网段）
+        //    必须把 ZeroTier 地址剔出去：1.0.21 的 discover() 只要通了就 remember()，
+        //    ZT 地址就是这么被学进池子的，留着它会让「内网直连」显示成 10.47.67.100。
+        let ztSet = Set(ztCandidates())
+        if let pool = UserDefaults.standard.array(forKey: "router.host_pool") as? [String] {
+            for h in pool {
+                let t = h.trimmingCharacters(in: .whitespacesAndNewlines)
+                if ztSet.contains(t) { continue }
+                add(h)
             }
         }
 
