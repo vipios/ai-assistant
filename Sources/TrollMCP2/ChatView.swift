@@ -649,11 +649,25 @@ struct ChatView: View {
     /// 这样的构造直接内联在 `ForEach { switch { case .msg } }` 两层泛型嵌套里时，
     /// Swift 的类型推断器要枚举的组合数爆炸，直接在 60 秒上限处放弃。
     ///
-    /// 修法：把这个构造提成独立方法并用 `-> some View` 显式给出返回类型。
+    /// 修法：把这个构造提成独立方法并显式给出返回类型。
     /// 类型锚点一给出，推断器就不用再猜整棵树，很快就能过。
     /// 这是 Apple 官方推荐的解法（"try breaking up the expression"）。
-    @ViewBuilder
-    private func bubble(for msg: ChatMessage) -> some View {
+    ///
+    /// 2026-11-05 **编译修复（fix-equatable-1）**：返回类型从 `some View` 改成 `MessageBubble`。
+    ///
+    /// 上一轮在调用处加了 `.equatable()`，但 `some View` 是不透明的，编译器只知道
+    /// 「某个 View」而不知道它就是 `MessageBubble`（也就不知道它 conform Equatable），于是：
+    ///   error: referencing instance method 'equatable()' on 'View'
+    ///          requires that 'some View' conform to 'Equatable'
+    /// 而且这个错误会顺带把外层 `ForEach(ChatListGrouping.group(...), id: \.id)` 的
+    /// 类型推断一起拖崩（报成 "cannot convert [ChatListGrouping.Item] to Binding<C>"，
+    /// 极具误导性 —— 数组本身完全没问题）。
+    ///
+    /// 写具体类型既修了报错，也让 `.equatable()` 真正开始工作。
+    /// 注意：函数体里**只能有一条**返回 `MessageBubble` 的表达式，不能带 `if`/`switch`
+    /// 分支（那就必须用 @ViewBuilder + some View，也就不可能拿到具体类型）。
+    /// 当前实现满足这个前提。
+    private func bubble(for msg: ChatMessage) -> MessageBubble {
         // 注意：isScrollingFast 在 scroll.activity 上，**不在 scroll 上**。
         // 这是刻意拆分（见 ChatScrollState.swift）：它跟 offset/contentHeight 放一起的话，
         // body 一订阅就会连每帧的 offset 更新一起收，等于把修好的滚动性能问题退回去。
