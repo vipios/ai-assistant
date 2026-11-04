@@ -1579,7 +1579,7 @@ enum L10n {
             tbl["i18n_1549"] = ["zh": "路由器返回 HTTP %d", "en": "Router returned HTTP %d"]
             tbl["i18n_1550"] = ["zh": "路由器拒绝了：%@", "en": "Router rejected: %@"]
             tbl["i18n_1551"] = ["zh": "请先填后台密钥", "en": "Enter the admin key first"]
-            tbl["i18n_1552"] = ["zh": "重启指令直接发给路由器。人在外面时请先开 ZeroTier，或连着家里 WiFi。", "en": "The command goes straight to the router. Outside home, enable ZeroTier or join the home Wi-Fi."]
+            tbl["i18n_1552"] = ["zh": "重启指令直接发给路由器，内网 / ZeroTier / 外网域名都能用。外网点「重启中转站服务」暂不支持，其余功能正常。", "en": "The command goes straight to the router; it works on home LAN, ZeroTier, and the public domain. Restarting the relay service itself still needs home LAN."]
             tbl["i18n_1553"] = ["zh": "正在找路由器…", "en": "Locating router…"]
             tbl["i18n_1554"] = ["zh": "内网没找到，试公网通道…", "en": "Not on LAN — trying the public channel…"]
             tbl["i18n_1555"] = ["zh": "连不上路由器：在家请确认连着 WiFi，在外面请先打开 ZeroTier", "en": "Can't reach the router: check Wi-Fi at home, or enable ZeroTier when away"]

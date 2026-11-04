@@ -156,12 +156,20 @@ struct RouterControlView: View {
 
     private var routeIcon: String {
         guard let r = route else { return "wifi.router" }
-        return r.isLan ? "wifi.router.fill" : "globe.asia.australia.fill"
+        switch r.kind {
+        case .lan:      return "wifi.router.fill"
+        case .zeroTier: return "network"
+        case .wan:      return "globe.asia.australia.fill"
+        }
     }
 
     private var routeTint: Color {
         guard let r = route else { return .secondary }
-        return r.isLan ? .blue : .orange
+        switch r.kind {
+        case .lan:      return .blue
+        case .zeroTier: return .teal
+        case .wan:      return .orange
+        }
     }
 
     private var deviceCard: some View {
@@ -190,8 +198,9 @@ struct RouterControlView: View {
                                 : (deviceError.isEmpty ? "检测中…" : "未连上")))
                             .font(.caption)
                             .foregroundColor(.secondary)
-                        if let r = route, device != nil {
-                            Text("· \(r.isLan ? "WiFi 直连" : "走域名")")
+                        // 1.0.22：三类线路各说各的，ZT 不再冒充「WiFi 直连」
+                        if let r = route, device != nil, !r.channelText.isEmpty {
+                            Text("· \(r.channelText)")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
@@ -486,11 +495,20 @@ struct RouterControlView: View {
     private func detectRoute(force: Bool = false) async {
         if detecting { return }
         detecting = true
-        let r = await RouterControl.resolveRoute()
+        // 把当前线路传进去做「粘性」：它还能用就别换地址，
+        // 否则 .88 / .250 会每次刷新随机跳（1.0.21 用户实测）。
+        let r = await RouterControl.resolveRoute(preferring: route)
         detecting = false
         lastNetSig = RouterControl.netSignature()
         let changed = (route?.adminBase != r.adminBase) || (route?.bootBase != r.bootBase)
         route = r
+        if changed {
+            // 换了线路，上一台的数字就不能继续摆在界面上。
+            // 老代码保留旧 device，于是「已经切到域名/ZT 了，卡片还是绿的、还是 55 分钟」，
+            // 看着像在线，其实是上个网络的残留。
+            device = nil
+            deviceError = ""
+        }
         // 地址变了、或者用户手动点刷新 → 重拉一次状态
         if changed || force {
             refreshDevice()
@@ -712,7 +730,7 @@ struct RouterControlView: View {
                 // 外网点「中转站重启」会 404：隧道只把 8080 转出去了，
                 // /cgi-bin/airboot 在 80 上，relay.py 根本不认识这个路径。
                 // 这句比「HTTP 404」有用得多。
-                if !target.isLan, case .http(404) = e {
+                if target.kind == .wan, case .http(404) = e {
                     msg = "外网隧道目前只开放了 8080 端口，重启中转站服务请在家连 WiFi 操作。"
                         + "「路由器重启」在外网可以正常用。"
                 }
