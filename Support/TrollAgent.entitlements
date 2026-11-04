@@ -194,22 +194,16 @@
 	</array>
 	<key>com.apple.private.security.container-manager</key>
 	<true/>
-	<key>com.apple.private.security.container-required</key>
-	<false/>
+	<!-- P76-b（2026-11-04）第二步实验：移除 container-required=false 与 no-container。
+	     P76 第一步只删了 no-sandbox，1.0.17 实机结果：denied 159 一条没少、spawn 仍为 0
+	     ⇒ no-sandbox 不是唯一原因，进程「没有任何数据容器」才是关键关卡。
+	     依据：WebContent 子进程要往父进程容器里写缓存/Cookie 才能建立通道；
+	           微信有正常容器 ⇒ 能跑；我们 no-container ⇒ 通道建不起来。
+	     本步同时删这两项，让系统按 bundleId 分配正常容器（不再强制"无容器"）。
+	     风险：路径访问从「全盘可写」收窄为「容器内可写」。
+	           文件管理/Shell 若访问 /var/mobile 等容器外路径，可能被拒 —— 装机后需实测。 -->
 	<key>com.apple.private.security.disk-device-access</key>
 	<true/>
-	<key>com.apple.private.security.no-container</key>
-	<true/>
-	<!-- P76（2026-11-04）实验：移除 no-sandbox，验证 WebKit XPC 是否能通。
-	     依据（真机对比，微信 vs TrollAgent）：
-	       微信  mach-lookup=0 项 / no-sandbox=无 / no-container=无  → WebContent 能跑（23 次成功 spawn）
-	       我们  mach-lookup=10 项 / no-sandbox=有 / no-container=有  → WebContent 全被 159 拒
-	     推论：no-sandbox=true 让进程脱离用户沙盒域，而 WebKit XPC 连接要求发起方在沙盒域内。
-	     因此白名单不是关键（微信 0 项也能跑），沙盒域才是关键。
-	     本次只删这一项，其余全部不动 —— 受控实验，一次装机即可判定。
-	     若仍不通 ⇒ 说明 no-container 也是原因（下一步再删），或问题更深（转方案 B 双进程）。
-	     风险：task_for_pid / launchd job 提交 依赖该权限，砸壳功能可能受影响。
-	           先验证 WebKit；砸壳若坏，走方案 B 用独立 helper 进程补回。 -->
 	<key>com.apple.private.security.storage.AppBundles</key>
 	<true/>
 	<key>com.apple.private.security.storage.AppDataContainers</key>

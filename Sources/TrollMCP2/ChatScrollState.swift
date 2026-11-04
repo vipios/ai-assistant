@@ -1,5 +1,7 @@
 import SwiftUI
 import UIKit
+// P78：CFAbsoluteTime / CFAbsoluteTimeGetCurrent 来自 CoreFoundation
+import CoreFoundation
 // activity.objectWillChange 的 sink 需要 Combine
 import Combine
 
@@ -117,32 +119,65 @@ final class ChatScrollState: ObservableObject {
 final class ChatScrollActivity: ObservableObject {
     @Published var isScrollingFast: Bool = false
 
-    /// 滚动停止判定令牌：每次滚动回调 +1，延时任务醒来比对，
-    /// 变了说明期间又滚过，放弃本次「恢复」，交由最后一次调度的任务处理。
-    private var scrollTick: Int = 0
+    /// P78（2026-11-04）：停止判定改用时间戳 —— 见下方 noteScrolled 的详细说明。
+    /// restoreWork 是「唯一的待执行任务槽」，非 nil 表示已排程、不重复排。
     private var restoreWork: DispatchWorkItem?
 
     /// 每帧调用。只在状态真的需要翻转时才写 @Published，否则仅更新令牌，
-    /// 避免每帧一次 objectWillChange 又把 body 重算拉回高频路径。
-    func noteScrolled() {
-        scrollTick &+= 1
-        let tick = scrollTick
+    /// 避免每帧一次 objectWillChange 又把 body 重算拉回高频频率。
+    ///
+    /// P78（2026-11-04）修卡顿：原来每次调用都 `restoreWork?.cancel()` + 新建
+    /// DispatchWorkItem + asyncAfter，在 120Hz 屏上滚动 1 秒就是 120 次对象分配
+    /// 和 120 次主队列排程 —— 分配和 cancel 本身把主线程占住，用户感知就是
+    /// 「往上滑聊天记录很卡」。数值逻辑没错，坏在每帧的固定开销。
+    ///
+    /// 现在改成：只在「首次进入滚动」时排一次延时任务（每轮滚动 1 次，不是每帧 1 次）；
+    /// 后续每帧只更新 timestamp。延时任务醒来后比对「距最后一次滚动过了多久」，
+    /// 不足 0.3 秒就把剩余时间再排一次（尾随触发），够了才恢复。
+    /// 这样无论滚多久，同一时刻最多只有 1 个待执行任务，且不产生每帧分配。
+    private var lastScrollTime: CFAbsoluteTime = 0
+    /// 停止判定阈值：0.3 秒。比手指离屏略长，避开回弹动画期间的反复切换；
+    /// 又不能太长——否则停手后想长按选字要等半秒才有反应。
+    private let stopInterval: CFAbsoluteTime = 0.3
 
+    func noteScrolled() {
+        lastScrollTime = CFAbsoluteTimeGetCurrent()
+
+        // 只有从「静止」进入「滚动」这一次写 @Published（每轮滚动仅 1 次翻转）
         if !isScrollingFast {
             isScrollingFast = true
         }
 
-        restoreWork?.cancel()
+        // 已有待执行任务就不重复排程 —— 这是省掉每帧分配的关键。
+        // 该任务自己会检查 lastScrollTime 决定是收尾还是续排。
+        guard restoreWork == nil else { return }
+
+        scheduleRestoreCheck()
+    }
+
+    private func scheduleRestoreCheck() {
         let work = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            guard self.scrollTick == tick else { return }
-            if self.isScrollingFast {
-                self.isScrollingFast = false
+            let idle = CFAbsoluteTimeGetCurrent() - self.lastScrollTime
+            if idle < self.stopInterval {
+                // 还在滚（或刚停不足 0.3s）：把剩余时间再排一次，任务槽保持占用
+                let remain = self.stopInterval - idle
+                let next = DispatchWorkItem { [weak self] in self?.runRestoreCheck() }
+                self.restoreWork = next
+                DispatchQueue.main.asyncAfter(deadline: .now() + remain, execute: next)
+                return
             }
+            self.runRestoreCheck()
         }
         restoreWork = work
-        // 0.3 秒：比手指离屏略长，避开回弹动画期间的反复切换；
-        // 又不能太长——否则停手后想长按选字要等半秒才有反应。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + stopInterval, execute: work)
+    }
+
+    /// 真正收尾：解除任务槽 + 恢复重量级控件。
+    private func runRestoreCheck() {
+        restoreWork = nil
+        if isScrollingFast {
+            isScrollingFast = false
+        }
     }
 }
