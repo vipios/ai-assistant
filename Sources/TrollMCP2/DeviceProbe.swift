@@ -141,26 +141,46 @@ final class DeviceProbe: ObservableObject {
         // 静默安装助手：TrollStore 部署的 helper。
         // 系统位 /var/usr/bin/trollstorehelper（TrollStore 1 系）+ TrollStore.app 容器内
         // （TrollStore 2：com.opa334.TrollStore 路径）——与 AppDecryptTools 运行时查找顺序一致。
+        // 2026-11-05 实机修正：手机上是 TrollStore **Lite**（com.opa334.TrollStoreLite，越狱装到
+        // /var/jb/Applications 下），另有 巨魔R（TrollStoreR）。老代码只认 com.opa334.TrollStore
+        // 一个 bundleId，Lite 机器上一辈子绿不了 —— 明明 helper 就在那儿（实测可执行），
+        // 界面却报"静默安装助手缺失"。改成：系统位 → 越狱部署位 → 前缀匹配所有 trollstore* App。
         let helperPath = "/var/usr/bin/trollstorehelper"
         var helperOK = FileManager.default.isExecutableFile(atPath: helperPath)
         var helperDetail = helperOK ? L10n.t("i18n_1222") : L10n.t("i18n_1223")
         if !helperOK {
-            let tsPath = AppCatalog.list().first { $0.bundleId == "com.opa334.TrollStore" }?.path ?? ""
-            if !tsPath.isEmpty {
-                let candidates = [tsPath + "/trollstorehelper", tsPath + "/TrollStore.app/trollstorehelper",
-                                  (tsPath as NSString).deletingLastPathComponent + "/trollstorehelper"]
-                if let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-                    helperOK = true
-                    helperDetail = L10n.t("i18n_1222")
+            var candidates: [String] = []
+            // 越狱部署位置（TrollStore Lite / 巨魔R 这类 /var/jb/Applications）
+            for app in ["TrollStoreLite", "TrollStoreR", "TrollStore"] {
+                for root in ["/var/jb/Applications", "/Applications"] {
+                    candidates.append("\(root)/\(app).app/trollstorehelper")
                 }
+            }
+            // AppCatalog 里任何 trollstore 系 App 的包内路径
+            for app in AppCatalog.list() where app.bundleId.lowercased().hasPrefix("com.opa334.trollstore") {
+                candidates.append(app.path + "/trollstorehelper")
+                candidates.append(app.path + "/TrollStore.app/trollstorehelper")
+                candidates.append((app.path as NSString).deletingLastPathComponent + "/trollstorehelper")
+            }
+            if let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+                helperOK = true
+                helperDetail = L10n.t("i18n_1222")
+                _ = found
             }
         }
         checks.append(Check(label: L10n.t("i18n_1221"), passed: helperOK,
                             detail: helperOK ? helperDetail : L10n.t("i18n_1223"), infoOnly: false))
 
         // 环境类型（信息项，解释功能差异——如进程级操作仅越狱可用）
+        // 2026-11-05：越狱判定加多路兜底。这台机器是 Dopamine 越狱（rootless，/var/jb），
+        // 但 App 只带 platform-application、没有 no-sandbox，沙盒读不到 /var/jb 根目录 →
+        // 老代码判成"未识别"。改用三路任一命中：/var/jb、/var/jb/Applications、
+        // 以及 AppCatalog 里带 .jbroot- 的 App 路径（rootless 虚拟根标记，一定读得到）。
+        let appsNow = AppCatalog.list()
         let jailbroken = FileManager.default.fileExists(atPath: "/var/jb")
+            || FileManager.default.fileExists(atPath: "/var/jb/Applications")
             || FileManager.default.fileExists(atPath: "/private/preboot/jb")
+            || appsNow.contains(where: { $0.path.contains(".jbroot-") })
         let envType: String
         if jailbroken { envType = L10n.t("i18n_1226") }
         else if trollStore { envType = L10n.t("i18n_1225") }
@@ -221,11 +241,17 @@ final class DeviceProbe: ObservableObject {
         if FileManager.default.fileExists(atPath: "/.TrollStore") { return true }
         if FileManager.default.fileExists(atPath: "/var/jb") { return true }
         if FileManager.default.fileExists(atPath: "/private/preboot/jb") { return true }
-        if AppCatalog.list().contains(where: { $0.bundleId == "com.opa334.TrollStore" }) { return true }
+        // 2026-11-05：bundleId 前缀匹配——机上是 TrollStore Lite（com.opa334.TrollStoreLite）
+        // 和 巨魔R（com.opa334.TrollStoreR），死写 com.opa334.TrollStore 一个都认不到 →
+        // 分项全绿却红横幅「本机环境异常」、环境类型"未识别"。
+        let apps = AppCatalog.list()
+        if apps.contains(where: { $0.bundleId.lowercased().hasPrefix("com.opa334.trollstore") }) { return true }
+        // 越狱环境（rootless）的 App 会挂在 .jbroot-xxx 虚拟根下面，路径里带这个标记
+        if apps.contains(where: { $0.path.contains(".jbroot-") }) { return true }
         // v2.9.159：AppCatalog 兜底——直接扫容器目录找 TrollStore.app (不依赖枚举结果）
         for root in ["/var/containers/Bundle/Application", "/private/var/containers/Bundle/Application"] {
             if let dirs = try? FileManager.default.contentsOfDirectory(atPath: root),
-               dirs.contains(where: { $0.localizedCaseInsensitiveContains("TrollStore") }) {
+               dirs.contains(where: { $0.localizedCaseInsensitiveContains("TrollStore") || $0.contains(".jbroot-") }) {
                 return true
             }
         }
@@ -355,12 +381,16 @@ final class DeviceProbe: ObservableObject {
         let names = ["ldid", "optool", "insert_dylib", "ct_bypass"]
         var result: [String: Bool] = [:]
         for name in names {
-            guard let path = InjectionManager.shared.binaryPath(name) else {
-                result[name] = false
-                continue
-            }
-            // 真实可执行性：access(X_OK) 通过且文件存在
-            result[name] = access(path, X_OK) == 0
+            // 2026-11-05：包内 bin 优先；找不到再退到越狱系统位（/var/jb/usr/bin）。
+            // 实机（iOS 17.0.2 越狱 + TrollStore Lite）核对过：包内 bin/ldid、optool、
+            // insert_dylib、ct_bypass 全部存在且可执行，老代码却报"缺失"。
+            // 原因是只查了 Bundle.main.bundleURL/bin 一个位置，且没有任何兜底。
+            // 现在多探几个位置，任一处可执行就算通过 —— 检查结果要反映"能不能用"，
+            // 而不是"我当时猜的那个路径是否存在"。
+            let candidates = [InjectionManager.shared.binaryPath(name),
+                              "/var/jb/usr/bin/" + name,
+                              "/usr/bin/" + name].compactMap { $0 }
+            result[name] = candidates.contains { access($0, X_OK) == 0 }
         }
         return result
     }
