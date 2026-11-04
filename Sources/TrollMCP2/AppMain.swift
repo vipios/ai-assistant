@@ -243,6 +243,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     // v2.9.10：进后台时申请后台任务，让正在进行的请求有保活窗口（最多 3 分钟）
     func applicationDidEnterBackground(_ application: UIApplication) {
+        // 2026-11-05：安装交接期间进过后台 → 说明 ipa 真的被 TrollStore 接走了。
+        // UpdateManager.installIPA 靠这个标记判断「要不要走远程兜底」——
+        // 旧写法看 3.5 秒那一刻的 applicationState，用户手动切回来就会误判，
+        // 于是又走 http 直链、TrollStore 又下一遍（用户反馈「ipa 下了一遍、巨魔里又下了一遍」）。
+        UpdateManager.shared.noteBackgroundedForInstall()
         // 2026-11-03：进后台时补写「正常退出」标记。
         // 用户平时是划到后台而不是杀进程，所以这个时机最能代表「App 是正常被挂起的」。
         // 下次冷启动若发现标记太旧/不存在，才判定上次是崩了。

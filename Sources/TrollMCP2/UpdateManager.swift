@@ -548,16 +548,39 @@ final class UpdateManager: ObservableObject {
                     return
                 }
                 // open 返回 true 也可能是「其实没人接」——系统有时会静默吞掉。
-                // 判据很简单：真把包交出去了，本 App 一定会被切到后台。
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                    if UIApplication.shared.applicationState == .active {
-                        self.installViaRemotePackage()
-                    } else {
+                // 判据：真把包交出去了，本 App 一定会被切到后台。
+                //
+                // 2026-11-05 修用户反馈「跳转安装时又要下载一遍，ipa 下了一遍、
+                // 巨魔里又下了一遍」：那是走了兜底 installViaRemotePackage（http 直链，
+                // TrollStore 自己再下一遍）。误触发的根源是判定太粗糙。
+                //
+                // 现在改成「**是否曾经离开过前台**」判定，而不是看 3.5 秒那一刻的状态：
+                //   · App 一旦进过后台，说明系统真的把 ipa 交给别的 App 了 → 交付成功；
+                //   · 只有从头到尾一直停在前台，才是真没交出去 → 才允许走远程兜底。
+                // 用「曾经」而不是「此刻」，是因为用户可能手动切回本 App 看进度，
+                // 那一刻 applicationState 又是 .active —— 旧写法会因此误判、白下一遍。
+                self.wasBackgroundedForInstall = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) {
+                    if self.wasBackgroundedForInstall {
+                        // 交出去过 → 成功，绝不重复下载
                         self.markHandedOff()
+                    } else {
+                        // 全程没离开前台 → TrollStore 没接住
+                        self.installViaRemotePackage()
                     }
                 }
             }
         }
+    }
+
+    /// 本次交接期间 App 是否进过后台。
+    /// 由 SceneDelegate / 生命周期通知写入（见 UpdateManager 的 observeLifecycle）。
+    /// 只要进过一次，就说明 ipa 真的被别的 App 接走了。
+    private(set) var wasBackgroundedForInstall = false
+
+    /// 标记「交接期间进过后台」。供 App 生命周期回调调用（只在安装交接窗口内有效）。
+    func noteBackgroundedForInstall() {
+        if stagedURL != nil { wasBackgroundedForInstall = true }
     }
 
     /// 兜底二：把公开 Release 里的 tipa 直链交给 TrollStore，由它自己下载并安装。
