@@ -948,7 +948,14 @@ enum L10n {
             tbl["i18n_659"] = ["zh": "已自动安装", "en": "Auto-installed"]
             tbl["i18n_660"] = ["zh": "镜像", "en": "Mirror"]
             tbl["i18n_661"] = ["zh": "检查更新失败：GitHub 与备用源均不可达（可能被墙）。可在「更新镜像源」里配置可用镜像。", "en": "Update check failed: GitHub and backup sources unreachable (possibly blocked). Configure a working mirror under 'Update Mirrors'."]
-            tbl["i18n_662"] = ["zh": "已是最新版本 v%d", "en": "Already up to date v%@"]
+            // 2026-11-05：中文模板原来是 %d，但调用处传的是 String（版本号 "1.0.24"）。
+            // String(format:) 用 %d 去读一个对象指针 → 输出乱码甚至崩，
+            // 于是「点检查更新」偶尔直接闪退，用户看到的现象就是"点了没反应/检测不到"。
+            tbl["i18n_662"] = ["zh": "已是最新版本 v%@", "en": "Already up to date v%@"]
+            // 2026-11-05 新增：把「没查过」和「查过且最新」分开，别再用同一句"已是最新"
+            tbl["i18n_upd_never"] = ["zh": "还没检查过 · 点开查一下", "en": "Not checked yet · tap to check"]
+            tbl["i18n_upd_same"] = ["zh": "已是最新 v%@", "en": "Up to date v%@"]
+            tbl["i18n_upd_limited"] = ["zh": "GitHub 接口被限流了（未登录每小时 60 次），等几分钟再试；登录 GitHub 账号后配额高得多。", "en": "GitHub API rate-limited (60 req/h signed out). Wait a few minutes, or sign in for a much higher quota."]
             tbl["i18n_663"] = ["zh": "请先检查更新", "en": "Check for updates first"]
             tbl["i18n_664"] = ["zh": "所有下载源都失败了（GitHub 可能被墙，可在「更新镜像源」配置可用镜像）", "en": "All download sources failed (GitHub may be blocked; configure a mirror under 'Update Mirrors')"]
             tbl["i18n_665"] = ["zh": "检查更新闪退", "en": "Update check crashed"]
@@ -957,9 +964,9 @@ enum L10n {
             tbl["i18n_668"] = ["zh": "静默安装失败(exit %d), 分享调起也失败: %@", "en": "Silent install failed (exit %d), share fallback also failed: %@"]
             tbl["i18n_669"] = ["zh": "安装调起失败: %@", "en": "Install invocation failed: %@"]
             tbl["i18n_670"] = ["zh": "静默安装失败（exit %d），App 可能已退出或未安装完整——请用「保存到文件」重新安装", "en": "Silent install failed (exit %d), the app may be closed or not fully installed — reinstall via Save to Files"]
-            // v4.6.x：更新安装改走 TrollStore URL scheme（对齐 Reynard，根治自装闪退/半覆盖）
-            tbl["i18n_1230"] = ["zh": "已交给 TrollStore 安装 v%@——安装完成前请不要打开本 App，完成后重新打开即新版本", "en": "Handed off to TrollStore for v%@ — don't open this app until install finishes; relaunch for the new version"]
-            tbl["i18n_1231"] = ["zh": "未检测到 TrollStore URL Scheme（TrollStore 设置里需开启 URL Scheme Enabled），已打开分享菜单——选 TrollStore 或保存安装包", "en": "TrollStore URL Scheme not detected (enable URL Scheme Enabled in TrollStore settings); share sheet opened — choose TrollStore or save the package"]
+            // 2026-11-05：安装路径改为「本地包直投 TrollStore」（见 UpdateManager.installIPA 注释）
+            tbl["i18n_1230"] = ["zh": "安装包已交给 TrollStore：在弹出的界面点「安装」就会覆盖旧版（安装过程中别打开本 App）", "en": "Package handed to TrollStore — tap Install in its prompt to overwrite the old version (don't open this app while it installs)"]
+            tbl["i18n_1231"] = ["zh": "没找到能打开安装包的 TrollStore，已打开分享菜单——选 TrollStore，或先储存再用 TrollStore 打开", "en": "No TrollStore found to open the package; share sheet opened — pick TrollStore, or save it and open it in TrollStore"]
             tbl["i18n_1232"] = ["zh": "系统拒绝了安装请求，已打开分享菜单兜底", "en": "System rejected the install request; share sheet opened as fallback"]
             // v4.6.x：快捷卡片 prompt 中文化（卡片 UI 已双语，发送的指令原来硬编码英文 → AI 回复英文）
             tbl["i18n_1233"] = ["zh": "在 GitHub 上编译一个测试 tweak（HelloWorld），然后把 dylib 下载到工作区", "en": "Compile a test tweak (HelloWorld) on GitHub, then download the dylib to the workspace"]
@@ -1574,15 +1581,15 @@ enum L10n {
             tbl["i18n_1544"] = ["zh": "还差后台密钥", "en": "Admin key missing"]
             tbl["i18n_1545"] = ["zh": "路由器地址不对", "en": "Invalid router address"]
             tbl["i18n_1546"] = ["zh": "后台密钥不对，操作被拒绝", "en": "Wrong admin key, request rejected"]
-            tbl["i18n_1547"] = ["zh": "重启通道只允许内网访问（要在家里 WiFi 或开 ZeroTier）", "en": "This channel only allows LAN access (home Wi-Fi or ZeroTier)"]
+            tbl["i18n_1547"] = ["zh": "重启通道只接受来自家里 WiFi 或隧道的请求", "en": "This channel only accepts requests from home Wi-Fi or the tunnel"]
             tbl["i18n_1548"] = ["zh": "路由器返回了看不懂的内容", "en": "Unexpected response from router"]
             tbl["i18n_1549"] = ["zh": "路由器返回 HTTP %d", "en": "Router returned HTTP %d"]
             tbl["i18n_1550"] = ["zh": "路由器拒绝了：%@", "en": "Router rejected: %@"]
             tbl["i18n_1551"] = ["zh": "请先填后台密钥", "en": "Enter the admin key first"]
-            tbl["i18n_1552"] = ["zh": "重启指令直接发给路由器，内网 / ZeroTier / 外网域名都能用。外网点「重启中转站服务」暂不支持，其余功能正常。", "en": "The command goes straight to the router; it works on home LAN, ZeroTier, and the public domain. Restarting the relay service itself still needs home LAN."]
+            tbl["i18n_1552"] = ["zh": "两个重启指令都直接发给路由器：在家走 WiFi，在外走域名隧道，都不经过中转站。", "en": "Both restart commands go straight to the router — home Wi-Fi at home, the domain tunnel when away. Neither goes through the relay."]
             tbl["i18n_1553"] = ["zh": "正在找路由器…", "en": "Locating router…"]
             tbl["i18n_1554"] = ["zh": "内网没找到，试公网通道…", "en": "Not on LAN — trying the public channel…"]
-            tbl["i18n_1555"] = ["zh": "连不上路由器：在家请确认连着 WiFi，在外面请先打开 ZeroTier", "en": "Can't reach the router: check Wi-Fi at home, or enable ZeroTier when away"]
+            tbl["i18n_1555"] = ["zh": "连不上路由器：在家请确认连着家里 WiFi，在外面请确认网络正常", "en": "Can't reach the router: check that you're on the home Wi-Fi, or that your network is up"]
             tbl["i18n_1556"] = ["zh": "已通知路由器重启中转站，等它起来…", "en": "Relay restart sent — waiting for it to come back…"]
             tbl["i18n_1557"] = ["zh": "中转站已重启完成", "en": "Relay restarted"]
             tbl["i18n_1558"] = ["zh": "重启指令已直接从路由器发出，约 40 秒后恢复…", "en": "Reboot sent straight to the router — back in about 40 seconds…"]

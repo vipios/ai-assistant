@@ -11,7 +11,7 @@ import Darwin
 ///    毫无关系。中转站是这套系统里最容易卡死的组件（Python 单进程，内存一紧张就 swap
 ///    颠簸），真到了「后台进不去、想重启」的时候，走中转站发重启指令必然也发不出去。
 ///    所以重启必须有一条不经过 Python 的路。
-/// 2. **中转站 `/admin/api/device/reboot`**（兜底）——人在外面没开 ZeroTier 时，
+/// 2. **中转站 `/admin/api/device/reboot`**（兜底）——人在外面时，
 ///    只有经过中转站（或其后面的 Cloudflare 隧道）才够得着。
 ///
 /// 判断 airboot 的依据是返回 `"svc":"airboot"`，避免把光猫/别的路由器误认成自家设备。
@@ -25,8 +25,15 @@ enum RouterControl {
     /// 0.4 秒经常还没 exec 完就被判超时，结果「明明在家却显示连不上」。
     static let probeTimeout: TimeInterval = 1.2
 
-    /// 内网候选地址（按可信度排序）。
-    /// 用户手动填的 > 当前 WiFi 网段推导（.88 优先）> 历史地址池 > 已知固定地址。
+    /// 内网候选地址（最多 4 个，按「是不是咱家」的可信度排）。
+    ///
+    /// 判定规则（1.0.25，用户要求：连别人家 WiFi 也要算「外面」）：
+    ///   **先看当前 WiFi 的网关**——家里那几个 WiFi 的网关就是这台路由器自己，
+    ///   airboot 一定应答；别人家的 WiFi 网关是别人的路由器，回不了 airboot 签名。
+    ///   网关探不通就当场判定「不在家」，直接走域名，不再翻历史地址池瞎试。
+    ///
+    /// 顺序：手动填的 > 当前网段网关 > 当前网段 .88 > 家里固定 .88 / .250
+    /// 正好 4 个 = discover() 第一波一次并发探完，不会再进第二波。
     static func lanCandidates() -> [String] {
         var list: [String] = []
         func add(_ h: String) {
@@ -38,59 +45,29 @@ enum RouterControl {
         // 1) 用户手动填的，最可信
         add(UserDefaults.standard.string(forKey: "router.custom_host") ?? "")
 
-        // 2) 当前 WiFi 网段推导——家用路由常见尾号按可信度排（.88 在第一位）。
-        //    **排在历史地址池前面**：这样在家永远是 .88，不会因为池子里存过 .250
-        //    或 ZeroTier 地址就换一个显示。误判风险也低——只有自家路由会回 airboot 签名。
+        // 2) 当前 WiFi 的网关（家用路由基本都落在 x.y.z.1）。
+        //    在家 → 网关就是这台路由器，一定有 airboot；
+        //    在别人家 → 网关是别人的路由器，探不到 → 后面直接判成外面。
         // en0 拿不到（个别机型 WiFi 不叫 en0）就退回「第一个非蜂窝内网地址」
         let myIP = RouterControl.wifiIPv4() ?? BaseURLRouter.localPrivateIPv4s().first
         if let myIP = myIP {
             let p = myIP.split(separator: ".")
             if p.count == 4 {
                 let seg = "\(p[0]).\(p[1]).\(p[2])"
-                for tail in ["88", "250", "1", "2", "254", "100", "10", "8", "18", "3"] {
-                    add("\(seg).\(tail)")
-                }
+                add("\(seg).1")
+                // 家里 WiFi 也可能是上级光猫发的（192.168.1.x），
+                // 路由器自己挂在那个网段的 .88 上
+                add("\(seg).88")
             }
         }
 
-        // 3) 学到过的地址池（非当前网段的老地址仍可能有用，比如换了网段）
-        //    必须把 ZeroTier 地址剔出去：1.0.21 的 discover() 只要通了就 remember()，
-        //    ZT 地址就是这么被学进池子的，留着它会让「内网直连」显示成 10.47.67.100。
-        let ztSet = Set(ztCandidates())
-        if let pool = UserDefaults.standard.array(forKey: "router.host_pool") as? [String] {
-            for h in pool {
-                let t = h.trimmingCharacters(in: .whitespacesAndNewlines)
-                if ztSet.contains(t) { continue }
-                add(h)
-            }
-        }
-
-        // 4) 已知固定地址兜底。
-        //    .88 是家里路由的主地址，.250 是它在同一网段上的第二个地址
-        //    （1.0.22 实测：两个都在 wan 上，是同一台机器，uptime 同步走）。
-        //    顺序固定成 .88 在前 —— 两个都通时优先 .88，界面地址才不会来回跳。
-        //    **ZeroTier 的 10.47.67.100 不在这里**，见 ztCandidates()。
-        for h in ["192.168.1.88", "192.168.1.250", "192.168.2.1"] {
+        // 3) 家里固定地址兜底。
+        //    .88 是主地址，.250 是同一台机器在同一个网段上的第二个地址
+        //    （1.0.22 实测：两个 uptime 同步，确系一台）。顺序固定 .88 在前。
+        for h in ["192.168.1.88", "192.168.1.250"] {
             add(h)
         }
-        return list
-    }
-
-    /// ZeroTier 固定 IP。
-    ///
-    /// **为什么必须和 lanCandidates 分开**（1.0.21 实测踩的坑）：
-    /// 它原来是内网候选之一，而线路又只有「内网 / 外网」两档，
-    /// 于是一命中就渲染成「内网直连 · WiFi 直连」，地址栏写着 10.47.67.100 —— 
-    /// 看着像 App 瞎填地址，实际是 ZT 虚拟网。ZT 是第三条通道，得单独标。
-    static let defaultZtHost = "10.47.67.100"
-
-    static func ztCandidates() -> [String] {
-        var list: [String] = []
-        let custom = (UserDefaults.standard.string(forKey: "router.zt_host") ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !custom.isEmpty { list.append(custom) }
-        if !list.contains(defaultZtHost) { list.append(defaultZtHost) }
-        return list
+        return Array(list.prefix(4))
     }
 
     /// 取当前 WiFi 的 IPv4（en0）。拿不到（没连 WiFi/用流量）返回 nil。
@@ -143,8 +120,7 @@ enum RouterControl {
     /// 为什么改（1.0.22，用户实测）：
     /// 家里路由在 192.168.1.x 上有 .88 / .250 两个地址，谁先应答是随机的。
     /// 老写法 `group.cancelAll()` 一命中就收工，结果同一个页面连刷三次，
-    /// 地址从 192.168.1.88 跳到 192.168.1.250 再跳到 10.47.67.100，
-    /// 用户以为 App 在乱填地址。
+    /// 地址就在 .88 / .250 之间来回跳，用户以为 App 在乱填地址。
     ///
     /// 现在分两波：
     ///   第一波只探最可信的前 4 个（几乎都在同一个网段，通常 200ms 内全回），
@@ -225,14 +201,11 @@ enum RouterControl {
         return v.isEmpty ? defaultWanHost : v
     }
 
-    /// 线路类型。**必须分三类**：1.0.21 只有「内网/外网」两档，
-    /// 于是 ZeroTier 地址也被渲染成「内网直连 · WiFi 直连」，用户一看就是错的。
+    /// 线路类型。只有两大类：家里 WiFi 直连，或者走公网域名。
     enum Kind: Equatable {
         /// 家里 WiFi 直连（路由器 LAN 地址）
         case lan
-        /// ZeroTier 虚拟网（人在外面，但手机装并连上了 ZT）
-        case zeroTier
-        /// 公网域名（Cloudflare 隧道 → relay.py:8080）
+        /// 公网域名（Cloudflare 隧道 → 路由器 80 / relay.py:8080）
         case wan
     }
 
@@ -243,22 +216,21 @@ enum RouterControl {
         var adminBase: String
         /// airboot 基地址——重启指令用它（内网是 80，外网是域名）
         var bootBase: String
-        /// 界面显示：内网直连 / ZeroTier 直连 / 外网
+        /// 界面显示：内网直连 / 外网
         var label: String
         /// 界面显示：实际地址
         var detail: String
         /// 裸主机（不带协议和端口）。粘性判定只认它，改了就等于换了线路。
         var host: String
 
-        /// true 只代表「真的走家里 WiFi」——ZT 也算远程，不能标成内网。
+        /// true 只代表「真的走家里 WiFi」。
         var isLan: Bool { kind == .lan }
 
-        /// 状态卡第二段小字（ZT 不需要再说一遍，label 已经写清楚了）
+        /// 状态卡第二段小字
         var channelText: String {
             switch kind {
-            case .lan:      return "WiFi 直连"
-            case .zeroTier: return ""
-            case .wan:      return "走域名"
+            case .lan: return "WiFi 直连"
+            case .wan: return "走域名"
             }
         }
     }
@@ -268,8 +240,7 @@ enum RouterControl {
     /// 判定顺序：
     ///   0. 粘性 —— 上一条线路还活着就继续用它（防止 .88 / .250 来回跳）
     ///   1. 有内网卡 + 能探到 airboot → 内网直连
-    ///   2. 探到 ZeroTier 固定 IP     → ZeroTier 直连
-    ///   3. 都不通                    → 公网域名
+    ///   2. 都不通                    → 公网域名
     static func resolveRoute(preferring current: Route? = nil) async -> Route {
         let wan = Route(kind: .wan,
                         adminBase: "https://" + wanHost,
@@ -280,7 +251,8 @@ enum RouterControl {
 
         // 0) 粘性：上一条线路还在，就原样返回，不重新挑地址。
         //    这是「地址乱跳」的正面解法：只有它真的不通了才换。
-        //    域名线路不做粘性（隧道只转发 8080，探 airboot 必然失败，白等 0.9 秒）。
+        //    域名线路不做粘性——不然回到家连上 WiFi 也不会切回内网，
+        //    每次进页面都重新判一次才对。
         if let c = current, c.kind != .wan, await ping(host: c.host, timeout: 0.9) {
             return c
         }
@@ -296,18 +268,7 @@ enum RouterControl {
                          host: hit)
         }
 
-        // 2) ZeroTier：手机开着 ZT 时这条路比绕隧道快得多。
-        //    没开 ZT 时会在这 0.8 秒超时后放弃，然后落到域名。
-        if let zt = await discover(candidates: ztCandidates(), timeout: 0.8) {
-            return Route(kind: .zeroTier,
-                         adminBase: "http://\(zt):8080",
-                         bootBase: "http://\(zt)",
-                         label: "ZeroTier 直连",
-                         detail: zt,
-                         host: zt)
-        }
-
-        // 3) 都不通 → 公网域名。隧道后面是 relay.py(8080)，设备状态照样能读。
+        // 2) 都不通 → 公网域名。隧道后面是 relay.py(8080)，设备状态照样能读。
         return wan
     }
 

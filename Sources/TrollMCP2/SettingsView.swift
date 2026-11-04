@@ -495,7 +495,14 @@ struct SettingsView: View {
         if let s = m.lastSource {
             return L10n.t("i18n_231", s)
         }
-        return L10n.t("i18n_232")
+        // 2026-11-05：这里是「杀进程重进显示已是最新」的直接责任行。
+        // 以前不管查没查过都返回 i18n_232「已是最新」——App 刚启动、状态全空，
+        // 用户看到的就是"旧版本已是最新"。现在没查过就照实说，查过才敢说最新。
+        if m.lastCheckAt == nil {
+            return L10n.t("i18n_upd_never")
+        }
+        let cur = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        return L10n.t("i18n_upd_same", cur)
     }
 
     // v4.3.30：镜像源副标题（显示当前生效的镜像，去协议前缀）
@@ -587,7 +594,9 @@ struct UpdateView: View {
         //   于是「没查成 / 查失败」全都渲染成 i18n_238「已是最新版本」——
         //   用户杀后台重进看到「1.0.18 已是最新」就是这么来的。
         if let e = updateManager.errorMessage, !e.isEmpty { return e }
-        return L10n.t("i18n_238")
+        // 2026-11-05：同 SettingsView.updateSubtitle——没查过不许冒充"已是最新"
+        if updateManager.lastCheckAt == nil { return L10n.t("i18n_upd_never") }
+        return L10n.t("i18n_upd_same", currentVersion)
     }
     
     var body: some View {

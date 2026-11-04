@@ -1,3 +1,6 @@
+// TimeInterval / URLError 来自 Foundation；SwiftUI 会间接带入，
+// 但显式引入更稳（本文件用了 URLError.timedOut 判超时）
+import Foundation
 import SwiftUI
 // UIPasteboard（复制公网地址）在 UIKit 里；SwiftUI 会间接带入，
 // 但显式引入更稳（换 Swift 版本时传递关系可能变，项目里有过先例）
@@ -157,18 +160,16 @@ struct RouterControlView: View {
     private var routeIcon: String {
         guard let r = route else { return "wifi.router" }
         switch r.kind {
-        case .lan:      return "wifi.router.fill"
-        case .zeroTier: return "network"
-        case .wan:      return "globe.asia.australia.fill"
+        case .lan: return "wifi.router.fill"
+        case .wan: return "globe.asia.australia.fill"
         }
     }
 
     private var routeTint: Color {
         guard let r = route else { return .secondary }
         switch r.kind {
-        case .lan:      return .blue
-        case .zeroTier: return .teal
-        case .wan:      return .orange
+        case .lan: return .blue
+        case .wan: return .orange
         }
     }
 
@@ -198,7 +199,7 @@ struct RouterControlView: View {
                                 : (deviceError.isEmpty ? "检测中…" : "未连上")))
                             .font(.caption)
                             .foregroundColor(.secondary)
-                        // 1.0.22：三类线路各说各的，ZT 不再冒充「WiFi 直连」
+                        // 线路类型后面跟一句走法（WiFi 直连 / 走域名）
                         if let r = route, device != nil, !r.channelText.isEmpty {
                             Text("· \(r.channelText)")
                                 .font(.caption)
@@ -497,7 +498,10 @@ struct RouterControlView: View {
         detecting = true
         // 把当前线路传进去做「粘性」：它还能用就别换地址，
         // 否则 .88 / .250 会每次刷新随机跳（1.0.21 用户实测）。
-        let r = await RouterControl.resolveRoute(preferring: route)
+        // 但网络指纹变了（关了 WiFi / 连到别人家的网）就**不做粘性**——
+        // 上一条线路必然不通，还去 ping 它一下纯属白等 0.9 秒。
+        let sameNet = (RouterControl.netSignature() == lastNetSig)
+        let r = await RouterControl.resolveRoute(preferring: sameNet ? route : nil)
         detecting = false
         lastNetSig = RouterControl.netSignature()
         let changed = (route?.adminBase != r.adminBase) || (route?.bootBase != r.bootBase)
@@ -618,13 +622,6 @@ struct RouterControlView: View {
         }
     }
 
-    /// 外网重启：relay.py 的 /admin/api/device/reboot 包成 async
-    private func wanReboot(base: String, key: String) async -> Result<String, RelayError> {
-        await withCheckedContinuation { (cont: CheckedContinuation<Result<String, RelayError>, Never>) in
-            RelayBackend.rebootDevice(base: base, key: key) { cont.resume(returning: $0) }
-        }
-    }
-
     private func run(_ action: RouterAction) async {
         let key = accessKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else {
@@ -660,13 +657,18 @@ struct RouterControlView: View {
             return
         }
 
+        // 超时给多少：实测（2026-11-04）在家几十毫秒，
+        // 外网走隧道到路由器 80 端口单次往返 5～6 秒，校密钥那次 10.8 秒。
+        // 原来固定 8 秒，外网会把「已经发出去的指令」误报成失败。
+        let tmo: TimeInterval = target.isLan ? 8 : 25
+
         do {
             switch action {
             case .relay:
-                // 重启中转站服务只能走 airboot（80 端口）。
-                // 内网直连没问题；外网要求隧道把 /cgi-bin 也转发出去，
-                // 否则 relay.py 会回 404（下面 catch 里会翻译成人话）。
-                try await RouterControl.restartRelay(host: target.bootBase, key: key)
+                // 重启中转站服务走 airboot（80 端口）。
+                // 隧道已经把 /cgi-bin/airboot 单独转发到路由器 80 端口，
+                // 所以在家、在外都是直发路由器，不用中转站活着。
+                try await RouterControl.restartRelay(host: target.bootBase, key: key, timeout: tmo)
                 await MainActor.run {
                     statusLine = L10n.t("i18n_1556")
                     waitingBack = true
@@ -681,44 +683,21 @@ struct RouterControlView: View {
                 }
 
             case .reboot:
-                if target.isLan {
-                    // 在家：不走 relay.py，直接打 airboot，最可靠
-                    try await RouterControl.reboot(host: target.bootBase, key: key)
-                    await MainActor.run {
-                        statusLine = L10n.t("i18n_1558")
-                        waitingBack = true
-                    }
-                    try? await Task.sleep(nanoseconds: 45_000_000_000)
-                    await MainActor.run {
-                        waitingBack = false
-                        busy = false
-                        statusLine = L10n.t("i18n_1559")
-                        refreshDevice(silent: true)
-                    }
-                } else {
-                    // 在外：走 relay.py 的公网白名单接口（8080），
-                    // 不依赖隧道是否开放 80 —— 这条路现在就能用。
-                    switch await wanReboot(base: target.adminBase, key: key) {
-                    case .success(let msg):
-                        await MainActor.run {
-                            statusLine = msg.isEmpty ? L10n.t("i18n_1558") : msg
-                            waitingBack = true
-                        }
-                        try? await Task.sleep(nanoseconds: 45_000_000_000)
-                        await MainActor.run {
-                            waitingBack = false
-                            busy = false
-                            statusLine = L10n.t("i18n_1559")
-                            refreshDevice(silent: true)
-                        }
-                    case .failure(let e):
-                        await MainActor.run {
-                            busy = false
-                            waitingBack = false
-                            statusIsError = true
-                            statusLine = e.message
-                        }
-                    }
+                // 内网、外网都直发路由器 80 端口的 airboot：
+                //   在家 → http://<路由器 IP>/cgi-bin/airboot
+                //   在外 → https://<域名>/cgi-bin/airboot（隧道里单独转了这条到 80）
+                // 两条都不经过中转站，所以中转站卡死/没起来也照样能重启路由器。
+                try await RouterControl.reboot(host: target.bootBase, key: key, timeout: tmo)
+                await MainActor.run {
+                    statusLine = L10n.t("i18n_1558")
+                    waitingBack = true
+                }
+                try? await Task.sleep(nanoseconds: 45_000_000_000)
+                await MainActor.run {
+                    waitingBack = false
+                    busy = false
+                    statusLine = L10n.t("i18n_1559")
+                    refreshDevice(silent: true)
                 }
             }
         } catch let e as RouterError {
@@ -727,12 +706,11 @@ struct RouterControlView: View {
                 waitingBack = false
                 statusIsError = true
                 var msg = e.errorDescription ?? L10n.t("i18n_1560")
-                // 外网点「中转站重启」会 404：隧道只把 8080 转出去了，
-                // /cgi-bin/airboot 在 80 上，relay.py 根本不认识这个路径。
-                // 这句比「HTTP 404」有用得多。
+                // 外网走域名时 404：说明隧道里 /cgi-bin/airboot 那条转发没生效，
+                // 请求落到了 relay.py 上（它不认识这个路径）。这句比「HTTP 404」有用。
                 if target.kind == .wan, case .http(404) = e {
-                    msg = "外网隧道目前只开放了 8080 端口，重启中转站服务请在家连 WiFi 操作。"
-                        + "「路由器重启」在外网可以正常用。"
+                    msg = "外网通道返回 404：隧道里 /cgi-bin/airboot → 路由器 80 端口的转发规则没生效，"
+                        + "去 Cloudflare 检查那条 Public Hostname。"
                 }
                 statusLine = msg
                 if case .noKey = e { keyLoaded = false }
@@ -746,7 +724,14 @@ struct RouterControlView: View {
                 busy = false
                 waitingBack = false
                 statusIsError = true
-                statusLine = L10n.t("i18n_1561", error.localizedDescription)
+                // 外网超时 ≠ 没执行：指令可能已经到了路由器，只是回话慢
+                // （隧道往返实测 5～6 秒）。这时说「失败」会让人重复点。
+                if target.kind == .wan, (error as? URLError)?.code == .timedOut {
+                    statusLine = "外网通道没等到回话（隧道较慢）。指令可能已经发到路由器了，"
+                        + "等 40 秒左右点刷新看状态。"
+                } else {
+                    statusLine = L10n.t("i18n_1561", error.localizedDescription)
+                }
             }
         }
     }

@@ -30,7 +30,13 @@ final class AppInstallTool: MCPTool {
         let im = InjectionManager.shared
         // v2.9.273：trollstorehelper 在 TrollStore.app bundle 内 (TrollStore 源码 TSUtil.m
         // rootHelperPath = NSBundle.mainBundle.bundlePath/trollstorehelper），不在 /var/usr/bin！
-        let tsPath = AppCatalog.list().first { $0.bundleId == "com.opa334.TrollStore" }?.path ?? ""
+        // 2026-11-05 实机修正：手机上是 TrollStore Lite（com.opa334.TrollStoreLite，另有
+        // 巨魔R com.opa334.TrollStoreR），只认死的 com.opa334.TrollStore 会一个都找不到 →
+        // helper 不存在 → 静默降级到那条走不通的 scheme → 用户看到"装了但没反应"。
+        // 改成前缀匹配，三个版本都吃得下。
+        let tsPath = AppCatalog.list().first {
+            $0.bundleId.lowercased().hasPrefix("com.opa334.trollstore")
+        }?.path ?? ""
         var helper = tsPath.isEmpty ? "/var/usr/bin/trollstorehelper" : tsPath + "/trollstorehelper"
         var helperExist = FileManager.default.fileExists(atPath: helper)
         if !helperExist, !tsPath.isEmpty {
@@ -66,16 +72,17 @@ final class AppInstallTool: MCPTool {
         // failed降级 URL scheme (记录 spawn 真实错误，便于远程诊断）
         let msg = installViaScheme(path)
         let cOut = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        return ["ok": msg.ok, "method": msg.ok ? "trollstore://" : "trollstorehelper_failed",
+        return ["ok": msg.ok, "method": msg.ok ? "trollstore_file_open" : "trollstorehelper_failed",
                 "output": cOut.isEmpty ? "(spawn exit code \(c), helper=\(helper) exist=\(helperExist))" : cOut,
                 "message": "trollstorehelper failed (exit=\(c)). \(msg.message)"]
     }
 
     private func installViaScheme(_ path: String) -> (ok: Bool, message: String) {
-        let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
-        guard let url = URL(string: "trollstore://install?url=file://\(encoded)") else {
-            return (false, "cannot build TrollStore install link")
-        }
+        // 2026-11-05 修正：本地包不能套 scheme。
+        //   TrollStore 源码里 apple-magnifier://install?url= 走的是 URLSession 下载，只认 http(s)；
+        //   给 file:// 会直接报 "unsupported URL"。trollstore:// 这个 scheme 它更是没注册。
+        //   本地包唯一有效的入口就是「文件 URL 本身」——TrollStore 的 isFileURL 分支。
+        let url = URL(fileURLWithPath: path)
         var ok = false
         let sem = DispatchSemaphore(value: 0)
         DispatchQueue.main.async {

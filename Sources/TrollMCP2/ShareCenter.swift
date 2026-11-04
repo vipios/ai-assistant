@@ -109,22 +109,19 @@ final class ShareCenter: ObservableObject {
 
     // MARK: - 用其他 App 打开（UIDocumentInteractionController，安全路径）
 
-    /// v4.3.51：用 TrollStore 安装（URL scheme 直调，不渲染任何 App 图标列表）。
-    /// TrollStore 注册了 apple-magnifier://install?url= 路由（安装 tipa/ipa 到设备）。
-    /// 该路径是系统级 scheme 路由，不经过 MobileIcons 图标列表渲染，侧载环境安全。
+    /// v4.3.51：用 TrollStore 安装（不渲染任何 App 图标列表，侧载环境安全）。
+    /// 2026-11-05 修正：**直接把文件 URL 交给系统**。
+    ///   查 TrollStore 源码（TSSceneDelegate.m，1.x 起未变）确认：
+    ///   · apple-magnifier://install?url= 走的是 URLSessionDownloadTask，**只认 http/https**，
+    ///     给 file:// 必报 "unsupported URL" —— 以前这里一直都是这么传的，所以点了没反应；
+    ///   · 本地包唯一有效入口是「文件 URL 本身」（isFileURL 分支：读包 → 弹安装 → 装）。
+    ///   这条路径不渲染图标列表，不会碰到 MobileIcons 崩溃那个坑。
     func openInTrollStore(_ url: URL) {
         guard url.pathExtension.lowercased() == "tipa" || url.pathExtension.lowercased() == "ipa" else {
             self.showNotice(L10n.t("i18n_874"))
             return
         }
-        guard let base = URL(string: "apple-magnifier://install?url="),
-              let encoded = url.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let target = URL(string: base.absoluteString + encoded) else {
-            UIPasteboard.general.string = url.path
-            self.showNotice(L10n.t("i18n_875"))
-            return
-        }
-        UIApplication.shared.open(target) { ok in
+        UIApplication.shared.open(url) { ok in
             if !ok {
                 UIPasteboard.general.string = url.path
                 self.showNotice(L10n.t("i18n_876"))

@@ -43,7 +43,6 @@
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>trollagent</string>
-				<string>apple-magnifier</string>
 			</array>
 		</dict>
 	</array>
