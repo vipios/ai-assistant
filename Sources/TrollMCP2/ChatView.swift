@@ -691,13 +691,13 @@ struct ChatView: View {
                     // offset 已按原 marker 语义转换（顶部=0，向下为负），下方显示矩阵判断无需改动。
                     ScrollGeometryBridge(
                         onOffset: { v in
-                            scroll.offset = v
-                            // 2026-11-03：标记「正在滚动」→ 消息正文临时降级为轻量 Text，
-                            // 停手 0.3 秒后恢复 UITextView。修「快速上滑卡死」。
-                            scroll.noteScrolled()
+                            // 2026-11-05：改走 setOffset —— 内部同时刷新按钮显隐位 + 标记滚动中。
+                            // offset 本身是普通属性，写它不再产生任何 SwiftUI 通知；
+                            // 只有 canScrollUp/Down 真翻转时才发一次。这是「滑动卡死」的根治点。
+                            scroll.setOffset(v)
                         },
-                        onContentHeight: { scroll.contentHeight = $0 },
-                        onViewportHeight: { scroll.viewportHeight = $0 }
+                        onContentHeight: { scroll.setContentHeight($0) },
+                        onViewportHeight: { scroll.setViewportHeight($0) }
                     )
                     .frame(height: 0)
                     LazyVStack(spacing: 12) {
@@ -791,26 +791,46 @@ struct ChatView: View {
                 .allowsHitTesting(true)
             }
             .onChange(of: store.currentMessages.count) { _ in
-                // v7.4.0-fix73f-6：只在"已处于底部附近"时自动滚到底——否则用户在
-                // 上滑看历史时被强制拉回（实测"无法滑动到顶部、会回退/↑按钮看不到"根因：
-                // AI 回复流式中工具卡不断创建→count 变→无条件 scrollToBottom 抢滚，
-                // 把上滑到中间的用户拉回底部——↑ 按钮只在中间显示，所以"看不到↑"）。
-                // 关键修复：contentHeight 未知（LazyVStack 惰性 marker 未渲染=0）时
-                // 旧逻辑仍无条件滚——改为按滚动偏移判断：顶部附近(offset>-50)才跟随，
-                // 上滑/中间停留（offset 远离 0）绝不抢。已知时：底部 40pt 内才滚。
-                // 2026-11-03：改用 ChatScrollState 的判定方法。
-                // 注意：这里在 onChange 闭包内（消息条数变化时才跑一次），不在 body
-                // 求值路径上，读属性不会造成每帧重算；但统一走方法便于以后维护。
-                let shouldFollow = scroll.shouldAutoFollow()
-                if shouldFollow {
-                    if let last = store.currentMessages.last {
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                // 2026-11-05 **重写（fix-jitter-3）**——这里是「AI 回复一直上下跳动」的直接来源。
+                //
+                // 老逻辑：count 变了 → 判一下在不在底部 → 在的话
+                //         withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                //
+                // 为什么必然抖：
+                //   1) LazyVStack 的内容高度是**估算**的。scrollTo 内部先按当前估算算目标，
+                //      滚过去之后又新渲染出几个 cell，contentSize 突变几十上百 pt，
+                //      于是「刚滚到底」立刻又不在底了；
+                //   2) withAnimation 给这个过程套了一层 spring 插值，每来一条新消息就重新起跳一次；
+                //   3) AI 干活时工具卡一条接一条追加，count 一秒能变好几次 → 一秒起跳好几次。
+                //   三者叠加 = 用户看到的「消息一直在那上下跳，下面说什么都看不到」。
+                //
+                // 新做法：**这里不再做任何滚动**。跟随底部交给 ScrollGeometryBridge 在 UIKit 层
+                // 用 setContentOffset(animated:false) 一次钉到位（见该文件 pinToBottom 注释：
+                // 无插值、无估算误差、不与手势打架）。这里只负责一件事：用户**刚刚自己发了消息**
+                // 时，强制把吸附状态重置为「跟随底部」——发完消息必须看到自己的话。
+                //
+                // 判断「刚发的」用最后一条是不是 user：AI 的流式追加永远是 assistant/tool，
+                // 只有用户自己发消息才会让最后一条变成 user。
+                if let last = store.currentMessages.last, last.role == "user", !last.isTool {
+                    scroll.requestStickToBottom()
+                    // 用户主动发消息是低频动作，这里滚一次是合理的（且不带 withAnimation，
+                    // 避免和 UIKit 吸附互相插值）。
+                    // 丢到下一个 runloop：onChange 回调时新气泡还没进 LazyVStack，
+                    // 立刻 scrollTo 找不到锚点会静默失败。
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }
             }
             // v2.9.12：打开/切换会话时自动滚到底（老会话不再停在顶部）
-            .onAppear { scrollToBottom(proxy) }
+            // 2026-11-05：先让桥接层恢复吸附（用户切进来必须看到最新消息），再滚一次。
+            // 这里的 scrollTo 是低频（一次进入/一次切换），不会抖。
+            .onAppear {
+                scroll.requestStickToBottom()
+                scrollToBottom(proxy)
+            }
             .onChange(of: store.selectedId) { _ in
+                scroll.requestStickToBottom()
                 scrollToBottom(proxy)
             }
             // v2.9.72：AI 回复完成时结束工作流
@@ -843,11 +863,19 @@ struct ChatView: View {
         FloatingScrollButtons(
             scroll: scroll,
             onUp: {
+                // 2026-11-05：去掉 withAnimation —— 用户点「回到顶部」时希望在 0.1 秒内
+                // 到位，而不是看一段 0.35 秒的 spring 动画；且动画期间桥接层如果判定
+                // 「还在底部附近」会反向吸附，两者互扯就是「点了没反应/回弹」。
+                // 先解除吸附（用户明确要离开底部），再定位。
+                scroll.releaseStick()
                 if let first = store.currentMessages.first {
-                    withAnimation { proxy.scrollTo(first.id, anchor: .top) }
+                    proxy.scrollTo(first.id, anchor: .top)
                 }
             },
-            onDown: { scrollToBottom(proxy) }
+            onDown: {
+                scroll.requestStickToBottom()
+                scrollToBottom(proxy)
+            }
         )
     }
 
@@ -856,8 +884,19 @@ struct ChatView: View {
     // 留在 ChatView 里会让 body 每帧重算。
 
     /// v2.9.12：滚到当前会话最新一条
+    ///
+    /// 2026-11-05：**不再包 withAnimation**，也不再只滚一次。
+    /// LazyVStack 高度是估算的，单次 scrollTo 经常「差一点到底」——差的那一点
+    /// 会在下一批 cell 渲染时被补上，视觉上就是轻微一顿。这里补一次延迟重试，
+    /// 且两次都是无动画定位，避免 spring 插值与桥接层的吸附互相打架。
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
         DispatchQueue.main.async {
+            if let last = store.currentMessages.last {
+                proxy.scrollTo(last.id, anchor: .bottom)
+            }
+        }
+        // 第二次兜底：等本轮布局稳定后再钉一次（无动画）。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             if let last = store.currentMessages.last {
                 proxy.scrollTo(last.id, anchor: .bottom)
             }

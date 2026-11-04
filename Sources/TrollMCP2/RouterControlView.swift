@@ -568,7 +568,9 @@ struct RouterControlView: View {
         // 2026-11-04 关键修正：设备状态必须走 **8080/域名** 那条线。
         //   老代码用 foundHost（裸 IP，不带端口）→ http://192.168.1.88/admin/api/device
         //   → 打到 uhttpd 的 80 → 404 → 状态卡永远「未连上」。
-        let base = route?.adminBase ?? RelayAdminCredential.shared.baseURL
+        // 2026-11-05：回退分支也要走自动判定，不能直接拿 baseURL（那是「在家地址」）。
+        // 在别人家 WiFi / 流量下，baseURL 仍是 192.168.1.88，必然打不通。
+        let base = route?.adminBase ?? RelayAdminCredential.shared.effectiveBaseURL()
         let key = accessKey.trimmingCharacters(in: .whitespacesAndNewlines)
 
         RelayBackend.fetchDeviceStatus(base: base, key: key) { result in
@@ -606,7 +608,9 @@ struct RouterControlView: View {
         guard !key.isEmpty else { return }
         keyChecking = true
         keyCheckOK = nil
-        let base = route?.adminBase ?? RelayAdminCredential.shared.baseURL
+        // 2026-11-05：回退分支也要走自动判定，不能直接拿 baseURL（那是「在家地址」）。
+        // 在别人家 WiFi / 流量下，baseURL 仍是 192.168.1.88，必然打不通。
+        let base = route?.adminBase ?? RelayAdminCredential.shared.effectiveBaseURL()
 
         RelayBackend.fetchDeviceStatus(base: base, key: key) { result in
             keyChecking = false

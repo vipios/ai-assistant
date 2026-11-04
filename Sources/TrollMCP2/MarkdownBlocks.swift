@@ -35,7 +35,39 @@ enum MarkdownBlocks {
         var level: Int = 0   // v7.2.3-fix5：嵌套级别（行首 2 空格 = 1 级，tab = 1 级）
     }
 
+    // 2026-11-05 **性能修复（fix-jitter-4）**：parse 结果缓存。
+    //
+    // 为什么必须加：`MarkdownBlocksView.body` 第一行就是 parse(text)，
+    // 而 body 会在「消息内容变化 / 父视图重算 / 滚动降级切换」等很多时机被重新求值。
+    // 一次 parse 是「按行切分 + 逐行正则判断列表/表格/任务/公式」的 O(n) 遍历，
+    // 一条长回复几千行时单次就要几毫秒。一个几百条的会话里几十个气泡各跑一遍，
+    // 主线程直接排满 —— 用户感知就是「让 AI 干活的时候非常卡」。
+    //
+    // 缓存策略与 ContentBlocks.split 完全一致（那边已经踩过并验证过）：
+    //   · key = 原文本（内容即 key，天然近似 LRU）；
+    //   · 上限 128，超了整体清空（长会话里热点集中在最近几条，够用）；
+    //   · NSLock 串行化 —— 必须有：parse 可能被主线程渲染路径和后台路径同时调用，
+    //     Swift Dictionary 并发写会破坏内存、EXC_BAD_ACCESS（ContentBlocks 踩过这个坑）。
+    //   · 真正的 parse 在锁外做，避免长文本持锁阻塞 UI。
+    private static var parseCache: [String: [Block]] = [:]
+    private static let parseLock = NSLock()
+
     static func parse(_ text: String) -> [Block] {
+        parseLock.lock()
+        let hit = parseCache[text]
+        parseLock.unlock()
+        if let hit = hit { return hit }
+
+        let result = parseRaw(text)
+
+        parseLock.lock()
+        if parseCache.count >= 128 { parseCache.removeAll(keepingCapacity: true) }
+        parseCache[text] = result
+        parseLock.unlock()
+        return result
+    }
+
+    private static func parseRaw(_ text: String) -> [Block] {
         // 2026-11-03：归一瞬间——模型偶发吐全角竖线（U+FF5C）/双竖线 ||DSML|| /
         // 零宽空格的 DSML 特殊 token，这里不归一就识别不到工具段，整块 XML 会被
         // 当普通文本原样渲染成一大片英文（用户反馈「下面全是英文，把中文都顶走了」）。
@@ -626,7 +658,31 @@ enum CitationExtractor {
         var sources: [Source] = []
     }
 
+    // 2026-11-05 **性能修复（fix-jitter-4）**：extract 结果缓存。
+    //
+    // 这个函数在 `MarkdownBlocksView.body` 里**每次求值都跑**，内部还要
+    // 现场编译两条 NSRegularExpression（编译正则本身就不便宜）+ 全文扫描。
+    // 一条几千字的长回复，单次调用可能上毫秒；几十个气泡一起就是几十毫秒，
+    // 主线程每重算一帧就卡一下。缓存策略同 ContentBlocks.split。
+    private static var extractCache: [String: Result] = [:]
+    private static let extractLock = NSLock()
+
     static func extract(_ text: String) -> Result {
+        extractLock.lock()
+        let hit = extractCache[text]
+        extractLock.unlock()
+        if let hit = hit { return hit }
+
+        let result = extractRaw(text)
+
+        extractLock.lock()
+        if extractCache.count >= 128 { extractCache.removeAll(keepingCapacity: true) }
+        extractCache[text] = result
+        extractLock.unlock()
+        return result
+    }
+
+    private static func extractRaw(_ text: String) -> Result {
         var r = Result()
         // 角标：形如 [1] 或 [1][2]，紧跟句尾
         let markerPattern = #"\[\d+\]"#

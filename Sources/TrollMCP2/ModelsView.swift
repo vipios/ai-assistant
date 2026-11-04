@@ -917,18 +917,22 @@ struct ModelEditorView: View {
             .foregroundColor(.secondary)
     }
 
-    /// 2026-11-03：当前「自动判定」会走哪一条接口——直接说人话，不用用户猜。
+    /// 当前「自动判定」会走哪一条接口——直接说人话，不用用户猜。
     ///
-    /// 只看网段（同步、零成本），和真正发请求时的第一层判定完全一致，
-    /// 所以这里显示什么，手上这条消息大概率就走什么。
+    /// ⚠️ 2026-11-05：这里只是**网段预判**，不是最终结论。
+    /// 用户明确指出「也要判定我在别的 WiFi 也是外面」——而网段预判做不到这件事：
+    /// 别人家 WiFi 也是 192.168.x，一样被判成「在家」。
+    /// 真正发请求时会有后台 /health 探活核实（BaseURLRouter.probeInBackground），
+    /// 探不通会自动翻到备用地址。所以这里的文案必须写「预判」，
+    /// 不能让用户以为「界面说在家就一定走内网」。
     private var activeRouteNote: String {
         let home = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !home.isEmpty else { return "备用接口已填，但主接口为空，会直接用备用接口" }
         switch BaseURLRouter.shared.lanVerdict(homeBase: home) {
         case .home:
-            return "当前判定：在家 → 用上面的接口地址"
+            return "当前预判：在内网（若连的是别人家 WiFi，发请求时会自动改用备用接口）"
         case .away:
-            return "当前判定：在外面 → 用下面的备用接口"
+            return "当前判定：在外面（无内网 / 非自家网段）→ 用下面的备用接口"
         case .unknown:
             return "主接口不是内网地址，看不出在家还是在外 → 先试主接口，连不上自动换备用"
         }
@@ -1127,7 +1131,7 @@ struct ModelEditorView: View {
         let home = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !home.isEmpty else { return "未填接口地址" }
         switch BaseURLRouter.shared.lanVerdict(homeBase: home) {
-        case .home:    return "判定：在家，走接口地址"
+        case .home:    return "预判：在内网，走接口地址（连不上会自动换备用）"
         case .away:    return "判定：在外面，走备用接口"
         case .unknown: return "判定：主接口非内网地址，先试主接口"
         }

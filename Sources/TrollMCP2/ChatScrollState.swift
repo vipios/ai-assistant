@@ -5,53 +5,55 @@ import CoreFoundation
 // activity.objectWillChange 的 sink 需要 Combine
 import Combine
 
-/// 2026-11-03：滚动位置/内容高度/视口高度的独立状态容器。
+/// 滚动位置/内容高度/视口高度的状态容器。
 ///
-/// 为什么必须单独抽一个 ObservableObject：
-/// 以前这三个值是 ChatView 的 @State。ScrollGeometryBridge 是 UIKit KVO，
-/// 滚动时**每一帧**都回调一次 → 每帧写一次 @State → ChatView 的整个 body
-/// 重新求值。ChatView.body 里包含：
-///   · ChatListGrouping.group(store.currentMessages)（全量重新分组）
-///   · ForEach 全部消息（每个 MessageBubble 重新比较）
-///   · ContentBlocks.split / MarkdownBlocksView 等重渲染路径
-/// 于是「手指一滑」就变成每帧一次全量重建 —— 这正是用户反馈的
-/// 「上下滑动看项目非常卡」。数值本身是对的，问题在更新粒度。
+/// 2026-11-05 **重写（fix-jitter-2，关键）**——上一版仍然让聊天页每帧全量重建。
 ///
-/// 现在改为：KVO 只写这个对象的三个 @Published，纯滚动时 ChatView.body
-/// 不再参与，只有真正依赖这三个值的悬浮按钮视图会重新求值
-/// （它们被抽成独立 struct，订阅这个对象）。
+/// 上一版的问题：把 offset / contentHeight / viewportHeight 三个都写成 `@Published`，
+/// 然后 ChatView 里声明 `@StateObject private var scroll = ChatScrollState()`。
+/// 注释里写着「主 body 完全不读这三个值，所以每帧不会重算」——**这个推断是错的**：
+/// `@StateObject` 的语义就是「这个 View 订阅该对象的 objectWillChange」，
+/// body 读不读它的属性完全不影响订阅关系。于是：
 ///
-/// @MainActor 保证 KVO 回调在主线程赋值（UIKit 的 contentOffset KVO 本身
-/// 就在主线程，这里只是把约束写进类型里，避免以后有人从别的线程改）。
+///   KVO 每帧回调 → offset 写 @Published → objectWillChange → ChatView.body 重算
+///   → ChatListGrouping.group(全部消息) + 全部 MessageBubble 重新求值
+///   → 每条消息都重跑 MarkdownBlocks.parse / CitationExtractor.extract / 正则着色
+///
+/// 手指轻轻一滑就是每帧一次全量重建，几百条消息的会话里主线程直接被占满。
+/// 这就是用户反复反馈的「上下滑动聊天记录直接卡死」——之前几版都在优化被重建的**内容**
+/// （降级 Text、加缓存），但重建本身从没被止住，所以治不好。
+///
+/// 现在的结构：
+///   · 三个数值（offset / contentHeight / viewportHeight）改成**普通属性**，
+///     高频写入完全不产生任何 SwiftUI 通知；
+///   · 只有 `canScrollUp` / `canScrollDown` 这两个「按钮显示位」是 @Published，
+///     且只在**真的翻转**时才赋值 —— 一轮滚动最多 2 次通知（不是每帧）；
+///   · `isScrollingFast` 保持独立对象 + 转发，道理同上（每轮滚动 2 次翻转）。
+///
+/// 结果：滚动期间 ChatView.body 基本不重算，只有那个 40pt 圆钮会动。
+@MainActor
 final class ChatScrollState: ObservableObject {
     /// 滚动偏移（对齐原 marker 语义：顶部 = 0，向下滚为负）
-    @Published var offset: CGFloat = 0
-    /// 内容总高
-    @Published var contentHeight: CGFloat = 0
-    /// 视口高度
-    @Published var viewportHeight: CGFloat = 0
+    /// ⚠️ 普通属性，不是 @Published —— 这是本类最重要的约束，别改回去。
+    private(set) var offset: CGFloat = 0
+    /// 内容总高。同上，普通属性。
+    private(set) var contentHeight: CGFloat = 0
+    /// 视口高度。同上，普通属性。
+    private(set) var viewportHeight: CGFloat = 0
 
-    /// 2026-11-03：滚动活动状态**必须独立成另一个对象**。
+    /// 悬浮按钮显示位——**只有这两个**是 @Published。
+    /// 每轮滚动只在真正翻转时各赋值一次，不是每帧。
+    @Published private(set) var canScrollUp: Bool = false
+    @Published private(set) var canScrollDown: Bool = false
+
+    /// 滚动活动状态**必须独立成另一个对象**。
     ///
     /// 原因：ChatView.body 要读 isScrollingFast 才能决定消息正文用轻量 Text
     /// 还是 UITextView。如果它跟 offset 放在同一个对象里，body 一订阅就
-    /// 连 offset 的每帧更新一起收 —— 直接把本类开头注释修好的性能问题退回去。
-    /// 拆开后 offset 那条高频链谁都不读，isScrollingFast 每轮滚动只翻转两次。
+    /// 连 offset 的每帧更新一起收。拆开后 offset 那条高频链谁都不读，
+    /// isScrollingFast 每轮滚动只翻转两次。
     let activity = ChatScrollActivity()
 
-    /// 2026-11-03 **关键修复**：把 activity 的变化转发到本对象的 objectWillChange。
-    ///
-    /// 之前这里没有这段转发，后果很严重：
-    /// ChatView 里写的是 `@StateObject private var scroll = ChatScrollState()`，
-    /// 它订阅的是**外层** scroll 的 objectWillChange。而 isScrollingFast 变更
-    /// 只发生在内层 activity 上 → 外层收不到通知 → ChatView.body 不重新求值
-    /// → `fastScrolling` 永远是初始值 false。
-    /// 也就是说「滚动时降级为轻量 Text」这个优化**从来没生效过**，
-    /// 快速上滑时几十个 UITextView 照样疯进疯出，这就是用户反复反馈的
-    /// 「上下滑动完全没反应 / 卡死」的真实原因。
-    ///
-    /// 注意不能简单地把 activity 改成 @Published：那会连带每帧 offset 一起刷新。
-    /// 这里只转发 activity 的变更（每轮滚动仅两次），不影响 offset 的高频链。
     private var activityObserver: AnyCancellable?
 
     init() {
@@ -66,20 +68,46 @@ final class ChatScrollState: ObservableObject {
             }
     }
 
-    /// 由 ScrollGeometryBridge 的 onOffset 调用（每帧都会调，必须极轻）。
-    func noteScrolled() {
+    // MARK: - 写入入口（由 ScrollGeometryBridge 的 KVO 调用，每帧一次，必须极轻）
+
+    func setOffset(_ v: CGFloat) {
+        offset = v
+        refreshButtonFlags()
+        // 标记「正在滚动」→ 消息正文临时降级为轻量 Text，停手 0.3 秒后恢复。
         activity.noteScrolled()
     }
 
+    func setContentHeight(_ v: CGFloat) {
+        // 高度变化不牵动按钮显隐判定以外的东西；但它是低频的（只在内容增长时变），
+        // 顺手刷新一次按钮状态，避免内容从短变长后 ⬇️ 按钮该出现却没出现。
+        contentHeight = v
+        refreshButtonFlags()
+    }
+
+    func setViewportHeight(_ v: CGFloat) {
+        viewportHeight = v
+        refreshButtonFlags()
+    }
+
+    /// 只在值**真的翻转**时才赋给 @Published —— 这是「每帧不发通知」的保证。
+    private func refreshButtonFlags() {
+        let up = computeCanScrollUp()
+        if up != canScrollUp { canScrollUp = up }
+        let down = computeCanScrollDown()
+        if down != canScrollDown { canScrollDown = down }
+    }
+
+    // MARK: - 判定
+
     /// 是否可向上滚（不在顶部）
-    var canScrollUp: Bool {
+    private func computeCanScrollUp() -> Bool {
         guard contentHeight > 0 else { return offset < -2 }
         let bottom = -(contentHeight - viewportHeight)
         return offset < -2 && offset > bottom + 2
     }
 
     /// 是否可向下滚（不在底部）
-    var canScrollDown: Bool {
+    private func computeCanScrollDown() -> Bool {
         guard contentHeight > 0 else { return true }
         let bottom = -(contentHeight - viewportHeight)
         return offset > bottom + 2
@@ -95,17 +123,43 @@ final class ChatScrollState: ObservableObject {
 
     /// 新消息到达时是否应该自动滚到底。
     ///
-    /// 合并原有两个判据：
-    ///   · 已知内容高度 → 底部 40pt 内才跟随；
-    ///   · 高度未知（LazyVStack 惰性渲染，marker 还没建出来）→ 顶部附近才跟随，
-    ///     用户已经上滑看历史时绝不抢滚动位置。
+    /// **2026-11-05 重要收敛**：现在真正的「跟随底部」由 ScrollGeometryBridge 在
+    /// UIKit 层做（无动画吸附），这里只负责判断「该不该让桥接层去跟」。
+    /// 所以本方法只回答「用户此刻在不在底部」，返回 false 时调用方**不要再 scrollTo**
+    /// ——以前那种「不在底部也硬滚一次」正是把上滑看历史的用户拉回去的元凶。
+    ///
+    /// 另外把容差从 40pt 收到 24pt：40pt 太宽，用户明明已经上滑了一点
+    /// 仍会被判成「在底部」然后被拽下去。
     func shouldAutoFollow() -> Bool {
-        if contentHeight > 0 { return isNearBottom() }
+        if contentHeight > 0 { return isNearBottom(tolerance: 24) }
         return offset > -50
+    }
+
+    /// 2026-11-05：请求桥接层「重新吸附到底部」。
+    ///
+    /// 用在两个地方：用户自己发消息（必须看到自己的话）、切换会话（必须停在最新处）。
+    /// 这两个都是低频且语义明确的动作，不是流式高频追加——后者靠桥接层自动吸附，
+    /// 绝不走这里。
+    ///
+    /// 实现：桥接层通过 NotificationCenter 收到信号后把 stickToBottom 置 true 并钉一次底。
+    /// 用通知而不是给 BridgeView 加绑定，是为了避免把滚动状态再串回 SwiftUI 的更新环。
+    func requestStickToBottom() {
+        // 直接写字面量而不是引用 ScrollGeometryBridge.stickToBottomNote：
+        // 后者是 UI 结构体的静态成员，在 @MainActor 类里跨类型访问在严格并发下会被判隔离冲突。
+        NotificationCenter.default.post(name: Notification.Name("TrollAgent.scroll.stickToBottom"),
+                                        object: nil)
+    }
+
+    /// 2026-11-05：请求桥接层「解除吸附」——用户主动要离开底部时用（点 ↑ 回顶部）。
+    /// 不解除的话，桥接层会在下一次 contentSize 变化时把视图又拽回底部，
+    /// 表现为「点了回顶部，一下又弹回去」。
+    func releaseStick() {
+        NotificationCenter.default.post(name: Notification.Name("TrollAgent.scroll.releaseStick"),
+                                        object: nil)
     }
 }
 
-/// 2026-11-03：滚动活动状态（与滚动数值分离，避免高频刷新）。
+/// 滚动活动状态（与滚动数值分离，避免高频刷新）。
 ///
 /// 解决什么问题：消息正文用 SelectableText(UITextView) 才有长按划词和
 /// 「复制全文」，但 UITextView 是重量级控件——被 LazyVStack 回收后重建，

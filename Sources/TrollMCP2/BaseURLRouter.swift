@@ -85,9 +85,16 @@ final class BaseURLRouter {
 
         // 2) 网段判定（零成本）。判不出来就先按「在家」走，
         //    同时扔一个后台探测去校正 —— 不能在这里阻塞用户发消息。
+        //
+        // 2026-11-05：`.home` 也要后台探一次核实。
+        // 用户明确要求「也要判定我在别的 WiFi 也是外面」——
+        // 别人家 WiFi 也是 192.168.x，网段判必得 .home，但那个网里根本没有我们的中转站，
+        // 于是每次请求都打到黑洞直到超时。现在先按 .home 用（不阻塞当前这次请求），
+        // 同时后台探一次；探不通就把缓存翻成 .away，下一次请求自动走备用。
         switch lanVerdict(homeBase: home) {
         case .home:
             store(config.id, sig: sig, backup: false)
+            probeInBackground(config: config, home: home, sig: sig)
             return (home, false)
         case .away:
             store(config.id, sig: sig, backup: true)
@@ -143,6 +150,15 @@ final class BaseURLRouter {
     /// 用「手机当前内网 IP」和「主地址的 host」比网段。
     ///
     /// 只在两边都是**内网 IPv4** 时才有结论；主地址是域名 / 公网 IP 时返回 .unknown。
+    ///
+    /// ⚠️ 2026-11-05 **已知局限（重要）**：这个方法只比网段，**分不清「自家 WiFi」和
+    /// 「别人家 WiFi」**——别人家也是 192.168.1.x，也会判成 .home。
+    /// 用户明确指出这个问题：「也要判定我在别的 WiFi 也是外面」。
+    ///
+    /// 所以：
+    ///   · 本方法只作为**同步快速预判**（界面展示、发请求的第一层）；
+    ///   · 真正的结论必须用 `verifyAsync`——它探一次主地址，探得通才算在家；
+    ///   · 发请求路径上即使预判成 .home，失败时也会由 `markFailed` 翻面兜底。
     func lanVerdict(homeBase: String) -> Verdict {
         guard let host = Self.hostOf(homeBase), Self.isPrivateIPv4(host) else {
             return .unknown
@@ -164,6 +180,80 @@ final class BaseURLRouter {
         return .away
     }
 
+    /// 2026-11-05：**真判定**——探一次主地址，探得通才算在家。
+    ///
+    /// 解决「别人家 WiFi 被误判成在家」：
+    /// 网段只说明「你连着一个 192.168.x 的网」，不说明「这个网里有我的中转站」。
+    /// 所以必须真的打一次 `/health`：
+    ///   · 连得上且响应是我的服务 → 在家，用主地址；
+    ///   · 连不上（别人家网段里没有 192.168.1.88 这台机器）→ 在外，用备用地址。
+    ///
+    /// 为什么用 /health：免密钥，判定阶段没有 key 也能探。
+    /// 任何 2xx/4xx 响应都算「这台机器是我的」——401/404 说明路通了只是路径/鉴权问题，
+    /// 不该因为鉴权就判「在外」然后把用户踢到公网去绕一圈。
+    func verifyAsync(for config: ModelConfig,
+                     timeout: TimeInterval = 1.6,
+                     completion: @escaping (Verdict) -> Void) {
+        let home = config.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let away = config.backupBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 没填备用 = 没启用双通道，判定无意义
+        guard !away.isEmpty, !home.isEmpty else {
+            completion(lanVerdict(homeBase: home))
+            return
+        }
+        // 本来就没有内网 IP → 不用探，直接在外
+        guard !Self.localPrivateIPv4s().isEmpty else {
+            completion(.away)
+            return
+        }
+        // 网段都不是内网地址（主地址填的是域名）→ 交给 probeInBackground 那套
+        guard let host = Self.hostOf(home), Self.isPrivateIPv4(host) else {
+            completion(.unknown)
+            return
+        }
+
+        guard let url = Self.healthURL(from: home) else {
+            completion(lanVerdict(homeBase: home))
+            return
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = timeout
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = timeout
+        cfg.timeoutIntervalForResource = timeout + 1
+        cfg.waitsForConnectivity = false
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let session = URLSession(configuration: cfg)
+
+        session.dataTask(with: req) { data, resp, err in
+            defer { session.finishTasksAndInvalidate() }
+            var v: Verdict = .away
+            if err == nil, let http = resp as? HTTPURLResponse {
+                // 2xx/3xx/4xx 都算「这台机器在」；只有连不上/超时才是在外。
+                // 5xx 也认作在——服务在但内部出错，这种情况下用户更需要继续用内网地址排查。
+                if http.statusCode < 600 {
+                    // 若返回了明确的 service 标识且不是我们的，判为「别人家的服务」
+                    if let data = data,
+                       let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let svc = doc["service"] as? String, !svc.isEmpty,
+                       svc != "ai-relay" {
+                        v = .away
+                    } else {
+                        v = .home
+                    }
+                }
+            }
+            let verdict = v
+            DispatchQueue.main.async {
+                // 网络在这期间又变了 → 结论作废（别把旧网的结论写进新网）
+                completion(verdict)
+            }
+        }.resume()
+    }
+
     /// 网络指纹：当前内网 IP 集合 + 网段。一变就说明换了网络，缓存自动作废。
     private func netSignature() -> String {
         let locals = Self.localPrivateIPv4s().sorted()
@@ -180,9 +270,14 @@ final class BaseURLRouter {
 
     /// 探一次主地址；通了=在家，不通=在外。不阻塞任何界面操作。
     ///
-    /// 只在 `lanVerdict` 返回 .unknown 时才调用（主地址是域名/公网 IP，
-    /// 光看网段判断不出来）。拿到任何 HTTP 响应都算「在家」——
-    /// 401/404 也说明这条路是通的，只是鉴权/路径问题，不该因此切到备用。
+    /// 调用场景（2026-11-05 扩大）：
+    ///   · `lanVerdict == .unknown`（主地址是域名/公网 IP，光看网段判断不出来）
+    ///   · `lanVerdict == .home`（别人家 WiFi 也会判成 .home，必须核实一次）
+    ///
+    /// 「通了」的判定（2026-11-05 收紧）：不只看有没有 HTTP 响应，还要看响应是不是
+    /// **我们的服务**。原因：别人家空调/光猫的管理页也可能在 8080 上回 200，
+    /// 只看状态码会把「别人的设备」当成「我的中转站」，然后一直用错地址。
+    /// 具体：JSON 里 service 字段有值且不是 ai-relay → 判为别人家的服务 → 在外。
     private func probeInBackground(config: ModelConfig, home: String, sig: String) {
         guard let url = Self.healthURL(from: home) else { return }
         let id = config.id
@@ -203,12 +298,20 @@ final class BaseURLRouter {
         cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         let session = URLSession(configuration: cfg)
 
-        session.dataTask(with: req) { [weak self] _, resp, err in
+        session.dataTask(with: req) { [weak self] data, resp, err in
             defer { session.finishTasksAndInvalidate() }
             guard let self = self else { return }
             self.lock.lock(); self.probing.remove(id); self.lock.unlock()
 
-            let reachable = (resp as? HTTPURLResponse) != nil && err == nil
+            var reachable = (resp as? HTTPURLResponse) != nil && err == nil
+            // 2026-11-05：确认「这台是不是我的」——别人的服务不算通
+            if reachable,
+               let data = data,
+               let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let svc = doc["service"] as? String, !svc.isEmpty,
+               svc != "ai-relay" {
+                reachable = false
+            }
             // 网络指纹变了说明这是上一张网的结论，别覆盖新结论
             guard self.netSignature() == sig else { return }
             self.store(id, sig: sig, backup: !reachable)

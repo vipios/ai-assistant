@@ -64,6 +64,16 @@ enum RouterControl {
         // 3) 家里固定地址兜底。
         //    .88 是主地址，.250 是同一台机器在同一个网段上的第二个地址
         //    （1.0.22 实测：两个 uptime 同步，确系一台）。顺序固定 .88 在前。
+        //
+        //    ⚠️ 2026-11-05 考虑过「只在当前网段是 192.168.1.x 时才加」，
+        //    但**撤回了**：家里是两层网络（光猫 192.168.1.x + OpenWrt 192.168.2.x），
+        //    手机连 OpenWrt 时拿到 192.168.2.100，而路由器在 192.168.1.88 ——
+        //    限制网段会让这种情况误判成「在外」，正是 BaseURLRouter 注释里
+        //    记录过的老坑（明明在家却走公网域名，慢一个数量级）。
+        //
+        //    「别人家 WiFi 被判成在家」不靠收窄候选解决，而是靠 ping() 的
+        //    airboot 指纹：别人家的 192.168.1.88 上没有 /cgi-bin/airboot，
+        //    不可能返回 {ok:true, svc:"airboot"}，探测自然失败 → 落回域名。
         for h in ["192.168.1.88", "192.168.1.250"] {
             add(h)
         }
@@ -94,6 +104,16 @@ enum RouterControl {
 
     /// 这个地址上有没有 airboot 通道。
     /// 用 ephemeral session：不复用 cookie/连接池，避免拿着已死掉的连接干等。
+    ///
+    /// 2026-11-05：**判据收紧到「必须是我们的 airboot」**。
+    /// 原来只查 `ok == true && svc == "airboot"` —— 这两个字段是**别人家设备不可能有**的，
+    /// 所以这条其实已经能区分「自家路由器」和「别人家路由器」：
+    /// 别人家的 192.168.1.1 上没有 /cgi-bin/airboot，不可能返回 {ok:true, svc:"airboot"}。
+    ///
+    /// 换句话说「在别人家 WiFi 也判成在家」这件事，**根源不在 ping，而在 lanCandidates
+    /// 里塞了写死的 192.168.1.88 / .250** —— 只要别人家网段恰好也是 192.168.1.x，
+    /// 而且 .88 上恰好有台设备回了 200，就会被当成本路由器。
+    /// 所以这里再加一道：确认响应里 svc 精确等于 airboot（不接受空值/其它值）。
     static func ping(host: String, timeout: TimeInterval = 1.2) async -> Bool {
         guard let u = bootURL(host: host, query: "action=ping") else { return false }
         var req = URLRequest(url: u)
