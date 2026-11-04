@@ -468,37 +468,50 @@ final class UpdateManager: ObservableObject {
             DispatchQueue.main.async { self.installIPA(at: url) }
             return
         }
-        // 1) URL scheme 优先：本地包 file:// 交给 TrollStore 安装
-        //    (LSApplicationQueriesSchemes 已声明 trollstore + apple-magnifier → canOpenURL 才有效）
-        let scheme = "trollstore://install/?url="
         let encoded = url.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)
             ?? url.absoluteString
-        if let schemeURL = URL(string: scheme + encoded),
-           UIApplication.shared.canOpenURL(schemeURL) {
-            UIApplication.shared.open(schemeURL) { [weak self] ok in
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-                    if ok {
-                        // 已交给 TrollStore：熄灭红点，提示安装完成前别打开
-                        self.isDownloading = false
-                        self.downloadedIPAURL = nil
-                        self.updateAvailable = false
-                        self.hasUpdateRedDot = false
-                        self.installMessage = L10n.t("i18n_1230", self.latestVersion ?? "")
-                    } else {
-                        // open 被系统拒绝 → 兜底分享菜单
-                        self.errorMessage = L10n.t("i18n_1232")
-                        self.fallbackShareInstall(url)
-                    }
-                }
-            }
+        // 2026-11-04 修正（「下载完了但没有自动安装」的直接原因）：
+        //   老代码只试 `trollstore://install/?url=` 一个 scheme。
+        //   而 TrollStore 官方注册的一键安装入口是 **apple-magnifier://**，
+        //   `trollstore://` 在部分版本/未开 "URL Scheme Enabled" 的设备上 canOpenURL 直接 false，
+        //   于是静默掉进分享菜单 —— 用户看到的就是「下载好了，还得自己点分享」。
+        //   现在按可靠性排序逐个试，第一个能打开的就用。
+        tryInstall(schemes: ["apple-magnifier://install?url=",
+                             "trollstore://install/?url="],
+                   encoded: encoded,
+                   index: 0,
+                   fileURL: url)
+    }
+
+    /// 按顺序尝试安装 scheme；全部打不开才退到分享菜单。
+    private func tryInstall(schemes: [String], encoded: String, index: Int, fileURL: URL) {
+        guard index < schemes.count else {
+            // scheme 全都不可用（没装 TrollStore / 没开 URL Scheme）→ 分享菜单兜底
+            errorMessage = L10n.t("i18n_1231")
+            fallbackShareInstall(fileURL)
             return
         }
-        // 2) scheme 不可用（TrollStore 未开 URL Scheme Enabled / 老 TrollStore）→ 分享菜单兜底
-        //    （分享菜单里有 TrollStore 的 OpenIn / 保存安装包——用户可手动走 TrollStore）
-        DispatchQueue.main.async {
-            self.errorMessage = L10n.t("i18n_1231")
-            self.fallbackShareInstall(url)
+        guard let schemeURL = URL(string: schemes[index] + encoded),
+              UIApplication.shared.canOpenURL(schemeURL) else {
+            tryInstall(schemes: schemes, encoded: encoded, index: index + 1, fileURL: fileURL)
+            return
+        }
+        UIApplication.shared.open(schemeURL) { [weak self] ok in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if ok {
+                    // 已交给 TrollStore：熄灭红点，提示安装完成前别打开
+                    self.isDownloading = false
+                    self.downloadedIPAURL = nil
+                    self.updateAvailable = false
+                    self.hasUpdateRedDot = false
+                    self.installMessage = L10n.t("i18n_1230", self.latestVersion ?? "")
+                } else {
+                    // 系统拒绝打开 → 试下一个 scheme，别直接放弃
+                    self.tryInstall(schemes: schemes, encoded: encoded,
+                                    index: index + 1, fileURL: fileURL)
+                }
+            }
         }
     }
 

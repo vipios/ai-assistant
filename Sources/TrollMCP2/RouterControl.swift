@@ -146,6 +146,85 @@ enum RouterControl {
         UserDefaults.standard.set(pool, forKey: "router.host_pool")
     }
 
+    // MARK: - 双通道路由（2026-11-04 新增）
+    //
+    // 用户诉求（原话）：
+    //   「路由器界面点击进去就能自动刷新是链接 wifi 还是没有链接 wifi 自动判定，
+    //    在家就用 wifi 直连 ip 进行登录，判定是没链接 wifi 就自动切换成域名，
+    //    同时如果我在这个页面停留了，一开始链接了 wifi 他是家里的 ip，
+    //    在界面停留期间关闭 wifi 他要自动检测到」
+    //
+    // 为什么必须拆成两个地址（老代码的真正病根）：
+    //   airboot（重启指令）在 uhttpd 的 **80** 端口；
+    //   设备状态 / 后台接口在 relay.py 的 **8080** 端口。
+    //   老代码只有一个 foundHost（裸 IP，不带端口），同时喂给这两个通道：
+    //     - 喂给后台接口 → http://192.168.1.88/admin/api/device → 打到 80 → 404
+    //     - 喂给 airboot   → 正确
+    //   所以「有时能进有时进不去」不是网络问题，是**一个变量喂错端口**。
+    //   现在明确拆成 adminBase（8080 / 域名）和 bootBase（80 / 域名）。
+
+    /// 外网域名（Cloudflare 隧道）。
+    /// Gist 里如果带了 domain 字段就优先用那个，没带就用这个常量。
+    static let defaultWanHost = "lidongyang.dpdns.org"
+
+    /// 用户可以在设置里改；留空 = 用默认域名
+    static var wanHost: String {
+        let v = (UserDefaults.standard.string(forKey: "router.wan_host") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty ? defaultWanHost : v
+    }
+
+    /// 一条可用线路。字段含义见上方注释。
+    struct Route {
+        /// true = 内网直连；false = 走域名（外网）
+        var isLan: Bool
+        /// 后台接口基地址——设备状态、鉴权接口用它（内网一定带 :8080）
+        var adminBase: String
+        /// airboot 基地址——重启指令用它（内网是 80，外网是域名）
+        var bootBase: String
+        /// 界面显示：内网直连 / 外网
+        var label: String
+        /// 界面显示：实际地址
+        var detail: String
+    }
+
+    /// 判定当前该走哪条线路。**页面上唯一的「找地址」入口**，别再各找各的。
+    ///
+    /// 判定顺序（和 BaseURLRouter 的思路一致，避免两套逻辑打架）：
+    ///   1. 本机没有任何内网 IPv4  → 在用流量/没连 WiFi → 直接走域名（零成本）
+    ///   2. 有内网 IPv4 → 并发探 airboot，探到就是在家 → 内网直连
+    ///   3. 连了 WiFi 却探不到 airboot（路由器 80 挂了 / 换了别人家的网）→ 退回域名
+    static func resolveRoute() async -> Route {
+        let wan = Route(isLan: false,
+                        adminBase: "https://" + wanHost,
+                        bootBase: "https://" + wanHost,
+                        label: "外网",
+                        detail: wanHost)
+
+        // 1) 没有任何内网 IPv4 = 没连 WiFi（或用流量）→ 外面的域名
+        guard !BaseURLRouter.localPrivateIPv4s().isEmpty else { return wan }
+
+        // 2) 在家：探 airboot，命中才算真的在家
+        if let hit = await discover(candidates: lanCandidates()) {
+            return Route(isLan: true,
+                         adminBase: "http://\(hit):8080",
+                         bootBase: "http://\(hit)",
+                         label: "内网直连",
+                         detail: hit)
+        }
+
+        // 3) 连了 WiFi 但 80 探不到 → 走域名。
+        //    这时域名后面是 relay.py(8080)，设备状态照样能读到，
+        //    比「一直转圈什么也看不到」好。
+        return wan
+    }
+
+    /// 网络指纹：当前内网 IP 集合。变了就说明换了网络（WiFi↔蜂窝 / 换网段）。
+    static func netSignature() -> String {
+        let locals = BaseURLRouter.localPrivateIPv4s().sorted()
+        return locals.isEmpty ? "no-lan" : locals.joined(separator: ",")
+    }
+
     // MARK: - 发指令
 
     /// 重启整台路由器（全家断网约 40 秒）。

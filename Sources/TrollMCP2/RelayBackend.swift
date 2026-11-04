@@ -159,6 +159,58 @@ enum RelayBackend {
         }
     }
 
+    // MARK: 重启（外网通道）
+
+    /// POST {base}/admin/api/device/reboot —— **域名/外网下唯一能用的重启通道**。
+    ///
+    /// 为什么外网不能走 airboot：
+    ///   airboot 在 uhttpd 的 80 端口，而 Cloudflare 隧道只转发到 8080 的 relay.py，
+    ///   `https://<域名>/cgi-bin/airboot` 会被 relay.py 自己回 404。
+    ///   但 relay.py 的 `/admin/api/device/reboot` 是**公网白名单**里的
+    ///   （见 relay.py 的 _public_block_reason），所以走这条路能重启整台路由器。
+    ///
+    /// 服务端要求 body 必须带 confirm="reboot"（防手滑），否则 400。
+    static func rebootDevice(base: String, key: String,
+                             done: @escaping (Result<String, RelayError>) -> Void) {
+        guard let b = normalize(base), let url = URL(string: b + "/admin/api/device/reboot") else {
+            done(.failure(RelayError("后台地址格式不对")))
+            return
+        }
+        var req = URLRequest(url: url, timeoutInterval: 12)
+        // 必须用项目封装的 setHTTPMethod（iOS 15.6 直接用 req.httpMethod 会 dyld 闪退）
+        setHTTPMethod("POST", on: &req)
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        req.setValue("AIRelayChat/1.0 CFNetwork/1410.0.3 Darwin/22.6.0",
+                     forHTTPHeaderField: "User-Agent")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !key.isEmpty { req.setValue(key, forHTTPHeaderField: "X-Access-Key") }
+        req.httpBody = #"{"confirm":"reboot"}"#.data(using: .utf8)
+
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            var msg = ""
+            if let data = data,
+               let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                msg = (doc["msg"] as? String) ?? ""
+                if msg.isEmpty { msg = (doc["error"] as? String) ?? "" }
+            }
+            DispatchQueue.main.async {
+                if err != nil {
+                    done(.failure(RelayError("连不上后台（域名）。请确认中转站和隧道是通的。")))
+                } else if (200...299).contains(code) {
+                    done(.success(msg.isEmpty ? "正在重启，约 40 秒后自动恢复" : msg))
+                } else if code == 401 || code == 403 {
+                    done(.failure(RelayError("后台拒绝了这次请求：密钥不对或没有权限。")))
+                } else if code == 429 {
+                    done(.failure(RelayError("重启太频繁（10 分钟最多 3 次），请稍等。")))
+                } else {
+                    done(.failure(RelayError(msg.isEmpty ? "后台返回 HTTP \(code)" : msg)))
+                }
+            }
+        }.resume()
+    }
+
     // MARK: 公网地址（Gist）
 
     /// 设备把当前地址写到这个 Gist，每 3 分钟一次。

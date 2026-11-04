@@ -583,6 +583,10 @@ struct UpdateView: View {
             return L10n.t("i18n_237", v)
         }
         if let s = updateManager.installMessage, !s.isEmpty { return s }
+        // 2026-11-04 补：这里原来不读 errorMessage，
+        //   于是「没查成 / 查失败」全都渲染成 i18n_238「已是最新版本」——
+        //   用户杀后台重进看到「1.0.18 已是最新」就是这么来的。
+        if let e = updateManager.errorMessage, !e.isEmpty { return e }
         return L10n.t("i18n_238")
     }
     

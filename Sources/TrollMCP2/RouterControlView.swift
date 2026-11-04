@@ -2,6 +2,8 @@ import SwiftUI
 // UIPasteboard（复制公网地址）在 UIKit 里；SwiftUI 会间接带入，
 // 但显式引入更稳（换 Swift 版本时传递关系可能变，项目里有过先例）
 import UIKit
+// NWPathMonitor：网络变化（WiFi↔蜂窝）要**立刻**重探地址，不能等 20 秒的定时器
+import Network
 
 /// 路由器控制面板（2026-11-02 新增，2026-11-03 大改）。
 ///
@@ -27,7 +29,16 @@ struct RouterControlView: View {
     @State private var statusLine: String = ""
     @State private var statusIsError = false
     @State private var confirmAction: RouterAction?
-    @State private var foundHost: String?
+
+    /// 2026-11-04：当前线路。替掉原来的 foundHost —— 那个变量只有一个裸 IP，
+    /// 同时喂给 airboot(80) 和后台接口(8080)，必然有一个连不上。
+    @State private var route: RouterControl.Route?
+    /// 正在重新判定线路（界面上显示「正在检测…」）
+    @State private var detecting = false
+    /// 网络变化监听
+    @State private var pathMonitor: NWPathMonitor?
+    /// 上一次的网络指纹，用来判断「是不是真的换网了」
+    @State private var lastNetSig: String = ""
 
     /// 重启中转站后等它起来的倒计时提示
     @State private var waitingBack = false
@@ -108,14 +119,16 @@ struct RouterControlView: View {
             }
             .onAppear {
                 loadKey()
-                // 进页面就把设备状态和公网地址拉一遍，不等用户点
-                refreshDevice()
+                // 进页面就把线路、设备状态、公网地址都拉一遍，不等用户点
+                Task { await detectRoute(force: true) }
                 refreshPublicAddress()
                 startAutoRefresh()
+                startNetworkMonitor()
             }
             .onDisappear {
                 refreshTimer?.invalidate()
                 refreshTimer = nil
+                stopNetworkMonitor()
             }
             // 二次确认：两条路径都走同一个 dialog，标题/描述/按钮颜色由当前动作决定。
             .confirmationDialog(
@@ -141,37 +154,55 @@ struct RouterControlView: View {
 
     // MARK: - 设备状态卡
 
+    private var routeIcon: String {
+        guard let r = route else { return "wifi.router" }
+        return r.isLan ? "wifi.router.fill" : "globe.asia.australia.fill"
+    }
+
+    private var routeTint: Color {
+        guard let r = route else { return .secondary }
+        return r.isLan ? .blue : .orange
+    }
+
     private var deviceCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
-                Image(systemName: foundHost == nil ? "wifi.router" : "wifi.router.fill")
+                Image(systemName: routeIcon)
                     .font(.system(size: 22, weight: .medium))
-                    .foregroundColor(foundHost == nil ? .secondary : .blue)
+                    .foregroundColor(routeTint)
                     .frame(width: 40, height: 40)
-                    .background((foundHost == nil ? Color.secondary : Color.blue).opacity(0.12))
+                    .background(routeTint.opacity(0.12))
                     .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 2) {
-                    // 标题：优先显示设备实际地址
-                    Text(foundHost ?? L10n.t("i18n_1536"))
+                    // 标题：当前线路的实际地址（内网 IP / 域名）
+                    Text(route?.detail ?? L10n.t("i18n_1536"))
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    // 在线状态：绿点 = 在线，灰点 = 未连上
+                    // 在线状态 + 现在走哪条线
                     HStack(spacing: 5) {
                         Circle()
                             .fill(device != nil ? Color.green : Color.secondary.opacity(0.5))
                             .frame(width: 6, height: 6)
-                        Text(device != nil ? "在线" : (deviceError.isEmpty ? "检测中…" : "未连上"))
+                        Text(detecting ? "检测中…"
+                             : (device != nil ? (route?.label ?? "在线")
+                                : (deviceError.isEmpty ? "检测中…" : "未连上")))
                             .font(.caption)
                             .foregroundColor(.secondary)
+                        if let r = route, device != nil {
+                            Text("· \(r.isLan ? "WiFi 直连" : "走域名")")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
                 }
                 Spacer(minLength: 0)
                 Button {
-                    refreshDevice()
+                    // 手动刷新 = 重新判定线路 + 重拉状态（关掉 WiFi 后点它也能立刻切到域名）
+                    Task { await detectRoute(force: true) }
                 } label: {
-                    if deviceLoading {
+                    if deviceLoading || detecting {
                         ProgressView().scaleEffect(0.7)
                             .frame(width: 30, height: 30)
                     } else {
@@ -183,7 +214,7 @@ struct RouterControlView: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .disabled(deviceLoading)
+                .disabled(deviceLoading || detecting)
             }
 
             if let d = device {
@@ -444,17 +475,49 @@ struct RouterControlView: View {
             accessKey = saved
             keyLoaded = true
         }
-        Task {
-            let host = await findHost()
-            await MainActor.run {
-                foundHost = host
-                refreshDevice()
-            }
+    }
+
+    /// 判定线路 → 再拉设备状态。
+    ///
+    /// **页面里唯一「找地址」的入口**：进页面、手动点刷新、网络变化、20 秒兜底检查都调它。
+    /// 老代码只有进页面时探一次（`loadKey` 里），之后再也不探 ——
+    /// 所以「停留期间关掉 WiFi」永远是旧 IP，必然连不上。
+    @MainActor
+    private func detectRoute(force: Bool = false) async {
+        if detecting { return }
+        detecting = true
+        let r = await RouterControl.resolveRoute()
+        detecting = false
+        lastNetSig = RouterControl.netSignature()
+        let changed = (route?.adminBase != r.adminBase) || (route?.bootBase != r.bootBase)
+        route = r
+        // 地址变了、或者用户手动点刷新 → 重拉一次状态
+        if changed || force {
+            refreshDevice()
         }
     }
 
-    private func findHost() async -> String? {
-        await RouterControl.discover(candidates: RouterControl.lanCandidates())
+    /// 监听网络变化（WiFi ↔ 蜂窝）。用户明确要求：
+    /// 「在界面停留期间关闭 wifi 他要自动检测到」。
+    private func startNetworkMonitor() {
+        stopNetworkMonitor()
+        let m = NWPathMonitor()
+        m.pathUpdateHandler = { _ in
+            // 系统回调时链路刚变，DHCP 拿到新 IP 还要几百毫秒；
+            // 延迟 0.8 秒再读网卡列表，避免读到「已断开、还没连上」的中间态。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                let sig = RouterControl.netSignature()
+                guard sig != lastNetSig else { return }
+                Task { await detectRoute(force: true) }
+            }
+        }
+        m.start(queue: DispatchQueue(label: "router.path.monitor"))
+        pathMonitor = m
+    }
+
+    private func stopNetworkMonitor() {
+        pathMonitor?.cancel()
+        pathMonitor = nil
     }
 
     /// 每 20 秒自动刷设备状态——用户要的是「打开就能看到真实状态」，
@@ -462,7 +525,14 @@ struct RouterControlView: View {
     private func startAutoRefresh() {
         refreshTimer?.invalidate()
         let t = Timer(timeInterval: 20, repeats: true) { _ in
-            refreshDevice(silent: true)
+            // 兜底：NWPathMonitor 在个别机型/越狱环境下会漏回调，
+            // 这里每 20 秒顺手比一次网络指纹，变了就重探地址。
+            let sig = RouterControl.netSignature()
+            if sig != lastNetSig {
+                Task { await detectRoute(force: true) }
+            } else {
+                refreshDevice(silent: true)
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         refreshTimer = t
@@ -473,8 +543,10 @@ struct RouterControlView: View {
         deviceLoading = true
         if !silent { deviceError = "" }
 
-        // 优先用已探测到的地址；没有就用后台里存的地址
-        let base = foundHost ?? RelayAdminCredential.shared.baseURL
+        // 2026-11-04 关键修正：设备状态必须走 **8080/域名** 那条线。
+        //   老代码用 foundHost（裸 IP，不带端口）→ http://192.168.1.88/admin/api/device
+        //   → 打到 uhttpd 的 80 → 404 → 状态卡永远「未连上」。
+        let base = route?.adminBase ?? RelayAdminCredential.shared.baseURL
         let key = accessKey.trimmingCharacters(in: .whitespacesAndNewlines)
 
         RelayBackend.fetchDeviceStatus(base: base, key: key) { result in
@@ -512,7 +584,7 @@ struct RouterControlView: View {
         guard !key.isEmpty else { return }
         keyChecking = true
         keyCheckOK = nil
-        let base = foundHost ?? RelayAdminCredential.shared.baseURL
+        let base = route?.adminBase ?? RelayAdminCredential.shared.baseURL
 
         RelayBackend.fetchDeviceStatus(base: base, key: key) { result in
             keyChecking = false
@@ -525,6 +597,13 @@ struct RouterControlView: View {
             case .failure:
                 keyCheckOK = false
             }
+        }
+    }
+
+    /// 外网重启：relay.py 的 /admin/api/device/reboot 包成 async
+    private func wanReboot(base: String, key: String) async -> Result<String, RelayError> {
+        await withCheckedContinuation { (cont: CheckedContinuation<Result<String, RelayError>, Never>) in
+            RelayBackend.rebootDevice(base: base, key: key) { cont.resume(returning: $0) }
         }
     }
 
@@ -544,9 +623,17 @@ struct RouterControlView: View {
             statusLine = L10n.t("i18n_1553")
         }
 
-        let host = await RouterControl.discover(candidates: RouterControl.lanCandidates())
-
-        guard let target = host else {
+        // 动手前先确认线路是新的（可能刚关了 WiFi / 刚到家）
+        var r = route
+        if r == nil {
+            let fresh = await RouterControl.resolveRoute()
+            await MainActor.run {
+                route = fresh
+                lastNetSig = RouterControl.netSignature()
+            }
+            r = fresh
+        }
+        guard let target = r else {
             await MainActor.run {
                 busy = false
                 statusIsError = true
@@ -555,12 +642,13 @@ struct RouterControlView: View {
             return
         }
 
-        await MainActor.run { foundHost = target }
-
         do {
             switch action {
             case .relay:
-                try await RouterControl.restartRelay(host: target, key: key)
+                // 重启中转站服务只能走 airboot（80 端口）。
+                // 内网直连没问题；外网要求隧道把 /cgi-bin 也转发出去，
+                // 否则 relay.py 会回 404（下面 catch 里会翻译成人话）。
+                try await RouterControl.restartRelay(host: target.bootBase, key: key)
                 await MainActor.run {
                     statusLine = L10n.t("i18n_1556")
                     waitingBack = true
@@ -573,18 +661,46 @@ struct RouterControlView: View {
                     // 重启完立刻重拉一次状态，让用户看到内存释放的效果
                     refreshDevice(silent: true)
                 }
+
             case .reboot:
-                try await RouterControl.reboot(host: target, key: key)
-                await MainActor.run {
-                    statusLine = L10n.t("i18n_1558")
-                    waitingBack = true
-                }
-                try? await Task.sleep(nanoseconds: 45_000_000_000)
-                await MainActor.run {
-                    waitingBack = false
-                    busy = false
-                    statusLine = L10n.t("i18n_1559")
-                    refreshDevice(silent: true)
+                if target.isLan {
+                    // 在家：不走 relay.py，直接打 airboot，最可靠
+                    try await RouterControl.reboot(host: target.bootBase, key: key)
+                    await MainActor.run {
+                        statusLine = L10n.t("i18n_1558")
+                        waitingBack = true
+                    }
+                    try? await Task.sleep(nanoseconds: 45_000_000_000)
+                    await MainActor.run {
+                        waitingBack = false
+                        busy = false
+                        statusLine = L10n.t("i18n_1559")
+                        refreshDevice(silent: true)
+                    }
+                } else {
+                    // 在外：走 relay.py 的公网白名单接口（8080），
+                    // 不依赖隧道是否开放 80 —— 这条路现在就能用。
+                    switch await wanReboot(base: target.adminBase, key: key) {
+                    case .success(let msg):
+                        await MainActor.run {
+                            statusLine = msg.isEmpty ? L10n.t("i18n_1558") : msg
+                            waitingBack = true
+                        }
+                        try? await Task.sleep(nanoseconds: 45_000_000_000)
+                        await MainActor.run {
+                            waitingBack = false
+                            busy = false
+                            statusLine = L10n.t("i18n_1559")
+                            refreshDevice(silent: true)
+                        }
+                    case .failure(let e):
+                        await MainActor.run {
+                            busy = false
+                            waitingBack = false
+                            statusIsError = true
+                            statusLine = e.message
+                        }
+                    }
                 }
             }
         } catch let e as RouterError {
@@ -592,7 +708,15 @@ struct RouterControlView: View {
                 busy = false
                 waitingBack = false
                 statusIsError = true
-                statusLine = e.errorDescription ?? L10n.t("i18n_1560")
+                var msg = e.errorDescription ?? L10n.t("i18n_1560")
+                // 外网点「中转站重启」会 404：隧道只把 8080 转出去了，
+                // /cgi-bin/airboot 在 80 上，relay.py 根本不认识这个路径。
+                // 这句比「HTTP 404」有用得多。
+                if !target.isLan, case .http(404) = e {
+                    msg = "外网隧道目前只开放了 8080 端口，重启中转站服务请在家连 WiFi 操作。"
+                        + "「路由器重启」在外网可以正常用。"
+                }
+                statusLine = msg
                 if case .noKey = e { keyLoaded = false }
                 if case .badKey = e {
                     keyLoaded = false
