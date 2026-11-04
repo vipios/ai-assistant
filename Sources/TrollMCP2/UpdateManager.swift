@@ -33,21 +33,33 @@ final class UpdateManager: ObservableObject {
 
     // v2.9.108：仓库与工作流改为动态读取（对齐 GitHub 账号页配置）
     // v7.1.285：默认仓库名 trollmcp2 → TrollAgent（旧名 API 301 / CDN 404），并迁移已存的旧值
-    // 2026-11-02 定制版：默认仓库改为空——本版把版本号重置为 1.0.0，
-    // 而上游作者仓库是 7.x，若仍沿用其默认值，「检查更新」会判定 7.x 更新并把人升级回原版，
-    // 把我们所有定制（改名/中转站/UI/隐私加固）全部冲掉。留空=不自动指向上游，
-    // 由用户在 设置→GitHub 里填自己的仓库后才会检查更新。
+    // 2026-11-02 定制版曾把默认仓库改为空（怕指向上游 7.x 把定制冲掉）。
+    // 2026-11-04 改为「默认吃 vipios/ai-assistant」，因为留空会导致检查更新彻底不联网；
+    // 对上游的防护改由下方 upstreamOwners / upstreamRepos 硬拦，效果更准（只拦上游，不拦自己）。
     private var repo: String {
-        let owner = UserDefaults.standard.string(forKey: "trollmcp2.github_repo_owner") ?? ""
-        var name = UserDefaults.standard.string(forKey: "trollmcp2.github_repo_name") ?? ""
+        // 2026-11-04 修正（关键，修的是「发了新版但手机永远刷不出来」）：
+        //   原来这里只读 UserDefaults 两个键，而写这两个键的是
+        //   GitHubAccountStore.init → load() → persist()，那个 store 是**懒加载**的。
+        //   只要用户还没进过「设置 → GitHub 账号」页，键就是空 →
+        //   repo 为空 → checkForUpdate 一开始就 return，一次网络请求都不发 →
+        //   界面显示 i18n_232「已是最新」。把「没配仓库」伪装成「已经最新」，
+        //   结果就是永远收不到更新。
+        //   修法：空值直接吃 GitHubAccountStore 的静态默认值（vipios/ai-assistant），
+        //   不走 store 实例，避免在后台线程首次实例化 ObservableObject 触发跨线程告警。
+        let owner = (UserDefaults.standard.string(forKey: "trollmcp2.github_repo_owner") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var name = (UserDefaults.standard.string(forKey: "trollmcp2.github_repo_name") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         if name == "trollmcp2" { name = "" }
-        // 2026-11-03 硬保险：不管 UserDefaults 里存着什么，绝不允许更新源指向上游作者。
+        // 2026-11-03 硬保险：不管存着什么，绝不允许更新源指向上游作者。
         //   只要指过去，「检查更新」就会报 7.x，用户一点升级 = 定制版被原版覆盖。
-        //   这是最后一道闸——GitHubAccountStore 那边已经有迁移，这里是双保险。
         if GitHubAccountStore.upstreamOwners.contains(owner) { return "" }
         if GitHubAccountStore.upstreamRepos.contains(name) { return "" }
-        guard !owner.isEmpty, !name.isEmpty else { return "" }
-        return "\(owner)/\(name)"
+        // 缺哪一半就补默认值，而不是整串作废
+        let o = owner.isEmpty ? GitHubAccountStore.defaultOwner : owner
+        let n = name.isEmpty ? GitHubAccountStore.defaultRepo : name
+        guard !o.isEmpty, !n.isEmpty else { return "" }
+        return "\(o)/\(n)"
     }
     private var workflow: String {
         UserDefaults.standard.string(forKey: "trollmcp2.github_workflow_id") ?? "build-trollmcp2.yml"
@@ -102,8 +114,12 @@ final class UpdateManager: ObservableObject {
         // 否则会拼出 /repos//actions 这种空 owner 请求、白跑一轮并可能误点亮更新红点。
         guard !repo.isEmpty else {
             isChecking = false
-            errorMessage = nil
             updateAvailable = false
+            // 2026-11-04：不再静默返回「已是最新」。
+            //   以前这里直接把 updateAvailable 置 false 就完事，界面显示 i18n_232「已是最新」——
+            //   用户看到的是「已经是最新版」，实际是「仓库没配，压根没联网查」。
+            //   把配置问题伪装成「最新」，等于让用户永远收不到更新。
+            errorMessage = "未配置更新仓库，请到 设置 → GitHub 账号 填写 \(GitHubAccountStore.defaultOwner)/\(GitHubAccountStore.defaultRepo)"
             completion?(false)
             return
         }
