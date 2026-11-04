@@ -49,7 +49,19 @@ struct BrowserTextTool: MCPTool {
         // v4.3.26：返回当前页面 URL——AI 校验"读的是不是 navigate 后的目标页"，
         // 若 URL 不是期望页则说明页面没跳转/读错页，不再被旧页文本误导。
         let curURL = BrowserManager.shared.currentURL
-        return ["ok": !text.hasPrefix("ERR:"), "text": text, "length": text.count, "current_url": curURL]
+        // P58（2026-11-04）：失败的原文要能被 AI 看见。
+        // 原来只返回 ok:false + text，MCPCore 走 errorMessage(from: result["error"], fallback:"Tool returned ok=false")，
+        // result 里没有 "error" 键 ⇒ 那 28 个字符（现在是带 domain#code 的更长串）被 fallback 吃掉，AI 永远只看到
+        // "Tool returned ok=false"。加上 error 键后，errorMessage 的 String 分支会原样传出去。
+        var r: [String: Any] = ["ok": !text.hasPrefix("ERR:"), "text": text,
+                                "length": text.count, "current_url": curURL]
+        if text.hasPrefix("ERR:") {
+            r["error"] = text
+            // P58-b：这是确定性失败，重试一次只是再等一轮（getText 内部有 16 次 sleep(0.5)=8s），
+            // 而且第二次结果必然相同。标记禁重试，让 MCPCore 直接返回。
+            r["_noRetry"] = true
+        }
+        return r
     }
 }
 

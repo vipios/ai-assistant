@@ -102,6 +102,18 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var isLoading = false
     @Published var lastError = ""
 
+    // P57-b（2026-11-04）：导航阶段五态。替代原来只有一个 isLoading(Bool) 的粗粒度信号。
+    //   none      → load() 根本没生效（还没让 WebView 开始导航）
+    //   started   → 已开始导航，但还没收到服务器响应（Network 层没接上）
+    //   committed → 已收到响应头和首字节（Network 通了，在等 WebContent 渲染）
+    //   finished  → 页面完全加载完（渲染层问题才轮到 GPU）
+    //   failed    → 导航失败（此时 lastError 里会有 domain#code）
+    // 判读价值：把「白屏」拆成四个可区分的失败点，避免七轮以来那种「都是白屏，猜是哪里」。
+    @Published var navStage: String = "none"
+    // P56（2026-11-04）：WebContent 进程被系统杀掉（Jetsam/崩溃）的次数。
+    // didTerminate 只在「起来过、后来被杀」时触发；「从没起来」不会触发它（那要看 evalProbe）。
+    @Published var wcpTerminateCount: Int = 0
+
     private(set) var webView: WKWebView?
     // v2.9.81：是否已加载过任意页面（替代从未赋值的 loadedOnce）
     // 悬浮窗 onAppear 只在从未加载过时自动开 Bing，避免自动加载覆盖用户/AI 刚发起的 URL
@@ -135,11 +147,13 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
                 }
                 let waited = sem.wait(timeout: .now() + 2.5)
                 if webView != nil { return true }
-                // 主线程 2.5s 未响应 → 主线程忙 → 后台线程直建兜底（此时 async 大概率未执行, 无并发冲突）
-                if waited == .timedOut && webView == nil {
-                    if self.webView == nil { self.createWebView() }
-                    if webView != nil { return true }
-                }
+                // P44（2026-11-04）：删掉「后台线程直建兜底」四行。
+                // 原逻辑：waited == .timedOut 时在后台线程直接 createWebView()。
+                // 风险：main.async 已入队但可能还没执行，此时后台再建一次 ⇒ 两个 WKWebView
+                //       并发创建，后者的 webView = wv 覆盖前者，前者成为孤儿视图（白屏/闪退源）。
+                // 现改为：只等主线程，超时就进下一轮（共 6 轮 ≈ 15s），不在非主线程建 WebView。
+                // WKWebView 必须在主线程创建，这是 UIKit 的硬约束。
+                _ = waited
             }
             // 未成功则稍等再试，给主线程腾空
             Thread.sleep(forTimeInterval: 0.3)
@@ -387,6 +401,32 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
     /// 等待页面加载完成（最多 timeout 秒）。open 后必须 wait，否则 snapshot 拿不到元素。
     func wait(timeout: Int = 15) -> [String: Any] {
         guard ensureWebView() else { return ["ok": false, "error": "Browser initialization timeout"] }
+        // P71（2026-11-04）：前置短路。原来即使 WebView 是死的，也会在 while 循环里
+        // 空转 timeout 秒（默认 15s），每次都 evalSync(5s 超时) 拿 ERR，最坏 15s 白等。
+        // 现在先用 2 秒探一次 JS 引擎：通了再进正常等待；不通立即返回，把真实错误抛出来。
+        // 判据：返回值里带 shortCircuit=true 表示「根本没等，直接判死」。
+        // P71-b（2026-11-04）：主线程要单独报。evalSync 有主线程守卫会直接返回 ERR，
+        //   若不区分，主线程调用会被误报成「WebView not responding」（假阴性），
+        //   把排查方向带偏到 WebContent 上。这里明确标调用错线程，且 hint 指出正确用法。
+        if Thread.isMainThread {
+            return ["url": currentURL, "title": pageTitle, "loaded": isLoading,
+                    "error": "browser.wait must not run on the main thread (evalSync blocks UI there)",
+                    "hint": "call the tool from the MCP worker queue (DispatchQueue.global), not from the UI thread",
+                    "navStage": navStage, "shortCircuit": true, "mainThreadSkip": true, "body_text_length": 0]
+        }
+        let probe = evalSync("1+1", timeout: 2)
+        if probe.hasPrefix("ERR:") {
+            var r: [String: Any] = [
+                "url": currentURL,
+                "title": pageTitle,
+                "loaded": false,
+                "error": "WebView not responding, skipped waiting: \(probe)",
+                "navStage": navStage,
+                "shortCircuit": true
+            ]
+            r["body_text_length"] = 0
+            return r
+        }
         FloatingBrowser.shared.show()
         beginAction("Waiting for page load…")
         let deadline = Date().addingTimeInterval(TimeInterval(timeout))
@@ -717,7 +757,12 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
                 if let obj = obj {
                     result = "\(obj)"
                 } else if let err = err {
-                    result = "ERR: \(err.localizedDescription)"
+                    // P55（2026-11-04）：带上 NSError 的 domain 和 code。
+                    // 原来只有 localizedDescription（如 "The operation couldn't be completed"），
+                    // 无法判断是 WKErrorDomain#2(内容进程终止) / #3(进程崩溃) / #102(中断) / #101(网络)。
+                    // 判据：查看错误里的 WKErrorDomain#code —— 这决定能不能剥 no-sandbox。
+                    let ns = err as NSError
+                    result = "ERR: evalErr[\(ns.domain)#\(ns.code)] \(err.localizedDescription)"
                 } else {
                     result = ""
                 }
@@ -887,6 +932,28 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
             r["canGoBack"] = wv.canGoBack
             r["canGoForward"] = wv.canGoForward
         }
+        // P67''（2026-11-04）：两把「自证」尺子。
+        // evalProbe：执行 1+1 这种绝不会失败的 JS。它返回 "2" ⇒ JS 引擎通了（说明 WebContent 起来了）；
+        //            返回 ERR: ⇒ JS 引擎不通，此时看 error 里的 WKErrorDomain#code 才知道是哪种不通。
+        //            这是区分「WebView 建好了但内容进程没起」和「一切都好只是页面白」的唯一直接手段。
+        // P67''-b（2026-11-04）：evalSync 内部有主线程守卫（主线程调用直接返回 ERR 字符串，
+        //   因为 WKWebView.evaluateJavaScript 会同步等结果、在主线程做就是死等 UI）。
+        //   主力调用链 Models.swift:3001 是 DispatchQueue.global().async，天然安全；
+        //   但 dispatch 还有 5 个入口（JSONRPC / Offload / SubAgent / shell.exec 等），
+        //   任何一个在主线程都会让 evalProbe 永远返回 "ERR: ... main thread"，
+        //   从而把「探针本身没法跑」误读成「WebContent 没起来」——这是最坏的一种假阴性。
+        //   所以在调用点先判断：主线程就不探，明确标 skipped，检测试的人别把它当失败。
+        if Thread.isMainThread {
+            r["evalProbe"] = "skipped:main-thread"
+        } else {
+            r["evalProbe"] = evalSync("1+1", timeout: 2)
+        }
+        // dataRoot：NSHomeDirectory() 的真实返回值。no-container=true 时是 /var/mobile，
+        //           false 时是容器路径。P75 假设「WebKit 落盘路径不可写」就靠这个值来验证/证伪。
+        r["dataRoot"] = NSHomeDirectory()
+        // P57-b / P56：导航阶段 + 内容进程终止计数（见下方 navStage / wcpTerminateCount 定义）
+        r["navStage"] = navStage
+        r["wcpTerminateCount"] = wcpTerminateCount
         // v4.3.65：暴露拦截状态与缓存提示（对应 reynard-browser 的内容拦截/存储控制）
         r["adblock_enabled"] = adblockEnabled
         r["clear_hint"] = "browser clear kinds:cache,cookies,storage clears browsing data"
@@ -903,11 +970,44 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
 
     // MARK: - WKNavigationDelegate
 
+    // P57-b（2026-11-04）：导航五态回调。四个回调按时间顺序把「白屏」切成可区分的四个阶段。
+    // 全部用 DispatchQueue.main.async 更新 @Published（delegate 回调线程不确定，SwiftUI 需主线程）。
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        DispatchQueue.main.async { self.navStage = "started" }
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        // 收到响应头和首字节 ⇒ Network 层通了，正在等 WebContent 渲染
+        DispatchQueue.main.async { self.navStage = "committed" }
+    }
+
+    // P56（2026-11-04）：WebContent 渲染进程被系统杀掉（内存压力/崩溃）时的自愈。
+    // 只在「起来过、后来被杀」触发；「从没起来」不触发这个回调（那种情况看 evalProbe）。
+    // 2 次以内自动 reload 尝试恢复，超过就停手（避免无限重建把设备拖垮）。
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        // 注意：这个回调的线程不确定，且 @Published 只该在主线程读写（否则 SwiftUI 会警告/竞争）。
+        // 所以 NSLog 不读 wcpTerminateCount，只打固定标识；真正的自增在主线程块里做。
+        NSLog("[BrowserManager] WebContent process terminated")
+        DispatchQueue.main.async {
+            self.wcpTerminateCount += 1
+            self.lastError = "WebContent process terminated (count=\(self.wcpTerminateCount))"
+            // 前两次直接重载；第 3 次起不再自动重建，把问题暴露出来
+            if self.wcpTerminateCount <= 2 {
+                webView.reload()
+            } else {
+                self.isLoading = false
+                self.currentAction = ""
+            }
+        }
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         currentURL = webView.url?.absoluteString ?? currentURL
         pageTitle = webView.title ?? ""
         // v2.9.80：加载完成清理状态
         DispatchQueue.main.async {
+            self.navStage = "finished"
             self.isLoading = false
             self.currentAction = ""
             self.lastError = ""
@@ -927,20 +1027,25 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         pageTitle = "Load failed"
+        let ns = error as NSError
         DispatchQueue.main.async {
+            self.navStage = "failed"
             self.isLoading = false
             self.currentAction = ""
-            self.lastError = "Load failed: \((error as NSError).localizedDescription.prefix(60))"
+            // P55 配套：失败原因也带上 domain#code，与 evalSync 的格式保持一致
+            self.lastError = "Load failed[\(ns.domain)#\(ns.code)]: \(ns.localizedDescription.prefix(60))"
         }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         pageTitle = "Cannot access"
         currentURL = webView.url?.absoluteString ?? currentURL
+        let ns = error as NSError
         DispatchQueue.main.async {
+            self.navStage = "failed"
             self.isLoading = false
             self.currentAction = ""
-            self.lastError = "Cannot access: \((error as NSError).localizedDescription.prefix(60))"
+            self.lastError = "Cannot access[\(ns.domain)#\(ns.code)]: \(ns.localizedDescription.prefix(60))"
         }
     }
 }

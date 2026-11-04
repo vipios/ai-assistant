@@ -127,6 +127,11 @@
 		<string>com.apple.springboard</string>
 		<string>com.apple.backboardd</string>
 		<string>com.apple.usernotifications.usernotificationd</string>
+		<string>com.apple.WebKit.GPU</string>
+		<string>com.apple.WebKit.Networking</string>
+		<string>com.apple.WebKit.WebContent.CaptivePortal</string>
+		<string>com.apple.WebKit.WebContent.Crashy</string>
+		<string>com.apple.WebKit.WebContent</string>
 	</array>
 	<key>uicache.app-data-container-required</key>
 	<true/>

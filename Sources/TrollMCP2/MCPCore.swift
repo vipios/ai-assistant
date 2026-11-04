@@ -1064,7 +1064,10 @@ public final class ToolRegistry: ObservableObject {
                 if let errMsg = Self.extractReturnedError(result) {
                     let info = FailureKind.classify(errMsg)
                     // v3.1.5: 返回式错误也自动重试一次
-                    if FailureKind.retryable(errMsg) && callCount == 1 {
+                    // P58-b（2026-11-04）：工具可用 _noRetry 标记「这是确定性失败，重试无意义」。
+                    // 典型场景：browser.text 在 WebView 未初始化时返回 ERR:，内部已有 16×sleep(0.5)=8s 空转，
+                    // 重试只是再等 8 秒拿同一个结果。标记后直接进失败路径，不重试。
+                    if FailureKind.retryable(errMsg) && callCount == 1 && (result["_noRetry"] as? Bool) != true {
                         WorkflowManager.shared.updateStep(tool: originalName, detail: "🔄 auto-retrying...", success: false)
                         Thread.sleep(forTimeInterval: 1.0)  // 等 1 秒再重试
                         do {
