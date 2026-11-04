@@ -667,6 +667,10 @@ struct ChatView: View {
     /// 注意：函数体里**只能有一条**返回 `MessageBubble` 的表达式，不能带 `if`/`switch`
     /// 分支（那就必须用 @ViewBuilder + some View，也就不可能拿到具体类型）。
     /// 当前实现满足这个前提。
+    /// 2026-11-05 **编译修复二（fix-equatable-2）**：
+    /// 去掉 @ViewBuilder 后，函数体前面有一堆 `let` 语句，编译器就不再把它当
+    /// 「单表达式隐式返回」了，必须显式写 `return`。否则：
+    ///   error: missing return in instance method expected to return 'MessageBubble'
     private func bubble(for msg: ChatMessage) -> MessageBubble {
         // 注意：isScrollingFast 在 scroll.activity 上，**不在 scroll 上**。
         // 这是刻意拆分（见 ChatScrollState.swift）：它跟 offset/contentHeight 放一起的话，
@@ -680,7 +684,7 @@ struct ChatView: View {
         let picked = selectedIds.contains(msg.id)
         let streaming = store.streamingMessageId == msg.id
         let produced = store.liveProducedID == msg.id
-        MessageBubble(
+        return MessageBubble(
             message: msg,
             fastScrolling: fast,
             selectionMode: sel,
