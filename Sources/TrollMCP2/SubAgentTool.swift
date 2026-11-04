@@ -502,7 +502,11 @@ final class SubAgentManager {
         let finished = tasks.filter { !$0.value.isRunning() }
         if finished.count > SubAgentManager.maxRetainedTasks {
             let sorted = finished.sorted { $0.value.deadlineDate < $1.value.deadlineDate }
-            let overflow = sorted.prefix(finished.count - SubAgentManager.maxRetainedTasks)
+            // P77 配套（2026-11-04）：上面的 > 守卫已保证差值 > 0，这里再取 max(0,...)
+            // 是防将来把守卫改成 >= 或把上限来源换成动态值时，prefix 收到负数直接 trap
+            // （同 Models.swift runLoop 那个 SIGTRAP 崩溃的同类写法）。
+            let overflowCount = max(0, finished.count - SubAgentManager.maxRetainedTasks)
+            let overflow = sorted.prefix(overflowCount)
             for (id, _) in overflow { tasks.removeValue(forKey: id) }
         }
         lock.unlock()

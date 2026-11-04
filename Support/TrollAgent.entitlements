@@ -200,8 +200,16 @@
 	<true/>
 	<key>com.apple.private.security.no-container</key>
 	<true/>
-	<key>com.apple.private.security.no-sandbox</key>
-	<true/>
+	<!-- P76（2026-11-04）实验：移除 no-sandbox，验证 WebKit XPC 是否能通。
+	     依据（真机对比，微信 vs TrollAgent）：
+	       微信  mach-lookup=0 项 / no-sandbox=无 / no-container=无  → WebContent 能跑（23 次成功 spawn）
+	       我们  mach-lookup=10 项 / no-sandbox=有 / no-container=有  → WebContent 全被 159 拒
+	     推论：no-sandbox=true 让进程脱离用户沙盒域，而 WebKit XPC 连接要求发起方在沙盒域内。
+	     因此白名单不是关键（微信 0 项也能跑），沙盒域才是关键。
+	     本次只删这一项，其余全部不动 —— 受控实验，一次装机即可判定。
+	     若仍不通 ⇒ 说明 no-container 也是原因（下一步再删），或问题更深（转方案 B 双进程）。
+	     风险：task_for_pid / launchd job 提交 依赖该权限，砸壳功能可能受影响。
+	           先验证 WebKit；砸壳若坏，走方案 B 用独立 helper 进程补回。 -->
 	<key>com.apple.private.security.storage.AppBundles</key>
 	<true/>
 	<key>com.apple.private.security.storage.AppDataContainers</key>

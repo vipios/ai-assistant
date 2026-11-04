@@ -1244,7 +1244,7 @@ public final class ToolRegistry: ObservableObject {
                         let half = strLimit / 2
                         let head = String(t.prefix(half))
                         let tail = String(t.suffix(half))
-                        out[k] = head + "\n…[中间省略 共\(t.count - strLimit + 40)字符，完整内容: \(spillPath)]…\n" + tail
+                        out[k] = head + "\n…[中间省略 共\(max(0, t.count - strLimit + 40))字符，完整内容: \(spillPath)]…\n" + tail
                     } else {
                         out[k] = String(t.prefix(strLimit)) + "\n…[截断 共\(t.count)字符，完整内容: \(spillPath)]"
                     }

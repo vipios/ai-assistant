@@ -3458,12 +3458,36 @@ final class ConversationStore: ObservableObject {
         // 表现就是「翻了半天记录，它还问你要背景」。
         // 现在：保底从 6 提到 10，极限兜底从 2 提到 4，并把预算预留从 0.8 提到 0.85
         // （分档线本身已含余量，实测不会超发）。
-        var keepMin = 10
+        // P77（2026-11-04）修崩溃：Collection.prefix 负数 trap。
+        //
+        // 崩溃证据（TrollAgent-2026-11-04-170216.ips，1.0.16 build 17）：
+        //   exception = EXC_BREAKPOINT / SIGTRAP, codes = 0x1
+        //   调用栈 = specialized Collection.prefix(_:) +108
+        //            ← ConversationStore.runLoop(...) +3424
+        //            ← ConversationStore.send(...) ← ChatView.send()
+        // 用户现象：点发送后 App 直接退出。
+        //
+        // 根因（两行代码长得像，行为相反）：
+        //   suffix(keepMin) 在 core.count < keepMin 时**自动截断**，安全；
+        //   prefix(core.count - keepMin) 在同样情况下算出**负数**，
+        //   而 Collection.prefix(_:) 有前置条件 maxLength >= 0，
+        //   负数 ⇒ Swift 运行时主动 trap ⇒ SIGTRAP（不是野指针，是断言）。
+        //
+        // 触发条件：消息条数 < 10 但 token 预算已超（少而大的消息，比如粘贴长文/大工具结果）。
+        //   此时 total > theBudget 走到这里，core.count=5 就 prefix(-5) 崩了。
+        // 复现率低但必崩，且属于「一点发送就退出」这种最伤用户的问题。
+        //
+        // 修法：把 keepMin 夹到 core.count 以内，保证 core.count - keepMin >= 0。
+        //   不用 max(0, ...) 只夹参数，是因为 keepMin 后面还要用于 suffix，
+        //   夹 keepMin 本身语义更清楚（「最多保留这么多」）。
+        var keepMin = min(10, core.count)
         var suffix = Array(core.suffix(keepMin))
         var prefix = Array(core.prefix(core.count - keepMin))
         var used = suffix.reduce(0) { $0 + Self.estimateTokens($1) }
         if used > theBudget, core.count > 4 {
-            keepMin = 4
+            // P77 配套：这里 core.count > 4 已经保证 4 不越界（4-4=0 非负），
+            // 仍显式夹一次，防止将来把 4 调大或把 >4 的守卫改掉时静默复活同一个 trap。
+            keepMin = min(4, core.count)
             suffix = Array(core.suffix(keepMin))
             prefix = Array(core.prefix(core.count - keepMin))
             used = suffix.reduce(0) { $0 + Self.estimateTokens($1) }
