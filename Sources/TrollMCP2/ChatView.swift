@@ -59,15 +59,21 @@ struct ChatView: View {
     @State private var selectedIds = Set<UUID>()
     @State private var showToast = false
     @State private var toastText = L10n.t("i18n_1197")
-    // v7.4.0-fix73d：悬浮滚动按钮状态（对齐 Minis：up 只在中间显示、down 非底部显示）
-    /// 2026-11-03 性能核心：滚动位置/内容高度/视口高度不再用 @State，改为独立 ObservableObject。
-    ///
-    /// 原因（用户反馈「一直停在聊天页看它干活，手机非常热、滑动卡」）：
-    /// ScrollGeometryBridge 是 UIKit KVO，滚动时**每一帧**都回调一次。
-    /// 写 @State 就等于每帧让 ChatView 的整个 body 重新求值——里面有
-    /// ChatListGrouping.group()、全部 MessageBubble、ContentBlocks.split，
-    /// 手指轻轻一滑就变成每帧一次全量重建 → 帧率崩、CPU 满载、手机发烫。
-    /// 现在只有 FloatingScrollButtons 这一个小组件订阅它，主 body 完全不读。
+    // 2026-11-05 fix-freeze-4：**必须**用 @StateObject。
+    //
+    // `@StateObject` 的语义 = 「本视图订阅该对象的 objectWillChange」，与 body 读不读它无关。
+    // 所以真正要修的不是"取消订阅"（取消后 fastScrolling 降级就永久失效了），
+    // 而是**让这个对象别乱发通知**。修法分三处，全部在外层对象上：
+    //
+    //   ① canScrollUp / canScrollDown 搬去独立的 ChatScrollFlags（只有那个 40pt 圆钮订阅）。
+    //      它们原本是本对象的 @Published，而流式输出时翻得极频繁
+    //      （变高→不在底→贴底→又在底→下一条又变高），几十次全量 body 重算。
+    //   ② offset / contentHeight / viewportHeight 早就是普通属性（上一轮改的），不发通知。
+    //   ③ objectWillChange 现在只剩 activity 的转发 —— 而 activity 只由**用户手指真的
+    //      拖拽/惯性滚动**触发（见 ScrollGeometryBridge.onUserScroll），每轮滚动翻转 2 次。
+    //
+    // 结果：滚动期间 body 重算次数从「每帧」降到「每轮 2 次」，而这两次正是
+    // 「正文降级为轻量 Text / 恢复 UITextView」所必需的。滚动性能优化保留，卡死根除。
     @StateObject private var scroll = ChatScrollState()
 
     var body: some View {
@@ -691,13 +697,21 @@ struct ChatView: View {
                     // offset 已按原 marker 语义转换（顶部=0，向下为负），下方显示矩阵判断无需改动。
                     ScrollGeometryBridge(
                         onOffset: { v in
-                            // 2026-11-05：改走 setOffset —— 内部同时刷新按钮显隐位 + 标记滚动中。
+                            // 2026-11-05：改走 setOffset —— 内部同时刷新按钮显隐位。
                             // offset 本身是普通属性，写它不再产生任何 SwiftUI 通知；
-                            // 只有 canScrollUp/Down 真翻转时才发一次。这是「滑动卡死」的根治点。
+                            // 只有 canScrollUp/Down 真翻转时才发一次。
+                            //
+                            // 2026-11-05 fix-freeze-2：setOffset 里**不再**调 noteScrolled。
+                            // 那一行会把「程序性贴底」误判成「用户在滚动」→ 全部气泡换控件
+                            // → 行高全变 → 又触发贴底 → 死循环。降级改由下面的 onUserScroll 触发。
                             scroll.setOffset(v)
                         },
                         onContentHeight: { scroll.setContentHeight($0) },
-                        onViewportHeight: { scroll.setViewportHeight($0) }
+                        onViewportHeight: { scroll.setViewportHeight($0) },
+                        // **仅用户手指拖拽/惯性滚动**才走这里（桥接层用
+                        // UIScrollView.isTracking/isDragging/isDecelerating 判定）。
+                        // 这是「滚动期间正文降级为轻量 Text」优化的唯一入口。
+                        onUserScroll: { scroll.noteUserScrolled() }
                     )
                     .frame(height: 0)
                     LazyVStack(spacing: 12) {
@@ -707,6 +721,10 @@ struct ChatView: View {
                             switch item {
                             case .msg(let msg):
                                 bubble(for: msg)
+                                // 2026-11-05：配合 MessageBubble: Equatable ——
+                                // 参数没变的行直接跳过整棵子树重算（见 MessageBubble 上方的说明）。
+                                // 没有 .equatable() 的话，== 实现了也不会被调用。
+                                .equatable()
                                 .id(msg.id)
                             case .tools(let msgs):
                                 // 2026-11-03 修「怎么滑都回不到最底部 / 上滑到底内容还在动」：
@@ -718,51 +736,24 @@ struct ChatView: View {
                                     .id(ChatListGrouping.Item.tools(msgs).id)
                             }
                         }
+                        // 2026-11-05 **关键修复（fix-freeze-1）**：把「思考中」面板抽成独立子视图。
+                        //
+                        // 原来这段直接内联在 ChatView.body 里，读的是 store.liveTrail /
+                        // store.statusText / store.requestRound —— 这三个都是 @Published，
+                        // AI 干活时每执行一步就写一次（工具开始/结束/换轮次）。
+                        //
+                        // 后果（用户实测：「发完我说的话就卡死了，屏幕点什么都没反应」）：
+                        // 每写一次 → ChatView.body 全量重算 → LazyVStack 里**所有**
+                        // MessageBubble 重新求值 → 每条消息的 ContentBlocks.split、
+                        // MarkdownBlocks.parse、coloredBody 正则全部重跑。
+                        // 用户那条指令粘了几千字（截图里可见），单次 parse 就要几毫秒，
+                        // 几十条消息叠加 = 主线程被占满 = 点哪都没反应。
+                        //
+                        // 抽成 ThinkingPanel 后，这些 @Published 只在**它自己**内部读，
+                        // 刷新范围收缩到这一小块，消息列表不再被牵连。
                         if store.isLoading {
-                        // v2.9.34：请求过程可视化（对齐老 MCP 的"正在思考"面板）
-                        // v2.9.127：改为实时执行轨迹（豆包工作任务/Codex 式步骤流）
-                        VStack(alignment: .trailing, spacing: 6) {
-                            HStack {
-                                Spacer()
-                                HStack(spacing: 8) {
-                                    ProgressView()
-                                        .scaleEffect(0.8)
-                                    Text(L10n.t("home_thinking"))
-                                        .font(.footnote.weight(.medium))
-                                }
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 8)
-                                // v3.1.66：tertiarySystemBackground 浅色模式≈白看不见，改 systemGray5
-                                .background(Color(.systemGray5).opacity(0.9))
-                                .cornerRadius(14)
-                                .padding(.trailing, 16)
-                            }
-                            if store.isLoading, !store.liveTrail.isEmpty {
-                                LiveTrailCard(steps: store.liveTrail)
-                                    .padding(.trailing, 16)
-                            }
-                            if let status = store.statusText {
-                                Text(status)
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .padding(.trailing, 16)
-                            }
-                            if store.requestRound > 0 {
-                                // v4.3.71：无轮次上限 (requestRounds==0) 只显示"第 N 轮"
-                                if store.requestRounds > 0 {
-                                    Text(L10n.t("ui_157", store.requestRound, store.requestRounds))
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                        .padding(.trailing, 16)
-                                } else {
-                                    Text(L10n.t("i18n_1036", store.requestRound))
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                        .padding(.trailing, 16)
-                                }
-                            }
+                            ThinkingPanel()
                         }
-                    }
                     }
                     // v3.4.0：去掉整行水平 padding —— AI 气泡改为真正占满左右屏边缘；
                     // 用户气泡的右留白由 MessageBubble 内部按 isUser 处理
@@ -1703,6 +1694,8 @@ struct ChatView: View {
                         // "unable to type-check in reasonable time"，
                         // 二是保证两处的回调/样式永远一致（以前是复制粘贴，容易改漏）
                         bubble(for: msg)
+                            // 2026-11-05：同主列表，参数没变就跳过重算
+                            .equatable()
                             .id(msg.id)
                     }
                 }
@@ -1724,25 +1717,104 @@ struct ChatView: View {
 /// 关键点：ChatView.body 本身**不读** scroll 的任何属性，否则滚动每一帧都会让
 /// 整个聊天体重新求值（含分组、全部气泡、正文分块），性能修复就白做了。
 /// 把订阅面收窄到这一颗 40pt 的圆钮，滚动开销从「整页」降到「两个小圆点」。
+/// 2026-11-05：请求进行中的「思考中 / 执行轨迹 / 轮次」面板（独立子视图）。
+///
+/// 为什么必须独立成 struct（不是因为好看，是因为不独立会冻死 UI）：
+///
+///   ConversationStore 里 liveTrail / statusText / requestRound / requestRounds
+///   四个都是 @Published，AI 干活时每个工具的开始与结束、每轮切换都会写一次。
+///   ChatView 上是 `@ObservedObject var store` —— 一旦这些东西被写在 ChatView.body
+///   （或它内联的任一闭包里）读取，每次写入都会让 **ChatView 的整个 body 重新求值**。
+///
+///   body 里有什么：LazyVStack + ForEach 全部消息 + 每条 MessageBubble +
+///   每条消息的 ContentBlocks.split / MarkdownBlocks.parse / coloredBody 正则。
+///   一个几十条的会话，一次重算就是几十毫秒；AI 干活时这种重算每秒来好几次，
+///   主线程被彻底占满 —— 用户看到的就是「发完消息就卡死，屏幕点什么都没反应」。
+///
+///   抽出来以后，这四个 @Published 只在本 struct 的 body 里被读，
+///   刷新范围收缩成这一小块（几十 pt 的卡片），消息列表完全不参与。
+struct ThinkingPanel: View {
+    @ObservedObject private var store = ConversationStore.shared
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 6) {
+            HStack {
+                Spacer()
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                    Text(L10n.t("home_thinking"))
+                        .font(.footnote.weight(.medium))
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                // v3.1.66：tertiarySystemBackground 浅色模式≈白看不见，改 systemGray5
+                .background(Color(.systemGray5).opacity(0.9))
+                .cornerRadius(14)
+                .padding(.trailing, 16)
+            }
+            if !store.liveTrail.isEmpty {
+                LiveTrailCard(steps: store.liveTrail)
+                    .padding(.trailing, 16)
+            }
+            if let status = store.statusText {
+                Text(status)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(.trailing, 16)
+            }
+            if store.requestRound > 0 {
+                // v4.3.71：无轮次上限 (requestRounds==0) 只显示"第 N 轮"
+                if store.requestRounds > 0 {
+                    Text(L10n.t("ui_157", store.requestRound, store.requestRounds))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .padding(.trailing, 16)
+                } else {
+                    Text(L10n.t("i18n_1036", store.requestRound))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .padding(.trailing, 16)
+                }
+            }
+        }
+    }
+}
+
 struct FloatingScrollButtons: View {
-    @ObservedObject var scroll: ChatScrollState
+    /// 2026-11-05 fix-freeze-3：按钮显隐位单独订阅。
+    ///
+    /// 它以前是 ChatScrollState 上的 @Published，而 ChatView 以 @StateObject 持有那个对象 →
+    /// 这两个布尔每翻一次就让 ChatView.body 全量重算。流式输出时它们翻得极频繁
+    /// （变高→不在底→贴底→又在底→下一条又变高），几十次全量重算把主线程吃满，
+    /// 表现就是「发完消息点哪都没反应」。拆成独立对象后只有这个 40pt 圆钮会重算。
+    ///
+    /// 注意这里**不再** `@ObservedObject var scroll` —— 按钮的显隐只由 flags 决定，
+    /// 多订阅一个 ChatScrollState 等于让每轮滚动的 activity 翻转也重建这个按钮，白费。
+    @ObservedObject var flags: ChatScrollFlags
     var onUp: () -> Void
     var onDown: () -> Void
+    /// 显式 init：调用处只需要传 scroll，flags 从 scroll 里取，避免漏传。
+    init(scroll: ChatScrollState, onUp: @escaping () -> Void, onDown: @escaping () -> Void) {
+        self.flags = scroll.flags
+        self.onUp = onUp
+        self.onDown = onDown
+    }
 
     var body: some View {
         VStack(spacing: 10) {
-            if scroll.canScrollUp && scroll.canScrollDown {
+            if flags.canScrollUp && flags.canScrollDown {
                 button("chevron.up", action: onUp)
             }
-            if scroll.canScrollDown {
+            if flags.canScrollDown {
                 button("chevron.down", action: onDown)
             }
         }
         .padding(.trailing, 12)
         .padding(.bottom, 14)
         // 按钮显隐不要动画：滚动中反复触发会额外增加布局开销
-        .animation(nil, value: scroll.canScrollUp)
-        .animation(nil, value: scroll.canScrollDown)
+        .animation(nil, value: flags.canScrollUp)
+        .animation(nil, value: flags.canScrollDown)
     }
 
     private func button(_ icon: String, action: @escaping () -> Void) -> some View {
@@ -2183,7 +2255,28 @@ private struct MessageTapModifier: ViewModifier {
     }
 }
 
-struct MessageBubble: View {
+/// 2026-11-05 **性能关键（fix-freeze-2）**：MessageBubble 改为 Equatable。
+///
+/// 为什么：`ChatView.body` 重算时，`ForEach` 里的每个 `MessageBubble` 都会被
+/// **重新构造并重新求值整个子树**——包括 ContentBlocks.split、MarkdownBlocks.parse、
+/// coloredBody 正则、SelectableText(UITextView) 的 updateUIView。
+/// 一个几十条的会话，一次 body 重算 = 几十份解析 + 几十次 UITextView 更新。
+///
+/// 而 AI 干活期间 `ConversationStore` 的 @Published 每秒会变好几次
+/// （liveTrail 每步、statusText 每句、requestRound 每轮），
+/// 于是这个「几十份解析」每秒跑好几遍 —— 主线程直接饱和，
+/// 用户感知就是「发完消息就卡死，点什么都没反应」。
+///
+/// 实现 Equatable 后，配合调用处的 `.equatable()`，
+/// SwiftUI 在参数相等时**跳过整棵子树的重算**。绝大多数历史消息的
+/// 参数完全不变（同一个 ChatMessage、同样的 fastScrolling / selectionMode），
+/// 于是只有正在流式增长的那一条会重算 —— 成本从 O(全部消息) 降到 O(1)。
+///
+/// 比对字段的原则：只比**影响渲染结果**的输入。
+/// 闭包（onCopy/onShare/onWithdraw/onOpenSubAgent）不比 —— 它们每个 body
+/// 都是新实例，比必不相等，会导致永远走不到快速路径。这些闭包捕获的
+/// 都是稳定的 msg.id 与 self 上的方法，语义上恒定。
+struct MessageBubble: View, Equatable {
     let message: ChatMessage
     // 2026-11-03：正在快速滚动 → 正文降级为轻量 Text（见 ChatScrollState.isScrollingFast 的注释）。
     // 由 ChatView 透传下来而不是让每个气泡各自订阅：气泡数量多，
@@ -2347,6 +2440,22 @@ struct MessageBubble: View {
         let id = message.id.uuidString
         if expandedToolIds.contains(id) { expandedToolIds.remove(id) }
         else { expandedToolIds.insert(id) }
+    }
+
+    /// 2026-11-05：Equatable —— 仅比较**影响渲染结果**的输入。
+    ///
+    /// 不比闭包：它们每次 body 都是新实例，比必不相等，加了等于白加。
+    /// 不比 @State：@State 是视图内部状态，不由外部参数决定，本来就不参与。
+    /// ChatMessage 本身是 Hashable（含 id/content/toolCalls/thinking/trail 等），
+    /// 内容增长、工具状态变化、轨迹落定都会让它不相等 —— 正是我们想要的粒度。
+    static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
+        lhs.message == rhs.message
+            && lhs.fastScrolling == rhs.fastScrolling
+            && lhs.selectionMode == rhs.selectionMode
+            && lhs.isSelected == rhs.isSelected
+            && lhs.isStreaming == rhs.isStreaming
+            && lhs.forceType == rhs.forceType
+            && lhs.thinkEnabled == rhs.thinkEnabled
     }
 
     private var isUser: Bool { message.role == "user" }

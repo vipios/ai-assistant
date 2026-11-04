@@ -31,6 +31,10 @@ import Combine
 ///   · `isScrollingFast` 保持独立对象 + 转发，道理同上（每轮滚动 2 次翻转）。
 ///
 /// 结果：滚动期间 ChatView.body 基本不重算，只有那个 40pt 圆钮会动。
+///
+/// ---
+/// 2026-11-05 再修（fix-freeze-2）：**「用户在滚」的判定从本类内部挪到桥接层**。
+/// 见 `setOffset` 上方的长篇说明 —— 本类不再具备把程序性滚动误判为用户滚动的能力。
 @MainActor
 final class ChatScrollState: ObservableObject {
     /// 滚动偏移（对齐原 marker 语义：顶部 = 0，向下滚为负）
@@ -41,10 +45,18 @@ final class ChatScrollState: ObservableObject {
     /// 视口高度。同上，普通属性。
     private(set) var viewportHeight: CGFloat = 0
 
-    /// 悬浮按钮显示位——**只有这两个**是 @Published。
-    /// 每轮滚动只在真正翻转时各赋值一次，不是每帧。
-    @Published private(set) var canScrollUp: Bool = false
-    @Published private(set) var canScrollDown: Bool = false
+    /// 悬浮按钮显示位——**只有这两个**是 @Published，但**不放在本类里**。
+    ///
+    /// 2026-11-05 fix-freeze-3：它们原本是本类的 `@Published`，而 ChatView 用
+    /// `@StateObject` 持有本类 → 这两个布尔翻转就会让 **ChatView.body 全量重算**。
+    /// 流式输出时内容一直在变高：内容变高 → canScrollDown 翻 true → 贴底 →
+    /// 又翻 false → 下一条 delta 再翻 true……每条增量触发 2 次全量 body 重算
+    /// （全量 = ChatListGrouping + 每条消息的 ContentBlocks.split / MarkdownBlocks.parse /
+    /// 正则着色），几十条消息的会话里主线程直接被吃满 —— 这就是「发完消息点哪都没反应」。
+    ///
+    /// 现在这两个值挪进独立对象 `flags`，只有 FloatingScrollButtons 订阅它，
+    /// ChatView 完全不感知按钮显隐的变化。
+    let flags = ChatScrollFlags()
 
     /// 滚动活动状态**必须独立成另一个对象**。
     ///
@@ -61,6 +73,9 @@ final class ChatScrollState: ObservableObject {
         // SwiftUI 的刷新链。noteScrolled 是从 KVO 回调进来的（本来就在主线程），
         // 但显式声明调度更安全——绝不能在后台线程触发 @Published 的 willChange，
         // 否则是 "Publishing changes from background threads is not allowed" 崩溃。
+        //
+        // 注意：**只转发 activity，不转发 flags**。字幕按钮显隐是纯本地的视觉状态，
+        // 让它牵动 ChatView 重算是纯亏（见上面 flags 的说明）。
         activityObserver = activity.objectWillChange
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -70,10 +85,28 @@ final class ChatScrollState: ObservableObject {
 
     // MARK: - 写入入口（由 ScrollGeometryBridge 的 KVO 调用，每帧一次，必须极轻）
 
+    /// 每帧写入滚动偏移。
+    ///
+    /// ⚠️ **不要在这里调 `activity.noteScrolled()`**（2026-11-05 fix-freeze-2）。
+    ///
+    /// 上一版就是在这一行调了 noteScrolled，导致「程序性贴底」被当成「用户正在滚动」：
+    ///   pinToBottom → setContentOffset → 本方法 → noteScrolled → isScrollingFast=true
+    ///   → 全部气泡从 UITextView 降级成 Text → 行高全变 → contentSize 变
+    ///   → 又触发 pinToBottom → ……（0.3 秒后降级恢复，高度再变一次，继续循环）
+    ///
+    /// 主线程被无限次「几十条消息重新布局 + UITextView 重建」占满，表现就是
+    /// 用户反馈的「发完消息就卡死、屏幕点什么都没反应、杀进程重进才看到回复」。
+    ///
+    /// 现在「用户在滚」只由 ScrollGeometryBridge 依据 UIScrollView.isTracking /
+    /// isDragging / isDecelerating 判定后调 `noteUserScrolled()` —— 程序性滚动永不触发降级。
     func setOffset(_ v: CGFloat) {
         offset = v
         refreshButtonFlags()
-        // 标记「正在滚动」→ 消息正文临时降级为轻量 Text，停手 0.3 秒后恢复。
+    }
+
+    /// **只有用户真的用手指拖拽或惯性滚动时**才调用（见 ScrollGeometryBridge.onUserScroll）。
+    /// 语义：正文临时降级为轻量 Text，停手 0.3 秒后恢复。
+    func noteUserScrolled() {
         activity.noteScrolled()
     }
 
@@ -89,12 +122,9 @@ final class ChatScrollState: ObservableObject {
         refreshButtonFlags()
     }
 
-    /// 只在值**真的翻转**时才赋给 @Published —— 这是「每帧不发通知」的保证。
+    /// 只在值**真的翻转**时才赋给 flags —— 这是「每帧不发通知」的保证。
     private func refreshButtonFlags() {
-        let up = computeCanScrollUp()
-        if up != canScrollUp { canScrollUp = up }
-        let down = computeCanScrollDown()
-        if down != canScrollDown { canScrollDown = down }
+        flags.update(up: computeCanScrollUp(), down: computeCanScrollDown())
     }
 
     // MARK: - 判定
@@ -156,6 +186,36 @@ final class ChatScrollState: ObservableObject {
     func releaseStick() {
         NotificationCenter.default.post(name: Notification.Name("TrollAgent.scroll.releaseStick"),
                                         object: nil)
+    }
+}
+
+/// 悬浮滚动按钮的显隐状态（2026-11-05 fix-freeze-3 从 ChatScrollState 里拆出来）。
+///
+/// 为什么必须拆：ChatView 用 `@StateObject private var scroll = ChatScrollState()` 持有外层对象，
+/// 而 `@StateObject` 的语义就是「本视图订阅该对象的 objectWillChange」——
+/// 只要 canScrollUp/Down 是外层对象的 `@Published`，它们每次翻转都会让
+/// **ChatView.body 全量重算**（ChatListGrouping + 所有 MessageBubble + markdown 解析）。
+///
+/// 而这两个布尔在流式输出时翻转极其频繁：
+///   内容变高 → 不在底部 → canScrollDown=true → 桥接层贴底 → 又在底部 → false → 下一条 delta 再 true
+/// 一条几十字的 AI 回复就能触发几十次全量重算，主线程被占满 → 点哪都没反应。
+///
+/// 拆成独立对象后，只有 FloatingScrollButtons（一个 40pt 圆钮）订阅它，
+/// 它怎么翻都牵不动消息列表。
+///
+/// 加 @MainActor：只被 ChatScrollState（@MainActor）和 SwiftUI body 写/读，
+/// 而 ChatScrollState 的写入入口来自 UIKit KVO 回调（主线程）。声明出来是让
+/// 编译器帮我们挡住「从后台线程写 @Published」这种崩溃（Publishing changes
+/// from background threads is not allowed）。
+@MainActor
+final class ChatScrollFlags: ObservableObject {
+    @Published private(set) var canScrollUp: Bool = false
+    @Published private(set) var canScrollDown: Bool = false
+
+    /// 只在真的翻转时才写 —— 相同值重复赋值也会发 objectWillChange。
+    func update(up: Bool, down: Bool) {
+        if up != canScrollUp { canScrollUp = up }
+        if down != canScrollDown { canScrollDown = down }
     }
 }
 
