@@ -401,28 +401,82 @@ extension ModelConfig {
 
     static let authMethods = ["Bearer", "API Key", "Body api_key", "Body token", "Query token", "None"]
 
-    static let providerPresets: [(name: String, provider: String, protocol: String, baseURL: String, model: String, auth: String)] = [
-        ("OpenAI", "openai", "OpenAI Chat Completions", "https://api.openai.com/v1", "gpt-4o-mini", "Bearer"),
-        ("DeepSeek", "deepseek", "OpenAI Chat Completions", "https://api.deepseek.com", "deepseek-chat", "Bearer"),
-        ("Anthropic", "anthropic", "Anthropic Messages", "https://api.anthropic.com/v1", "claude-3-5-sonnet-20240620", "API Key"),
+    /// 2026-11-05 **快速配置项改成结构体（原来是不带标签的 6 元组）**。
+    ///
+    /// 起因：用户要在「供应商快速配置」里加自己的中转站，而且一条要带 **4 样东西**——
+    /// 名字、内网地址、备用域名、Key。原来的元组只有
+    /// `(name, provider, protocol, baseURL, model, auth)` 六项，
+    /// `backupBaseURL` 和 `apiKey` 根本无处安放，点一下只能填一半，
+    /// 用户还得自己回头补两栏，等于没做。
+    ///
+    /// 改成结构体后新增这两个字段，其余字段语义完全不变；
+    /// 老行的写法用 `p(...)` 简写保持原样，不引入无谓 diff。
+    struct ProviderPreset: Identifiable {
+        var name: String
+        var provider: String
+        var apiProtocol: String
+        var baseURL: String
+        var model: String
+        var auth: String
+        /// 备用接口（在外时用）。空串 = 这条预设不涉及双通道。
+        var backupBaseURL: String = ""
+        /// 一键带上的 Key。空串 = 需要用户自己填。
+        var apiKey: String = ""
+        var id: String { name }
+    }
+
+    /// 简写构造器：让原有 16 条预设保持「一行一条」的可读性。
+    private static func p(_ name: String, _ provider: String, _ proto: String,
+                          _ baseURL: String, _ model: String, _ auth: String,
+                          backup: String = "", key: String = "") -> ProviderPreset {
+        ProviderPreset(name: name, provider: provider, apiProtocol: proto,
+                       baseURL: baseURL, model: model, auth: auth,
+                       backupBaseURL: backup, apiKey: key)
+    }
+
+    /// 2026-11-05：家里那台中转站的内网地址。全项目只此一处定义，
+    /// 避免「改了预设忘了 RelayAdminView」。
+    static let relayHomeURL = "http://192.168.1.88:8080/v1"
+    /// 中转站公网域名（Cloudflare 隧道）。**必须复用 RouterControl.wanHost**，
+    /// 那是全项目唯一的域名来源；写死一份副本就等着哪天改域名漏掉这里。
+    static var relayAwayURL: String { "https://" + RouterControl.wanHost + "/v1" }
+
+    static var providerPresets: [ProviderPreset] {
+        [
+        // 2026-11-05 **用户自己的中转站，排第一位**。
+        //   点一下就把「内网地址 + 备用域名 + Key」三样一次填好，
+        //   在家自动走 192.168.1.88，出门自动走域名（判定见 BaseURLRouter）。
+        //   模型名故意留空 —— 用户明确说「剩下的我自己选择就行了」，
+        //   留空时模型选择器会去上游拉真实清单，比猜一个写死的名字稳。
+        p("中转站", "relay", "OpenAI Chat Completions",
+          relayHomeURL, "", "Bearer",
+          backup: relayAwayURL,
+          key: "sk-relay-c89baf204eab9fad9af69749"),
+        p("OpenAI", "openai", "OpenAI Chat Completions", "https://api.openai.com/v1", "gpt-4o-mini", "Bearer"),
+        p("DeepSeek", "deepseek", "OpenAI Chat Completions", "https://api.deepseek.com", "deepseek-chat", "Bearer"),
+        p("Anthropic", "anthropic", "Anthropic Messages", "https://api.anthropic.com/v1", "claude-3-5-sonnet-20240620", "API Key"),
         // 2026-11-02 按用户要求：移除 Botcf 预设项（作者自用中转站，与推荐横幅一并删除）
         // v4.4.17：扩充主流 OpenAI 兼容预设 (GLM/Kimi/Qwen/MiniMax/阶跃/豆包)。模型名可在模型管理页改。
-        ("智谱GLM", "zhipu", "OpenAI Chat Completions", "https://open.bigmodel.cn/api/paas/v4", "glm-4.5", "Bearer"),
-        ("Kimi(Moonshot)", "moonshot", "OpenAI Chat Completions", "https://api.moonshot.cn/v1", "kimi-k3", "Bearer"),
-        ("通义千问(Qwen)", "qwen", "OpenAI Chat Completions", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen3.8-max", "Bearer"),
-        ("MiniMax", "minimax", "OpenAI Chat Completions", "https://api.minimax.chat/v1", "MiniMax-Text-01", "Bearer"),
-        ("阶跃星辰(Step)", "step", "OpenAI Chat Completions", "https://api.stepfun.com/v1", "step-2-mini", "Bearer"),
-        ("豆包(火山)", "doubao", "OpenAI Chat Completions", "https://ark.cn-beijing.volces.com/api/v3", "doubao-pro-32k", "Bearer"),
+        p("智谱GLM", "zhipu", "OpenAI Chat Completions", "https://open.bigmodel.cn/api/paas/v4", "glm-4.5", "Bearer"),
+        p("Kimi(Moonshot)", "moonshot", "OpenAI Chat Completions", "https://api.moonshot.cn/v1", "kimi-k3", "Bearer"),
+        p("通义千问(Qwen)", "qwen", "OpenAI Chat Completions", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen3.8-max", "Bearer"),
+        p("MiniMax", "minimax", "OpenAI Chat Completions", "https://api.minimax.chat/v1", "MiniMax-Text-01", "Bearer"),
+        p("阶跃星辰(Step)", "step", "OpenAI Chat Completions", "https://api.stepfun.com/v1", "step-2-mini", "Bearer"),
+        p("豆包(火山)", "doubao", "OpenAI Chat Completions", "https://ark.cn-beijing.volces.com/api/v3", "doubao-pro-32k", "Bearer"),
         // v7.1.109-peers：协议面扩充预设——OpenRouter / xAI / Groq / Mistral / Ollama / Azure / Gemini
         // (OpenAI 兼容的配 Chat Completions 即用；Gemini 原生协议走 generateContent)
-        ("OpenRouter", "openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "deepseek/deepseek-chat", "Bearer"),
-        ("xAI", "xai", "OpenAI Chat Completions", "https://api.x.ai/v1", "grok-4", "Bearer"),
-        ("Groq", "groq", "OpenAI Chat Completions", "https://api.groq.com/openai/v1", "llama-4-70b", "Bearer"),
-        ("Mistral", "mistral", "OpenAI Chat Completions", "https://api.mistral.ai/v1", "mistral-large-latest", "Bearer"),
-        ("Ollama(本地)", "ollama", "OpenAI Chat Completions", "http://127.0.0.1:11434/v1", "llama3", "None"),
-        ("Azure OpenAI", "azure", "OpenAI Chat Completions", "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT", "gpt-4o", "API Key"),
-        ("Gemini", "google", "Gemini", "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-pro", "Query key")
-    ]
+        p("OpenRouter", "openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "deepseek/deepseek-chat", "Bearer"),
+        p("xAI", "xai", "OpenAI Chat Completions", "https://api.x.ai/v1", "grok-4", "Bearer"),
+        p("Groq", "groq", "OpenAI Chat Completions", "https://api.groq.com/openai/v1", "llama-4-70b", "Bearer"),
+        p("Mistral", "mistral", "OpenAI Chat Completions", "https://api.mistral.ai/v1", "mistral-large-latest", "Bearer"),
+        p("Ollama(本地)", "ollama", "OpenAI Chat Completions", "http://127.0.0.1:11434/v1", "llama3", "None"),
+        p("Azure OpenAI", "azure", "OpenAI Chat Completions", "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT", "gpt-4o", "API Key"),
+        p("Gemini", "google", "Gemini", "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-pro", "Query key")
+        ]
+    }
+
+    /// 中转站的显示名（列表标题、供应商行都用它）
+    static let relayDisplayName = "中转站"
 
     /// 2026-11-03：provider 内部代号 → 用户看得懂的供应商名。
     ///
@@ -449,6 +503,7 @@ extension ModelConfig {
         case "ollama":      return "Ollama (本地)"
         case "azure":       return "Azure OpenAI"
         case "google":      return "Gemini"
+        case "relay":       return "中转站"
         case "custom":      return "自定义接口"
         default:
             let p = provider.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -636,6 +691,15 @@ extension ModelConfig {
         let p = provider.lowercased()
         // 显式选的自定义端点尊重用户, 不自动纠正
         if current == "Custom Endpoint" { return current }
+        // 2026-11-05 **家中的中转站必须先拦在前面**。
+        //
+        // 它是 OpenAI 兼容的聚合中转，模型清单里什么都有（deepseek / gpt-5 / claude 都可能出现）。
+        // 而下面的自动纠正是按**模型名**猜协议的：
+        //   · 用户选中转站里的 claude 模型 → 被纠成 Anthropic Messages
+        //   · 选中转站里的 gpt-5 模型   → 被纠成 OpenAI Responses
+        // 中转站只有 /v1/chat/completions 一个口子，纠过去必然 404/400。
+        // 所以供应商是 relay 时钉死 Chat Completions，不让后面的规则改写。
+        if p == "relay" || p.contains("中转") { return "OpenAI Chat Completions" }
         // Anthropic 模型
         if p.contains("anthropic") || m.hasPrefix("claude") || m.contains("claude") { return "Anthropic Messages" }
         // Gemini 模型（原生 generateContent 协议）

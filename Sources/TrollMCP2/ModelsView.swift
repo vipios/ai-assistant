@@ -541,11 +541,15 @@ struct ModelEditorView: View {
         let p = ModelConfig.providerPresets.first
         _name = State(initialValue: config?.name ?? (p?.name ?? ""))
         _provider = State(initialValue: config?.provider ?? (p?.provider ?? "custom"))
-        _apiProtocol = State(initialValue: config?.apiProtocol ?? (p?.protocol ?? "OpenAI Chat Completions"))
+        // 2026-11-05：元组换结构体后字段名是 apiProtocol（原来叫 protocol）。
+        _apiProtocol = State(initialValue: config?.apiProtocol ?? (p?.apiProtocol ?? "OpenAI Chat Completions"))
         _baseURL = State(initialValue: config?.baseURL ?? (p?.baseURL ?? ""))
-        _backupBaseURL = State(initialValue: config?.backupBaseURL ?? "")
+        // 2026-11-05：预设第一条现在是「中转站」，它自带备用域名和 Key。
+        // 新建配置时一并带上 —— 用户点「新建」就直接是一条能干活的配置，
+        // 不用回头再手抄一遍域名和 sk-xxx。
+        _backupBaseURL = State(initialValue: config?.backupBaseURL ?? (p?.backupBaseURL ?? ""))
         _backupModel = State(initialValue: config?.backupModel ?? "")
-        _apiKey = State(initialValue: config?.apiKey ?? "")
+        _apiKey = State(initialValue: config?.apiKey ?? (p?.apiKey ?? ""))
         _model = State(initialValue: config?.model ?? (p?.model ?? ""))
         _authMethod = State(initialValue: config?.authMethod ?? (p?.auth ?? "Bearer"))
         _isDefault = State(initialValue: config?.isDefault ?? false)
@@ -967,25 +971,36 @@ struct ModelEditorView: View {
 
     // MARK: - 操作
 
+    /// 2026-11-05：原来这两个函数只填 6 个字段（name/provider/协议/地址/模型/鉴权），
+    /// 备用接口和 Key 一概不碰 —— 于是「中转站」这种一条就带全的预设，
+    /// 用户点完还得自己回头补两栏。现在统一走 `apply(_:)`，一次填满。
     private func applyPreset(at index: Int) {
         let p = ModelConfig.providerPresets[min(index, ModelConfig.providerPresets.count - 1)]
-        name = p.name
-        provider = p.provider
-        apiProtocol = p.protocol
-        baseURL = p.baseURL
-        model = p.model
-        authMethod = p.auth
+        apply(p)
     }
 
     private func applyPreset(name presetName: String) {
         if let p = ModelConfig.providerPresets.first(where: { $0.name == presetName }) {
-            name = p.name
-            provider = p.provider
-            apiProtocol = p.protocol
-            baseURL = p.baseURL
-            model = p.model
-            authMethod = p.auth
+            apply(p)
         }
+    }
+
+    /// 唯一填充入口 —— 新增字段只改这里，不会再出现「漏填一栏」。
+    private func apply(_ p: ModelConfig.ProviderPreset) {
+        name = p.name
+        provider = p.provider
+        apiProtocol = p.apiProtocol
+        baseURL = p.baseURL
+        model = p.model
+        authMethod = p.auth
+        // 备用接口：预设带值就覆盖（「中转站」带的是公网域名）；
+        // 不带值的预设（其它 16 条）保持用户已填的内容不动 ——
+        // 否则从「中转站」切到「OpenAI」会把用户的备用地址悄悄清掉。
+        let backup = p.backupBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !backup.isEmpty { backupBaseURL = backup }
+        // Key 同理：只有预设明确带了才写，不拿空串冲掉用户已填的 Key。
+        let key = p.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty { apiKey = key }
     }
 
     private func makeConfig() -> ModelConfig {
@@ -1222,7 +1237,7 @@ struct QuickConfigPicker: View {
 
     var body: some View {
         CompatNav {
-            List(ModelConfig.providerPresets, id: \.name) { preset in
+            List(ModelConfig.providerPresets) { preset in
                 Button(action: {
                     onSelect(preset.name)
                     presentationMode.wrappedValue.dismiss()
@@ -1230,19 +1245,35 @@ struct QuickConfigPicker: View {
                     HStack(spacing: 12) {
                         ZStack {
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(Color.blue)
+                                // 2026-11-05：「中转站」用自己的图标和色，一眼能从一堆预设里认出来。
+                                .fill(preset.provider == "relay" ? Color.green : Color.blue)
                                 .frame(width: 34, height: 34)
-                            Image(systemName: "sparkles")
+                            Image(systemName: preset.provider == "relay" ? "house.fill" : "sparkles")
                                 .font(.system(size: 17, weight: .semibold))
                                 .foregroundColor(.white)
                         }
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(preset.name)
-                                .font(.body)
-                            Text("\(preset.protocol) · \(preset.baseURL)")
+                            HStack(spacing: 6) {
+                                Text(preset.name)
+                                    .font(.body)
+                                // 带 Key 的预设标一颗钥匙，让用户知道「点一下不用再填 Key」
+                                if !preset.apiKey.isEmpty {
+                                    Image(systemName: "key.fill")
+                                        .font(.caption2)
+                                        .foregroundColor(.green)
+                                }
+                            }
+                            Text("\(preset.apiProtocol) · \(preset.baseURL)")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                                 .lineLimit(1)
+                            // 有备用接口的（目前只有中转站）多给一行，说明出门会自动换地址
+                            if !preset.backupBaseURL.isEmpty {
+                                Text("备用 \(preset.backupBaseURL)")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
                         }
                         Spacer()
                     }
