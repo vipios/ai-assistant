@@ -82,21 +82,22 @@ final class AppInstallTool: MCPTool {
         //   TrollStore 源码里 apple-magnifier://install?url= 走的是 URLSession 下载，只认 http(s)；
         //   给 file:// 会直接报 "unsupported URL"。trollstore:// 这个 scheme 它更是没注册。
         //   本地包唯一有效的入口就是「文件 URL 本身」——TrollStore 的 isFileURL 分支。
+        //
+        // 2026-11-05 再改（用户明确要求「删除跳转、添加共享」）：
+        //   `UIApplication.shared.open(file://)` 在本机必然失败 —— 它走 Launch Services 的
+        //   UTI 匹配，而侧载环境下没有 App 认领 .ipa/.tipa 的 open 请求。
+        //   与其在这里死等 5 秒再返回一句「TrollStore launch failed」，
+        //   不如直接弹分享菜单：面板里 TrollStore 会作为接收者出现（走分享扩展机制，
+        //   和失败的 open() 完全不是同一套），用户点一下就能装，而且**不会把 App 甩到后台**。
+        //   这也正是用户要的「添加共享」。
         let url = URL(fileURLWithPath: path)
-        var ok = false
-        let sem = DispatchSemaphore(value: 0)
+        guard FileManager.default.fileExists(atPath: path) else {
+            return (false, "file not found: \(path)")
+        }
         DispatchQueue.main.async {
-            UIApplication.shared.open(url, options: [:]) { done in
-                ok = done
-                sem.signal()
-            }
+            SharePresenter.present([url])
         }
-        _ = sem.wait(timeout: .now() + 5)
-        if ok {
-            AppCatalog.invalidateCache()   // v2.9.135: 安装后失效应用缓存
-            return (true, "TrollStore install prompted for \(path), confirm in the TrollStore popup")
-        }
-        return (false, "TrollStore launch failed (TrollStore not installed?)")
+        return (true, "shared install package \(path) — pick TrollStore in the share menu to finish installing")
     }
 }
 

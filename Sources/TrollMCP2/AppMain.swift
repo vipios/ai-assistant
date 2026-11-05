@@ -107,25 +107,58 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
         // v7.0.4.5: 自举 root helper 开 JIT（照抄 TrollStore RootHelper/jit.m——PT_ATTACHEXC+100ms+PT_DETACH）。
         // jit_helper 是独立 root 进程（spawnRoot persona uid 0），外部 attach 主进程 = 有效（区别于 self-attach）。
-        // v7.0.4.7 起：无论 helper rc 都无条件调 TrollStore URL 兜底（v7.0.4.5 实测 rc=0 但 JIT 未生效→SIGBUS；
-        //   URL 是 v7.0.3 验证的可靠路径）。注意：v7.0.4.5 及更早版本是"rc=0 免 URL 零闪切"——
-        //   老 tipa 在可靠设备（如 kfd 可用的 iOS 16.x）上不闪切即由此而来。
+        //
+        // 2026-11-05 **用户报「为什么还是跳转，我不是让你删除跳转、添加共享」的真正元凶就在下面这段**。
+        //
+        // 查证过程（别再走弯路）：
+        //   · 更新下载流程本身**早就改好了** —— `UpdateManager.processDownloaded`
+        //     只调 `SharePresenter.present([staged])` 弹自建分享菜单，
+        //     仓库里再也搜不到 `open(file://)` 和 `apple-magnifier://install`。
+        //   · 但用户还是在跳。原因是**启动路径**上还留着一条无条件跳转：
+        //     原来这里写着「无论 helper rc 都无条件调 TrollStore URL」——
+        //     于是每次冷启动都会 open `apple-magnifier://enable-jit`，
+        //     把用户直接甩到 TrollStore（他手机上是巨魔R），App 被切到后台。
+        //     这跟「下载完跳安装」是两件独立的事，只改更新流程当然没用。
+        //
+        // 现在的策略：**默认不跳**。
+        //   · 先自己用 jit_helper 开（进程内完成，不离开本 App）
+        //   · helper 真的失败了，才允许那条 URL 兜底一次 —— 而且必须是
+        //     用户没关掉它（"trollagent.jit_url_fallback" 开关，默认关）
+        //   · 无论哪条路，都**绝不再"无条件"跳**：跳转是被用户明确反感的行为，
+        //     不该是默认动作。
+        //   JIT 只影响部分高级能力，不该拿"一启动就闪一下巨魔R"当代价去换。
         let pidStr = String(ProcessInfo.processInfo.processIdentifier)
+        // 2026-11-05：默认 false = 不跳。老用户如果确实需要 JIT 兜底，
+        // 可以自己去 UserDefaults 打开（设置页暂无入口，避免又变成默认行为）。
+        let allowURLFallback = UserDefaults.standard.bool(forKey: "trollagent.jit_url_fallback")
         if let helperPath = Bundle.main.url(forResource: "jit_helper", withExtension: nil, subdirectory: "bin")?.path {
             logJIT("[JIT] helperPath=\(helperPath) pid=\(pidStr)\n")
             let spawnResult = InjectionManager.shared.spawnRootDetailed(helperPath, args: [pidStr], timeout: 10)
             logJIT("[JIT] jit_helper rc=\(spawnResult.code) timedOut=\(spawnResult.timedOut) signaled=\(spawnResult.signaled) stderr=\(spawnResult.stderr.prefix(200))\n")
             if spawnResult.code == 0 {
-                ("[appmain] JIT helper rc=0; still scheduling URL as double-insurance (rc=0 ≠ kernel released JIT, proven by v7.0.4.5 SIGBUS)\n" as NSString).utf8String.map { fputs($0, stderr) }
+                // helper 成功 → 到此为止，一次都不跳。
+                // （v7.0.4.7 当初"rc=0 也照跳"是怕 JIT 没真开，但那个代价是每次启动都把
+                //   用户甩到别的 App 去。现在改为尊重 helper 的结果：真出问题再谈兜底。）
+                ("[appmain] JIT helper rc=0; no URL fallback (never jump unless explicitly enabled)\n" as NSString).utf8String.map { fputs($0, stderr) }
+                logJIT("[JIT] helper ok, skip URL fallback\n")
             } else {
-                ("[appmain] jit_helper rc=\(spawnResult.code) — falling back to TrollStore URL\n" as NSString).utf8String.map { fputs($0, stderr) }
+                ("[appmain] jit_helper rc=\(spawnResult.code)\n" as NSString).utf8String.map { fputs($0, stderr) }
+                if allowURLFallback {
+                    logJIT("[JIT] helper failed, URL fallback ENABLED by user pref → will open once\n")
+                    scheduleTrollStoreJITURL()
+                } else {
+                    logJIT("[JIT] helper failed, URL fallback disabled (default) → staying in app\n")
+                }
             }
-            // v7.0.4.7: 无论 helper rc 都无条件调 URL（v7.0.4.5 实测 rc=0 但 JIT 未生效 → SIGBUS；URL 是 v7.0.3 验证的可靠路径）
-            scheduleTrollStoreJITURL()
         } else {
             logJIT("[JIT] WARN jit_helper not found in bundle\n")
-            fputs("[appmain] WARN: jit_helper not found in bundle — falling back to TrollStore URL\n", stderr)
-            scheduleTrollStoreJITURL()
+            fputs("[appmain] WARN: jit_helper not found in bundle\n", stderr)
+            if allowURLFallback {
+                logJIT("[JIT] helper missing, URL fallback ENABLED by user pref → will open once\n")
+                scheduleTrollStoreJITURL()
+            } else {
+                logJIT("[JIT] helper missing, URL fallback disabled (default) → staying in app\n")
+            }
         }
 
         CrashCatcher.install()  // v2.9.145c：最先注册崩溃捕获，闪退自动落盘 crash/ 可查
