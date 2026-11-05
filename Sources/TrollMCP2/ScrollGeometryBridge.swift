@@ -126,7 +126,25 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                 attachAttempts += 1
                 attach(to: findScrollView())
             }
+            // 2026-11-05 fix-blank：**挂上之后立刻补一次贴底**。
+            //
+            // 时序问题：ChatView 的 onAppear 早于本视图 attach 到 UIScrollView
+            // （didMoveToWindow/layoutSubviews 要等 SwiftUI 真正把内容树挂进宿主）。
+            // 所以 onAppear 发出的 stickToBottom 通知经常**没人接**——那时 stickObserver
+            // 还没注册（它在 attach 里才装）。结果就是：打开会话 → 吸附请求石沉大海
+            // → 停在 offset 0（顶部）或停在某个未渲染位置 → 用户看到空白/位置不对。
+            //
+            // 这里在首次 attach 成功后主动补一次分步贴底，把「通知早于监听」这个窗口关掉。
+            // 用 contentSize > 0 作为「真有内容可贴」的判据：内容还没布局出来时
+            // 不置位，留给后续 layoutSubviews 再试（置位太早会永远错过这一轮）。
+            if !didInitialPin, window != nil, let sv = scrollView, sv.contentSize.height > 0 {
+                didInitialPin = true
+                pinToBottom(sv)
+            }
         }
+
+        /// 是否已在 attach 后补过首次贴底（避免每帧 layoutSubviews 都重来）
+        private var didInitialPin = false
 
         /// 从自身沿 superview 链向上找最近的 UIScrollView（SwiftUI ScrollView 底层即 UIScrollView）
         private func findScrollView() -> UIScrollView? {
@@ -176,7 +194,14 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                 } else {
                     // 静止状态下的 offset 变化 = 代码设的（贴底吸附 / scrollTo）。
                     // 不触发降级，只顺手校正一次吸附判定，保证「程序性滚到底后继续跟随」。
-                    self.stickToBottom = self.isAtBottom(sv)
+                    //
+                    // 2026-11-05 fix-blank **关键**：分步贴合进行到一半时，offset 停在
+                    // 「还没到底」的位置，如果这里照常把 stickToBottom 改写成 isAtBottom
+                    // （= false），后面几步会被自己的闸门拦掉，永远贴不到底 —— 又变成
+                    // 打开会话停在半路。所以分步期间跳过这个改写。
+                    if !self.pinning {
+                        self.stickToBottom = self.isAtBottom(sv)
+                    }
                 }
             }
 
@@ -225,10 +250,9 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                 guard let self = self, let sv = self.scrollView else { return }
                 self.stickToBottom = true
                 // 立刻钉一次，不用等 contentSize 下一次变化。
-                let maxOffset = sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom
-                if maxOffset > 0 {
-                    sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: maxOffset), animated: false)
-                }
+                // 2026-11-05 fix-blank：改走 pinToBottom（分步靠近）—— 这里原来是
+                // 一次性 setContentOffset 到底，正是「打开会话整屏空白」的来源。
+                self.pinToBottom(sv)
             }
             // 2026-11-05：解除吸附（点 ↑ 回顶部）。只翻转状态，不动 offset ——
             // offset 由调用方的 proxy.scrollTo 负责，这里插手会互相打断。
@@ -254,6 +278,21 @@ struct ScrollGeometryBridge: UIViewRepresentable {
 
         /// 无动画钉到底部。用 setContentOffset(animated: false) 而不是 UIView.animate，
         /// 避免与用户手势、与 SwiftUI 自身布局动画互相插值 —— 那正是「跳」的来源。
+        ///
+        /// 2026-11-05 **再修（fix-blank）——修「打开会话偶尔整屏空白，往上滑几下才出内容」**。
+        ///
+        /// 病根不是「没滚到底」，而是**一步跳太远**：
+        /// `LazyVStack` 只渲染「当前可见范围 + 预取范围」的 cell，可见范围由
+        /// SwiftUI 的布局系统在每一帧里按 contentOffset 反推。用 setContentOffset
+        /// 一次性从 0 跳到几千 pt 的底部时，这一帧里可见范围还没重算完，
+        /// 目标区域一个 cell 都还没创建 → 视口落在空白上 → 用户看到整屏空白。
+        /// 只要手指一动，SwiftUI 重新计算可见范围、把 cell 建出来，内容就"突然"出现
+        /// —— 这正是用户描述的「往上滑动几下就出来了内容」。
+        ///
+        /// 修法：**分步靠近**。每帧只走剩余距离的一部分（最少 3 步），
+        /// 每一步之间隔一个 runloop，SwiftUI 有完整一帧去更新可见范围并创建新 cell。
+        /// 因为每一步的目标都在"已经渲染出来的区域附近"，所以任何一帧都不会落在空白上。
+        /// 视觉上就是「一进会话就停在最新消息处」，不会有跳或空白。
         private func pinToBottom(_ sv: UIScrollView) {
             // 三重闸门，任一不满足立刻返回（这是保证不出现自激循环的关键）：
             //   1) 不是吸附态（用户明确在看历史）→ 不动
@@ -264,16 +303,41 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             guard maxOffset > 0 else { return }
             guard abs(sv.contentOffset.y - maxOffset) > 0.5 else { return }   // 已到底，不重复设
             pinning = true
+            stepTowardBottom(sv, remaining: 3)
+        }
+
+        /// 分步靠近底部：每步走剩余距离的 1/remaining，最后一步精确落位。
+        ///
+        /// 为什么不能一步到位 —— 见 pinToBottom 里 fix-blank 的说明。
+        /// 步数固定 3 是权衡：再多会让「打开会话」有可见的逐格移动感，
+        /// 再少则 LazyVStack 来不及在两帧内建完全部需要的 cell。
+        private func stepTowardBottom(_ sv: UIScrollView, remaining: Int) {
             // 不能在最内层 KVO 回调里同步改 offset（UIKit 不允许在观察回调中改自身状态，
-            // 且会递归触发自身 KVO）。丢到下一个 runloop。
+            // 且会递归触发自身 KVO）。丢到下一个 runloop —— 这一步同时也是
+            // 「给 SwiftUI 一帧去更新可见范围」的保证。
             DispatchQueue.main.async { [weak self, weak sv] in
                 guard let self = self else { return }
-                self.pinning = false
-                guard let sv = sv, self.stickToBottom, !self.userIsScrolling(sv) else { return }
+                guard let sv = sv, self.stickToBottom, !self.userIsScrolling(sv) else {
+                    self.pinning = false
+                    return
+                }
+                // 目标要重新算：这一帧里 LazyVStack 可能又建出了几个 cell，
+                // contentSize 已经变大，用上一帧的旧目标会「差一点到底」。
                 let m = sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom
-                guard m > 0 else { return }
-                guard abs(sv.contentOffset.y - m) > 0.5 else { return }
-                sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: m), animated: false)
+                guard m > 0 else {
+                    self.pinning = false
+                    return
+                }
+                let cur = sv.contentOffset.y
+                let dest = remaining <= 1 ? m : cur + (m - cur) / CGFloat(remaining)
+                if abs(dest - cur) > 0.5 {
+                    sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: dest), animated: false)
+                }
+                if remaining > 1 && abs(m - dest) > 0.5 {
+                    self.stepTowardBottom(sv, remaining: remaining - 1)
+                } else {
+                    self.pinning = false
+                }
             }
         }
 
@@ -292,6 +356,11 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             decelObs = nil
             scrollView = nil
             pinning = false
+            // 2026-11-05 fix-blank：切会话/离屏后要允许新一轮补贴底，
+            // 否则新会话 attach 上来时 didInitialPin 还是 true → 不再补 → 又停在空白/顶部。
+            didInitialPin = false
+            // stickToBottom 同理复位：新会话默认就该停在最新消息处。
+            stickToBottom = true
         }
 
         deinit { detach() }

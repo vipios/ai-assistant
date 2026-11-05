@@ -227,9 +227,15 @@ final class ChatScrollFlags: ObservableObject {
 /// 一个几百条的会话里同时存在几十个，用户快速上滑时这些 cell 疯进疯出，
 /// 主线程被重建任务占满，表现就是反馈里的「快速上滑翻看聊天记录时界面卡死」。
 ///
-/// 解法：滚动期间把正文降级为轻量 Text（纯 SwiftUI，无 UIKit 控件开销），
-/// 停手 0.3 秒后再换回 UITextView。用户滑动时不会去长按选字，
+/// 解法：滚动期间降低正文开销，停手 0.3 秒后恢复。用户滑动时不会去长按选字，
 /// 所以这个降级对功能零影响，但能削掉滚动期绝大部分重建成本。
+///
+/// ⚠️ **2026-11-05 fix-jump：降级方式已经改了，别再改回「换控件」。**
+/// 原做法是把正文换成 SwiftUI 的 `Text`，停手再换回 `SelectableText`。
+/// 两者是两套排版引擎（CoreText vs TextKit），换行点/行高有零点几点的差，
+/// 换完 contentSize 突变 → LazyVStack 重排 → 用户看到「每滑一次、停一下就跳一下」。
+/// 现在改成**控件不变，只把 UITextView 的 isSelectable 关掉**：度量完全一致，
+/// 高度一个点都不变，跳动从根上不存在。省下的开销还是同一块（选择系统挂载）。
 final class ChatScrollActivity: ObservableObject {
     @Published var isScrollingFast: Bool = false
 

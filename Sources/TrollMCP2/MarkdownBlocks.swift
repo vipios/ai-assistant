@@ -457,14 +457,26 @@ struct MarkdownBlocksView: View {
     var copyAllTitle: String = ""
     /// 点「复制全文」回调（由 ChatView 写剪贴板）
     var onCopyAll: (() -> Void)? = nil
-    /// 2026-11-03：正在快速滚动 → 正文降级为轻量 Text。
+    /// 2026-11-03：正在快速滚动 → 正文降级。
     ///
-    /// 为什么：正文用 SelectableText(UITextView) 才有长按划词和「复制全文」，
+    /// 为什么需要：正文用 SelectableText(UITextView) 才有长按划词和「复制全文」，
     /// 但 UITextView 是重量级控件。用户快速上滑时 LazyVStack 不断回收/新建 cell，
     /// 每个新建都要走文本布局 + intrinsicContentSize + 文本选择系统挂载，
     /// 几十个同时来就把主线程占满 —— 表现就是「快速上滑翻看聊天记录时界面卡死」。
-    /// 滚动期间换成 Text（纯 SwiftUI，无 UIKit 控件开销），停手后自动换回。
-    /// 用户滑动时不会去长按选字，所以这个降级对功能没有影响。
+    ///
+    /// 2026-11-05 **改实现（fix-jump）**：降级方式从「换成 Text 控件」改成
+    /// 「还是这个 UITextView，只把 isSelectable 关掉」。
+    ///
+    /// 老做法为什么会「每滑一次、停一下就跳一下」：
+    /// 停手 0.3 秒后本参数翻回 false，整屏气泡一起从 `Text` 换回 `SelectableText`。
+    /// 两者是两套排版引擎（CoreText vs TextKit），换行点/行高本来就有零点几点的差，
+    /// 换完 contentSize 突变 → LazyVStack 重排 → 用户眼中就是「跳一下」。
+    /// 而且这个参数每轮滚动都翻两次，所以是「每次滑动都跳一次」。
+    ///
+    /// 新做法把引擎和字体完全保持不动，只摘掉 UITextInteraction（选择系统）——
+    /// 测量结果必然一致，高度一个点都不会变，跳动从根上不存在。
+    /// 省的开销还是同一块（UITextView 重建最贵的就是选择系统挂载），
+    /// 且用户滚动时不会去长按选字，功能零损失。
     var fastScrolling: Bool = false
     /// v7.2.2：资料折叠条展开态（"已参考 N 篇资料"点击展开来源列表）
     @State private var sourcesExpanded = false
@@ -532,15 +544,19 @@ struct MarkdownBlocksView: View {
                         // 2026-11-02：正文改用 UITextView（SelectableText）——长按系统菜单里
                         // 多一项「复制全文」，同时保留拖手柄划词与「拷贝」部分文字。
                         // 仍走 coloredBody 保持 **加粗** / `代码` 橙色高亮样式。
-                        // 2026-11-03：快速滚动时降级为 Text —— UITextView 重建太重，
+                        // 2026-11-03：快速滚动时降级 —— UITextView 重建太重，
                         // 几十个同时重建会卡死主线程（用户反馈「快速上滑界面卡死」）。
-                        if let nsBody = nsBody, !fastScrolling {
+                        // 2026-11-05 fix-jump：降级方式改为「同一控件关掉选择」，
+                        // 不再在 Text / UITextView 之间来回换 —— 换控件必然改行高，
+                        // 那就是「每次滑完停一下就跳一下」。详见 fastScrolling 的说明。
+                        if let nsBody = nsBody {
                             SelectableText(
                                 attributed: nsBody(cleanBody),
                                 textColor: .label,
                                 fontSize: 17,
                                 copyAllTitle: copyAllTitle.isEmpty ? nil : copyAllTitle,
-                                onCopyAll: onCopyAll
+                                onCopyAll: onCopyAll,
+                                isSelectable: !fastScrolling
                             )
                         } else {
                             Text(coloredBody(cleanBody))

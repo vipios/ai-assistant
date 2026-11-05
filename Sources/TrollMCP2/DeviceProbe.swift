@@ -1,6 +1,8 @@
 ﻿import Foundation
 import UIKit
 import Security
+// 2026-11-05：越狱判定要用 _dyld_image_count / _dyld_get_image_name 扫已加载镜像
+import MachO
 
 // MARK: - 设备环境自检 ("检测手机"核心层）
 
@@ -146,7 +148,7 @@ final class DeviceProbe: ObservableObject {
         // 一个 bundleId，Lite 机器上一辈子绿不了 —— 明明 helper 就在那儿（实测可执行），
         // 界面却报"静默安装助手缺失"。改成：系统位 → 越狱部署位 → 前缀匹配所有 trollstore* App。
         let helperPath = "/var/usr/bin/trollstorehelper"
-        var helperOK = FileManager.default.isExecutableFile(atPath: helperPath)
+        var helperOK = isUsableBinary(helperPath)
         var helperDetail = helperOK ? L10n.t("i18n_1222") : L10n.t("i18n_1223")
         if !helperOK {
             var candidates: [String] = []
@@ -162,10 +164,14 @@ final class DeviceProbe: ObservableObject {
                 candidates.append(app.path + "/TrollStore.app/trollstorehelper")
                 candidates.append((app.path as NSString).deletingLastPathComponent + "/trollstorehelper")
             }
-            if let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            // 2026-11-05：判定统一走 isUsableBinary（不用 isExecutableFile）。
+            // 这条是**顺带加固**：真正让 helper 报红的是权限被删后读不到 /var/jb
+            // （见 entitlements 里 P76-b 回滚说明），不是这里。
+            // 但 isExecutableFile 只看"当前沙盒准不准 exec"，一旦权限再变，就会
+            // 把「helper 明明在那儿」判成缺失，并给出"重装 TrollStore"这种无效建议。
+            if candidates.contains(where: { isUsableBinary($0) }) {
                 helperOK = true
                 helperDetail = L10n.t("i18n_1222")
-                _ = found
             }
         }
         checks.append(Check(label: L10n.t("i18n_1221"), passed: helperOK,
@@ -177,10 +183,34 @@ final class DeviceProbe: ObservableObject {
         // 老代码判成"未识别"。改用三路任一命中：/var/jb、/var/jb/Applications、
         // 以及 AppCatalog 里带 .jbroot- 的 App 路径（rootless 虚拟根标记，一定读得到）。
         let appsNow = AppCatalog.list()
+        // 2026-11-05：再补两条**不依赖 App 枚举**的越狱判据。
+        //
+        // 用户实测 iOS 17.0.2（Dopamine rootless）上「环境类型」显示"未识别"：
+        // 前三条 /var/jb 系列在无 no-sandbox 的 App 里读不到（沙盒直接 EPERM），
+        // 而 AppCatalog 若是空的（枚举失败/被过滤光了）第四路也一起失效。
+        // 越狱环境有两个沙盒进程也能感知的特征：
+        //   · dyld 注入链上挂着 jailbreak 的注入库（Dopamine 是 libhooker/TweakInject）；
+        //   · 自己的可执行路径里带 .jbroot-（rootless 虚拟根），从 Bundle 自身取，一定读得到。
+        let selfPath = Bundle.main.bundlePath
+        let dyldImageCount = _dyld_image_count()
+        var dyldHasJB = false
+        for i in 0..<dyldImageCount {
+            guard let name = _dyld_get_image_name(i) else { continue }
+            let s = String(cString: name)
+            if s.contains("/var/jb/") || s.contains(".jbroot-")
+                || s.lowercased().contains("libhooker")
+                || s.lowercased().contains("tweakinject")
+                || s.lowercased().contains("substrate") {
+                dyldHasJB = true
+                break
+            }
+        }
         let jailbroken = FileManager.default.fileExists(atPath: "/var/jb")
             || FileManager.default.fileExists(atPath: "/var/jb/Applications")
             || FileManager.default.fileExists(atPath: "/private/preboot/jb")
             || appsNow.contains(where: { $0.path.contains(".jbroot-") })
+            || selfPath.contains(".jbroot-")
+            || dyldHasJB
         let envType: String
         if jailbroken { envType = L10n.t("i18n_1226") }
         else if trollStore { envType = L10n.t("i18n_1225") }
@@ -381,18 +411,60 @@ final class DeviceProbe: ObservableObject {
         let names = ["ldid", "optool", "insert_dylib", "ct_bypass"]
         var result: [String: Bool] = [:]
         for name in names {
-            // 2026-11-05：包内 bin 优先；找不到再退到越狱系统位（/var/jb/usr/bin）。
-            // 实机（iOS 17.0.2 越狱 + TrollStore Lite）核对过：包内 bin/ldid、optool、
-            // insert_dylib、ct_bypass 全部存在且可执行，老代码却报"缺失"。
-            // 原因是只查了 Bundle.main.bundleURL/bin 一个位置，且没有任何兜底。
-            // 现在多探几个位置，任一处可执行就算通过 —— 检查结果要反映"能不能用"，
-            // 而不是"我当时猜的那个路径是否存在"。
+            // 2026-11-05（用户实测 1.0.29「注入工具链」四项全红）——**判定标准换了**。
+            //
+            // ⚠️ 先说真根因，别被这里的改动误导：那四项全红是**权限被删**导致的
+            // （Support/TrollAgent.entitlements 里的 no-sandbox / no-container /
+            // container-required 被 P76-b 实验删掉 → App 关进普通沙盒 → 读不到 /var/jb
+            // → 沙盒 exec 策略让 access(X_OK) 对包内 bin 也返回失败）。已回滚权限。
+            //
+            // 这里的改动是**第二层保险**，不是根因修复：
+            // 沙盒恢复正常时旧判据（access(X_OK)）本来也能通过；但一旦权限再被误改、
+            // 或换到别的签名方式，access 就会再次把「文件明明在、实际也能 spawn」判成缺失，
+            // 而界面只能给出一个误导性的「缺失：ldid, optool…（重装包恢复）」，
+            // 让用户白重装一遍包。所以判据改成三层，任一成立即通过：
+            //   ① 存在 + 可执行位（posixPermissions & 0o111）—— 只读属性，不受 exec 策略影响；
+            //   ② 存在 + FileManager.isExecutableFile（Apple 自己的判定）；
+            //   ③ 存在 + 是 Mach-O（读前 4 字节 magic）—— 退一步只求"文件真在这儿"。
+            // 真正能不能跑，交给执行时的 posix_spawn 给结论。
             let candidates = [InjectionManager.shared.binaryPath(name),
                               "/var/jb/usr/bin/" + name,
                               "/usr/bin/" + name].compactMap { $0 }
-            result[name] = candidates.contains { access($0, X_OK) == 0 }
+            result[name] = candidates.contains { isUsableBinary($0) }
         }
         return result
+    }
+
+    /// 判断一个路径上的文件「能不能当注入工具用」。
+    ///
+    /// 不用 `access(X_OK)`：它把「文件存在」和「当前沙盒允许 exec」两件事混在一起，
+    /// 权限配置稍有变化就会把能用的工具判成缺失，而界面文案只会说"缺失，重装包恢复"——
+    /// 那个提示是错的，重装也解决不了。这里只看文件本身。
+    private func isUsableBinary(_ path: String) -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else { return false }
+        // ① 可执行位
+        if let attrs = try? fm.attributesOfItem(atPath: path),
+           let mode = attrs[.posixPermissions] as? Int,
+           (mode & 0o111) != 0 {
+            return true
+        }
+        // ② Apple 的可执行判定
+        if fm.isExecutableFile(atPath: path) { return true }
+        // ③ 至少得是个 Mach-O（防止把同名空文件/占位文件当工具）
+        guard let fh = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? fh.close() }
+        // read(upToCount:) 而非已弃用的 readData(ofLength:)——与项目内其它读取保持一致。
+        // 注意它返回 Data?（文件尾返回 nil），外面套 try? 得到 Data??，所以要双层解包。
+        guard let maybe = try? fh.read(upToCount: 4),
+              let data = maybe, data.count == 4 else { return false }
+        // 逐字节拼 big-endian 值——不能用 withUnsafeBytes + load(as: UInt32.self)：
+        // Data 的底层缓冲不保证 4 字节对齐，load 未对齐地址是 UB（真机上可能直接崩）。
+        let magic = data.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        // 0xfeedface / 0xfeedfacf（thin，大小端）· 0xcafebabe / 0xbebafeca（FAT）
+        return magic == 0xfeedface || magic == 0xfeedfacf
+            || magic == 0xcefaedfe || magic == 0xcffaedfe
+            || magic == 0xcafebabe || magic == 0xbebafeca
     }
 
     // MARK: v2.9.67 增强设备信息辅助方法

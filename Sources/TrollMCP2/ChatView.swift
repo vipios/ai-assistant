@@ -832,14 +832,12 @@ struct ChatView: View {
                 }
             }
             // v2.9.12：打开/切换会话时自动滚到底（老会话不再停在顶部）
-            // 2026-11-05：先让桥接层恢复吸附（用户切进来必须看到最新消息），再滚一次。
-            // 这里的 scrollTo 是低频（一次进入/一次切换），不会抖。
+            // 2026-11-05 fix-blank：吸附请求与分步落位都收进 scrollToBottom 了，
+            // 这里不再重复 requestStickToBottom（重复发只会多排一次分步贴合，白做功）。
             .onAppear {
-                scroll.requestStickToBottom()
                 scrollToBottom(proxy)
             }
             .onChange(of: store.selectedId) { _ in
-                scroll.requestStickToBottom()
                 scrollToBottom(proxy)
             }
             // v2.9.72：AI 回复完成时结束工作流
@@ -894,21 +892,35 @@ struct ChatView: View {
 
     /// v2.9.12：滚到当前会话最新一条
     ///
-    /// 2026-11-05：**不再包 withAnimation**，也不再只滚一次。
-    /// LazyVStack 高度是估算的，单次 scrollTo 经常「差一点到底」——差的那一点
-    /// 会在下一批 cell 渲染时被补上，视觉上就是轻微一顿。这里补一次延迟重试，
-    /// 且两次都是无动画定位，避免 spring 插值与桥接层的吸附互相打架。
+    /// 2026-11-05 fix-blank **重写**——修「打开会话偶尔整屏空白，往上滑几下才出内容」。
+    ///
+    /// 老实现是一次（加一次 0.08s 兜底）`proxy.scrollTo(last.id, anchor: .bottom)`。
+    /// 这个调用有两个问题，正好凑成空白：
+    ///   1) `LazyVStack` 里 `last.id` 对应的 cell 在 `onAppear` 那一刻**还没被创建**
+    ///      （懒栈只建可见范围附近的），`scrollTo` 一个不存在的锚点会静默失败；
+    ///   2) 即使找到了，它也是「按当前估算高度一步跳到底」——和桥接层一次性
+    ///      setContentOffset 是同一个毛病：跳过去那帧可见范围还没重算，视口落在
+    ///      未渲染区域 = 整屏空白，手指一动才补出来。
+    ///
+    /// 现在只做两件事，顺序很关键：
+    ///   · 先用 `scrollTo` 把「最后一条」拉进渲染范围 —— 目的是**逼 LazyVStack 立刻
+    ///     创建末尾的 cell**，而不是精确落位（锚点用 .bottom，让末尾尽量靠下，
+    ///     与「停在最新消息处」一致，避免先跳到别处再回来）；
+    ///   · 再通知桥接层恢复吸附，由它分步靠近真正底部，每步给 SwiftUI 一帧去建 cell。
+    ///
+    /// 为什么必须有第一步：只靠 setContentOffset 时 SwiftUI 是按可见范围被动建 cell 的，
+    /// 第一步一旦落到空白区就可能一直不建；scrollTo 是唯一能主动"告诉" LazyVStack
+    /// 「现在需要这几条」的手段。
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        DispatchQueue.main.async {
-            if let last = store.currentMessages.last {
-                proxy.scrollTo(last.id, anchor: .bottom)
-            }
-        }
-        // 第二次兜底：等本轮布局稳定后再钉一次（无动画）。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-            if let last = store.currentMessages.last {
-                proxy.scrollTo(last.id, anchor: .bottom)
-            }
+        guard let last = store.currentMessages.last else { return }
+        proxy.scrollTo(last.id, anchor: .bottom)
+        // 落位交给桥接层分步完成（无动画、不与手势打架、不会落到未渲染区）。
+        scroll.requestStickToBottom()
+        // 兜底：内容多时第一次 scrollTo 可能因锚点尚未创建而落空，下一帧再要一次。
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let last = self.store.currentMessages.last else { return }
+            proxy.scrollTo(last.id, anchor: .bottom)
+            self.scroll.requestStickToBottom()
         }
     }
 
@@ -2466,6 +2478,11 @@ struct MessageBubble: View, Equatable {
     /// 不比 @State：@State 是视图内部状态，不由外部参数决定，本来就不参与。
     /// ChatMessage 本身是 Hashable（含 id/content/toolCalls/thinking/trail 等），
     /// 内容增长、工具状态变化、轨迹落定都会让它不相等 —— 正是我们想要的粒度。
+    ///
+    /// `fastScrolling` **必须**留在比较里（2026-11-05 fix-jump 后依然如此）：
+    /// 它现在控制的是 UITextView 的 `isSelectable`，翻转时必须让
+    /// `updateUIView` 跑一次把选择能力还回去/摘下来。去掉它 → 停手后永远选不了字。
+    /// 注意它**不再影响控件类型和行高**（老实现会换 Text，那才是跳动的来源）。
     static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
         lhs.message == rhs.message
             && lhs.fastScrolling == rhs.fastScrolling
@@ -2620,8 +2637,10 @@ struct MessageBubble: View, Equatable {
         if isUser {
             // 2026-11-02：用户消息也换成 UITextView（SelectableText）——长按系统菜单里多一项
             // 「复制全文」，同时保留拖手柄划词。打字机阶段仍用轻量 Text 避免高频刷新闪跳。
-            // 2026-11-03：快速滚动期间也降级为 Text（fastScrolling）——见下方 assistant 分支注释。
-            if isStreaming || (forceType && !Self.doneTyping(for: message.id)) || fastScrolling {
+            // 2026-11-03：快速滚动期间也降级（fastScrolling）——见下方 assistant 分支注释。
+            // 2026-11-05 fix-jump：降级**不再换控件**，只在同一个 UITextView 上关掉选择。
+            // 换控件会改行高 → 每轮滚动停手时整屏跳一次，这是用户实测的「每滑一次跳一下」。
+            if isStreaming || (forceType && !Self.doneTyping(for: message.id)) {
                 Text(AttributedString(shown))
                     .font(.body)
                     .textSelection(.enabled)
@@ -2637,7 +2656,8 @@ struct MessageBubble: View, Equatable {
                     textColor: .white,
                     fontSize: 17,
                     copyAllTitle: L10n.t("i18n_1530"),
-                    onCopyAll: { onCopy?() }
+                    onCopyAll: { onCopy?() },
+                    isSelectable: !fastScrolling
                 )
             }
         } else {

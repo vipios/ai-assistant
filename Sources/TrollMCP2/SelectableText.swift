@@ -19,6 +19,19 @@ struct SelectableText: UIViewRepresentable {
     var copyAllTitle: String? = nil
     /// 点自定义菜单项的回调
     var onCopyAll: (() -> Void)? = nil
+    /// 2026-11-05 fix-jump：是否允许划词选择。**这是「滚动降级」的新落点**。
+    ///
+    /// 老做法（fastScrolling）是在滚动期间把正文整个换成 SwiftUI 的 `Text`，
+    /// 停手 0.3 秒再换回本控件。后果是每停一次滑，整屏气泡一起换控件：
+    ///   · `Text` 走 SwiftUI/CoreText 排版，UITextView 走 TextKit，
+    ///     两者换行点与行高本来就不完全一致（中文混排、行内代码等更明显）；
+    ///   · 换完 contentSize 突变 → LazyVStack 重新排布 → 用户看到「每滑一次停一下就跳一下」。
+    ///
+    /// 现在改成**不换控件、只关掉选择**：控件类型/字体/宽度全不变，
+    /// 度量必然一致，高度一个点都不会变，所以绝不可能再跳。
+    /// 省下的开销是 UITextInteraction（长按放大镜、拖动手柄、选择菜单）不挂载 ——
+    /// 这正是 UITextView 重建里最重的那一块，且滚动时用户不会去选字，功能零损失。
+    var isSelectable: Bool = true
 
     /// 菜单注入统一由 CopyableUITextView 自己处理（editMenu(for:suggestedActions:) / UIMenuController），
     /// Coordinator 只保留配置转发的职责，避免两处都注册造成菜单项重复。
@@ -40,7 +53,7 @@ struct SelectableText: UIViewRepresentable {
         let tv = CopyableUITextView()
         tv.isEditable = false
         tv.isScrollEnabled = false
-        tv.isSelectable = true
+        tv.isSelectable = isSelectable
         tv.backgroundColor = .clear
         tv.textColor = textColor
         tv.font = .systemFont(ofSize: fontSize)
@@ -59,8 +72,16 @@ struct SelectableText: UIViewRepresentable {
         context.coordinator.onCopyAll = onCopyAll
         tv.copyAllTitle = copyAllTitle ?? ""
         tv.onCopyAll = onCopyAll
-        tv.textColor = textColor
-        tv.font = .systemFont(ofSize: fontSize)
+        // 2026-11-05 fix-jump：这三项都只在**真的变了**的时候才写。
+        // 同值重复赋值本身不改排版，但每次 updateUIView 都写一遍 font/textColor 会让
+        // UITextView 走一次 setNeedsLayout，滚动期间高频调用时纯属浪费。
+        if tv.textColor != textColor { tv.textColor = textColor }
+        let newFont = UIFont.systemFont(ofSize: fontSize)
+        if tv.font != newFont { tv.font = newFont }
+        // 只改 isSelectable，不动 attributedText —— 文字内容才是影响排版的量。
+        if tv.isSelectable != isSelectable {
+            tv.isSelectable = isSelectable
+        }
         // 用 string 比较而不是 attributedText 比较：UITextView 会内部规范化 attributedText，
         // 拿它跟传进来的对象做 == 常永远为 false（或永远为 true），会导致文字该更新时不更新。
         if tv.text != attributed.string || tv.attributedText.length != attributed.length {
