@@ -472,14 +472,51 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -uo pipefail
           VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Support/Info.plist 2>/dev/null || echo "unknown")
           echo "version=$VER"
-          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
-          # v6.6.0: 移除 busybox-elf/elf-runner 资产（CELF/静态翻译路线退役——统一环境=Asbestos+Alpine）
-          gh release create latest TrollAgent.tipa \
+
+          # 2026-11-05 **修「构建成功但 release 还是旧包」静默失败**。
+          #
+          # 用户实测：1.0.42 之后构建一直 success，但 release 里的 TrollAgent.tipa
+          # 时间戳和大小都停在 15:20 —— 新包根本没发上去。
+          #
+          # 根因就是原来这两行：
+          #   gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          #   gh release create latest TrollAgent.tipa ... || { echo ...; exit 0; }
+          # 两个 `||` 把失败全吞了：delete 没删掉、create 因 tag 已存在而失败，
+          # 结果步骤照样绿，用户拿到的是旧包，而且**没有任何迹象**。
+          #
+          # 现在的做法：
+          #   ① 先删（把 stderr 留出来，不再 2>/dev/null），删不掉不当作没事；
+          #   ② 用 --clobber 语义：create 失败就转到 upload --clobber，
+          #      确保「资产一定被新包覆盖」；
+          #   ③ 最后**校验大小**：拿不到新包就红，绝不再假装成功。
+          echo "=== delete old release (if any) ==="
+          gh release delete latest --yes --cleanup-tag || echo "(nothing to delete)"
+
+          echo "=== create release ==="
+          if gh release create latest TrollAgent.tipa \
               --title "TrollAgent latest (v${VER})" \
-              --notes "滚动构建（main 分支最新）。供 App 内多源自动更新使用：GitHub 被墙时经镜像前缀或 Releases 直链下载。下载地址：https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/TrollAgent.tipa" || \
-              { echo "RELEASE PUBLISH FAILED (non-fatal)"; exit 0; }
+              --notes "滚动构建（main 分支最新）。供 App 内多源自动更新使用：GitHub 被墙时经镜像前缀或 Releases 直链下载。下载地址：https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/TrollAgent.tipa"
+          then
+            echo "release created"
+          else
+            echo "create failed — falling back to upload --clobber"
+            gh release create latest --title "TrollAgent latest (v${VER})" \
+                --notes "滚动构建（main 分支最新）。" || true
+            gh release upload latest TrollAgent.tipa --clobber
+          fi
+
+          echo "=== verify uploaded asset ==="
+          LOCAL_SIZE=$(wc -c < TrollAgent.tipa | tr -d ' ')
+          REMOTE_SIZE=$(gh release view latest --json assets --jq '.assets[] | select(.name=="TrollAgent.tipa") | .size')
+          echo "local=$LOCAL_SIZE remote=$REMOTE_SIZE"
+          if [ "$LOCAL_SIZE" != "$REMOTE_SIZE" ]; then
+            echo "::error::release asset size mismatch (local=$LOCAL_SIZE remote=$REMOTE_SIZE) — new build NOT published"
+            exit 1
+          fi
+          echo "published OK: v${VER} ${LOCAL_SIZE} bytes"
 
   # v4.4.3：原生 ARM64 Python（iOS 版 CPython，PEP 730 官方构建脚本）。
   # 目的：pandas/numpy 在 iSH 模拟器里 import 必段错误闪退（崩溃栈 cpu_run_to_interrupt，
