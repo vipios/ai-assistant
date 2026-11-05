@@ -1,6 +1,12 @@
 // PluginStoreView.swift — v1.0.32 插件市场界面
 //
-// 三个屏：发现（分类筛选 + 搜索）、已安装（开关启停）、详情（装前看清它加什么）。
+// 两个屏：发现（内置能力包 + 4687 条外部插件，混在一起都可装）、已安装。
+//
+// 2026-11-05 用户要求：「把外部目录去掉，把这些插件都放在发现里面，
+// 就和我刚才给你发的 ipa 一样的，直接就能安装使用」。
+// 所以原来那个单独的「外部目录」页签已经删掉了，4687 条并进发现页，
+// 每条点进去都能装 —— 装的是它对应的能力包（CapabilityPacks），工具真能跑。
+//
 // 刻意做成原生 SwiftUI 而不是套 WebView——插件市场的价值在「装完真能用」，
 // 界面稳不稳定反而更重要。
 
@@ -11,31 +17,30 @@ struct PluginStoreView: View {
     // v1.0.35：授权确认门总开关
     @ObservedObject private var gate = ConfirmGate.shared
 
-    @State private var tab = 1                 // 0 = 已安装, 1 = 发现, 2 = 外部目录
+    @State private var tab = 1                 // 0 = 已安装, 1 = 发现
     @State private var query = ""
     @State private var category: PluginCategory? = nil
     @State private var detail: PluginManifest? = nil
     @State private var alertItem: PluginAlert? = nil
-    /// 2026-11-05：外部参考目录（竞品 12 类 / 4687 条）——
-    /// 这些是 Node 插件，本机装不了，只能「照着做一个」。所以单独一屏，别和可安装的混在一起。
-    @State private var refsVersion = 0
-    @State private var refDetail: RefPlugin? = nil
+    /// 2026-11-05：外部插件详情（并入发现页后仍然单独一个 sheet，
+    /// 因为它讲的是「这条外部插件会给你什么能力」，和内置包详情不完全一样）
+    @State private var extDetail: ExternalPlugin? = nil
+    /// 发现页是否把外部那 4687 条也列出来。
+    /// 默认列（用户要求「都放在发现里面」），但给一个开关能一键只看内置的 17 个，
+    /// 免得每次都要在 4704 条里翻。
+    @State private var includeExternal = true
 
     /// 同一个视图只能挂一个 .alert——安装确认与卸载确认合并成同一入口
     enum PluginAlert: Identifiable {
         case install(PluginManifest)
         case uninstall(PluginManifest)
+        case installExternal(ExternalPlugin)
 
         var id: String {
             switch self {
             case .install(let m): return "install-" + m.id
             case .uninstall(let m): return "uninstall-" + m.id
-            }
-        }
-
-        var manifest: PluginManifest {
-            switch self {
-            case .install(let m), .uninstall(let m): return m
+            case .installExternal(let e): return "installext-" + e.id
             }
         }
     }
@@ -51,7 +56,6 @@ struct PluginStoreView: View {
                 if tab != 0 { chips }
                 switch tab {
                 case 0: installedList
-                case 2: referenceList
                 default: discoverList
                 }
                 aiControlRow
@@ -72,13 +76,14 @@ struct PluginStoreView: View {
                 onToggle: { on in store.setEnabled(m, on) }
             )
         }
-        // 2026-11-05：外部目录详情——只展示，不提供「安装」，提供「让 AI 照做一个」
-        .sheet(item: $refDetail) { r in
-            RefPluginSheet(ref: r, categoryName: RefCategory.name(r.category))
-        }
-        .onAppear {
-            // 懒加载：只在真正打开市场时才解析那份 1.5MB 的 JSON
-            PluginCatalogRef.loadIfNeeded { refsVersion += 1 }
+        // 2026-11-05：外部插件详情——现在**可以装**了（装的是它对应的能力包）
+        .sheet(item: $extDetail) { e in
+            ExternalPluginSheet(
+                ext: e,
+                pack: CapabilityPacks.pack(e.capKey),
+                installed: store.isExternalMarkedInstalled(e),
+                onInstall: { alertItem = .installExternal(e); extDetail = nil }
+            )
         }
         .alert(item: $alertItem) { item in
             switch item {
@@ -94,6 +99,18 @@ struct PluginStoreView: View {
                     title: Text(L10n.t("i18n_1577") + " " + m.name),
                     message: Text(L10n.t("i18n_1592", m.tools.count, m.skills.count)),
                     primaryButton: .destructive(Text(L10n.t("i18n_1577"))) { store.uninstall(m) },
+                    secondaryButton: .cancel(Text(L10n.t("i18n_1591"))))
+            case .installExternal(let e):
+                // 关键：要说清楚「装它实际给你哪些工具」，不能只说一句"安装"
+                let pack = CapabilityPacks.pack(e.capKey)
+                let n = pack?.tools.count ?? 0
+                let names = pack?.tools.prefix(3).map { $0.name.components(separatedBy: "_").last ?? "" }.joined(separator: "、") ?? ""
+                return Alert(
+                    title: Text(e.name),
+                    message: Text("会用「\(pack?.name ?? "通用小工具")」的 \(n) 个工具来干这件事"
+                                  + (names.isEmpty ? "" : "（\(names)…）")
+                                  + "\n\n这个能力包装过一次就够了，同类的其他插件不用再装。"),
+                    primaryButton: .default(Text(L10n.t("i18n_1574"))) { store.installExternal(e) },
                     secondaryButton: .cancel(Text(L10n.t("i18n_1591"))))
             }
         }
@@ -171,12 +188,10 @@ struct PluginStoreView: View {
             if tab == 0 {
                 Text(L10n.t("i18n_1593", store.installedManifests.count,
                             store.installedToolCount, store.installedSkillCount))
-            } else if tab == 2 {
-                // 外部目录页单独一句：这一页 4687 条一条都装不上，副标题必须说清楚，
-                // 否则跟「发现」页一样写"共 N 个插件"，用户点进去找不到安装按钮会以为坏了。
-                Text(L10n.t("i18n_1634", PluginCategory.allCases.count, PluginCatalogRef.totalCount))
             } else {
-                Text(L10n.t("i18n_1594", PluginCategory.allCases.count, store.catalog.count))
+                // 2026-11-05：外部那 4687 条并进来了，这里的数字要含它们，
+                // 否则用户搜到一个显示不出的东西会以为坏了。
+                Text("共 \(totalDiscoverCount) 个可安装能力 · \(PluginCategory.allCases.count) 类")
             }
             Spacer()
             if let e = store.lastError {
@@ -190,12 +205,15 @@ struct PluginStoreView: View {
         .padding(.bottom, 12)
     }
 
+    /// 发现页总条数（内置 + 外部）
+    private var totalDiscoverCount: Int {
+        store.catalog.count + (includeExternal ? ExternalCatalog.all.count : 0)
+    }
+
     private var segmented: some View {
         HStack(spacing: 0) {
             segmentButton(0, L10n.t("i18n_1571"))
             segmentButton(1, L10n.t("i18n_1572"))
-            // 2026-11-05：第三页是外部参考目录（竞品那 12 类），只能查不能直接装
-            segmentButton(2, L10n.t("i18n_1624"))
         }
         .padding(2)
         .background(RoundedRectangle(cornerRadius: 9).fill(Color(.secondarySystemFill)))
@@ -249,10 +267,9 @@ struct PluginStoreView: View {
     private var chips: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 7) {
-                // 2026-11-05：两个页签的分类计数口径不同——
-                // 发现页算「能装的」，外部目录页算「能参考的」，混用会让数字对不上。
-                let total = tab == 2 ? PluginCatalogRef.totalCount : store.catalog.count
-                chipItem(nil, L10n.t("i18n_1585"), total)
+                // 2026-11-05：外部 4687 条并进来了，计数必须一起算上，
+                // 否则「工具」chip 显示 8 个、列表里却有 1200 个，自相矛盾。
+                chipItem(nil, L10n.t("i18n_1585"), totalDiscoverCount)
                 ForEach(PluginCategory.allCases) { c in
                     chipItem(c, c.shortName, count(in: c))
                 }
@@ -260,8 +277,6 @@ struct PluginStoreView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 10)
         }
-        // refsVersion 变了说明外部目录解析完了 → 强制刷新一次计数
-        .id(refsVersion)
     }
 
     private func chipItem(_ c: PluginCategory?, _ title: String, _ n: Int) -> some View {
@@ -289,9 +304,11 @@ struct PluginStoreView: View {
     }
 
     private func count(in c: PluginCategory) -> Int {
-        // 外部目录页用另一套计数（那边 4687 条，不分流会让「工具」显示成 8 个，明显不对）
-        if tab == 2 { return PluginCatalogRef.count(in: c) }
-        return store.catalog.filter { $0.category == c }.count
+        // 2026-11-05：外部并进来后计数要合并（内置 + 外部同分类）。
+        // 之前外部单独一屏时是分开算的，合并后必须一起算，否则数字对不上列表。
+        let builtin = store.catalog.filter { $0.category == c }.count
+        guard includeExternal else { return builtin }
+        return builtin + ExternalCatalog.count(in: c)
     }
 
     // MARK: 列表
@@ -316,9 +333,26 @@ struct PluginStoreView: View {
         }
     }
 
+    /// 外部插件的筛选结果。
+    ///
+    /// 只渲染前 120 条：4687 条全铺进 LazyVStack 会让滚动明显掉帧，
+    /// 而且用户真实使用是「搜」而不是「翻到第 3000 条」。
+    /// 限制条数时给一句提示，别让人以为只有这么多。
+    private var filteredExternal: [ExternalPlugin] {
+        guard includeExternal else { return [] }
+        return ExternalCatalog.search(query, category: category)
+    }
+
+    /// 外部列表一次最多渲染多少条
+    private let externalRenderLimit = 120
+
     private var discoverList: some View {
-        LazyVStack(spacing: 8) {
-            if filtered.isEmpty {
+        // 内置的永远全显示（只有 17 个），外部的最多 120 条
+        let ext = filteredExternal
+        let extShown = Array(ext.prefix(externalRenderLimit))
+        return LazyVStack(spacing: 8) {
+            // ---- 内置能力包 ----
+            if filtered.isEmpty && extShown.isEmpty {
                 emptyState
             } else {
                 ForEach(filtered) { m in
@@ -345,57 +379,63 @@ struct PluginStoreView: View {
                             .padding(.trailing, 13)
                         }
                 }
+
+                // ---- 外部插件（2026-11-05 并入，每条都可装）----
+                if !extShown.isEmpty {
+                    HStack(spacing: 6) {
+                        Text("更多能力")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.secondary)
+                        Text("\(ext.count)")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Capsule().fill(Color(.tertiarySystemFill)))
+                        Spacer()
+                        // 一键只留内置的：4704 条里翻太累，给个收窄开关
+                        Button {
+                            withAnimation(.easeOut(duration: 0.15)) { includeExternal = false }
+                        } label: {
+                            Text("只看内置")
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.accentColor)
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.top, 12)
+                    .padding(.bottom, 2)
+
+                    ForEach(extShown) { e in
+                        ExternalPluginRow(
+                            ext: e,
+                            packName: CapabilityPacks.pack(e.capKey)?.name ?? "通用小工具",
+                            tint: tints[(e.stars % tints.count)],
+                            ready: store.isExternalMarkedInstalled(e)
+                        )
+                        .onTapGesture { extDetail = e }
+                        .overlay(alignment: .trailing) {
+                            ExtInstallButton(installed: store.isExternalMarkedInstalled(e)) {
+                                if store.isExternalMarkedInstalled(e) { extDetail = e }
+                                else { alertItem = .installExternal(e) }
+                            }
+                            .padding(.trailing, 13)
+                        }
+                    }
+
+                    if ext.count > externalRenderLimit {
+                        Text("只显示前 \(externalRenderLimit) 条（共 \(ext.count) 条）· 在搜索框里敲关键词能精确找到")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .padding(.top, 8)
+                            .padding(.horizontal, 4)
+                    }
+                }
             }
         }
         .padding(.horizontal, 14)
     }
 
-    // MARK: - 外部参考目录（2026-11-05）
-    //
-    // 这一屏是「别处做过什么」，不是「本机能装什么」。
-    // 用户要的是「桌面上那个 ipa 里的插件」——那些是 Node 插件，本机跑不了，
-    // 所以这里点开只能看到原项目信息 + 一句「让 AI 照着做一个（shell 版）」。
-    // 混进「发现」页会让用户点安装然后失败，比没有更糟，因此单独一屏。
-
-    private var referenceList: some View {
-        let hits = PluginCatalogRef.search(query, category: category)
-        return LazyVStack(spacing: 8) {
-            if !PluginCatalogRef.isLoaded {
-                VStack(spacing: 10) {
-                    ProgressView()
-                    Text(L10n.t("i18n_1625"))
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 40)
-            } else if hits.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 30, weight: .light))
-                        .foregroundColor(Color(.tertiaryLabel))
-                    Text(L10n.t("i18n_1588"))
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 40)
-            } else {
-                // 只渲染前 200 条：4687 条全铺进 LazyVStack 也会让首屏卡
-                ForEach(hits) { r in
-                    RefPluginRow(ref: r, categoryName: RefCategory.name(r.category))
-                        .onTapGesture { refDetail = r }
-                }
-                if hits.count >= 200 {
-                    Text(L10n.t("i18n_1626"))
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                        .padding(.top, 6)
-                }
-            }
-        }
-        .padding(.horizontal, 14)
-    }
 
     private var installedList: some View {
         LazyVStack(spacing: 8) {
@@ -594,69 +634,51 @@ private struct PluginIcon: View {
 
 // MARK: - 详情页
 
-// MARK: - 外部参考目录的行 / 详情（2026-11-05）
+// MARK: - 外部插件（2026-11-05 并入发现页）
+//
+// 和原来那版的关键区别：**这里能装**。
+// 原来那版写的是「参考 · 需改写」，因为那时外部条目没接任何可执行的东西；
+// 现在每条都带 capKey 指向 CapabilityPacks 里的真实能力包，装完就有工具可用。
 
-/// 分类 id → 中文短名。外部目录里存的是英文 rawValue（tools / session ...），
-/// 界面上要显示和内置目录一致的「工具 / 会话 / 记忆」。
-enum RefCategory {
-    static func name(_ raw: String) -> String {
-        PluginCategory(rawValue: raw)?.shortName ?? raw
-    }
-    static func emoji(_ raw: String) -> String {
-        switch raw {
-        case "tools":    return "🧰"
-        case "session":  return "💬"
-        case "model":    return "🔌"
-        case "memory":   return "🧠"
-        case "skill":    return "🧩"
-        case "vision":   return "👁"
-        case "docs":     return "📄"
-        case "usage":    return "📈"
-        case "remote":   return "📡"
-        case "security": return "🛡"
-        case "browser":  return "🌐"
-        case "git":      return "🔀"
-        default:         return "🧩"
-        }
-    }
-}
-
-/// 外部目录的一行。刻意长得和 PluginRow 相似，但有两点必须不同：
-///   第一，不显示「安装」按钮——装了也跑不了，那是骗人；
-///   第二，明确标一句「参考 · 需改写」。
-private struct RefPluginRow: View {
-    let ref: RefPlugin
-    let categoryName: String
+/// 外部插件的一行。视觉上和 PluginRow 保持一致，多一个「→ 能力包名」的小标注，
+/// 让用户点安装前就知道「装它实际会得到什么」。
+private struct ExternalPluginRow: View {
+    let ext: ExternalPlugin
+    /// 它指向的能力包名（如「压缩归档」）
+    let packName: String
+    let tint: Color
+    let ready: Bool
 
     var body: some View {
         HStack(alignment: .top, spacing: 11) {
-            PluginIcon(emoji: RefCategory.emoji(ref.category),
-                       tint: .gray, size: 40)
+            PluginIcon(emoji: ext.category.emoji, tint: ready ? tint : .gray, size: 40)
             VStack(alignment: .leading, spacing: 4) {
-                Text(ref.name)
+                Text(ext.name)
                     .font(.system(size: 12.5, weight: .semibold))
                     .lineLimit(1)
-                Text(ref.summary)
+                Text(ext.summary)
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 6) {
-                    Text("★ \(num(ref.stars))")
-                    Text("·").opacity(0.4)
-                    Text(categoryName)
+                    Text("→ \(packName)")
                         .padding(.horizontal, 5).padding(.vertical, 1.5)
-                        .background(Capsule().fill(Color(.tertiarySystemFill)))
+                        .background(Capsule().fill(tint.opacity(0.14)))
+                        .foregroundColor(tint)
                     Text("·").opacity(0.4)
-                    Text(L10n.t("i18n_1627"))     // 「参考 · 需改写」
-                        .padding(.horizontal, 5).padding(.vertical, 1.5)
-                        .background(Capsule().fill(Color.gray.opacity(0.16)))
+                    Text(ext.category.shortName)
+                    if ext.stars > 0 {
+                        Text("·").opacity(0.4)
+                        Text("★ \(Self.num(ext.stars))")
+                    }
                 }
                 .font(.system(size: 10.5))
                 .foregroundColor(.secondary)
                 .lineLimit(1)
             }
-            Spacer(minLength: 4)
+            // 给行尾按钮留出位置，不然长文本会压到按钮下面
+            Spacer(minLength: 62)
         }
         .padding(13)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -664,311 +686,141 @@ private struct RefPluginRow: View {
         .contentShape(Rectangle())
     }
 
-    private func num(_ n: Int) -> String {
+    static func num(_ n: Int) -> String {
         if n >= 1000 { return String(format: "%.1fk", Double(n) / 1000) }
         return "\(n)"
     }
 }
 
-/// 外部目录详情：说明「这是什么、为什么装不了、能拿它干什么」。
-/// 唯一可执行的动作是「让 AI 照着做一个 shell 版」——把需求写进剪贴板，
-/// 用户回聊天框粘贴即可（这里不直接跳转，避免抢走当前会话上下文）。
-private struct RefPluginSheet: View {
-    let ref: RefPlugin
-    let categoryName: String
+/// 外部插件的行尾按钮。和 PluginActionButton 分开写，
+/// 避免把三元嵌套塞进同一个 struct 里让类型检查变慢。
+private struct ExtInstallButton: View {
+    let installed: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(installed ? "已安装" : "安装")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(installed ? .secondary : .white)
+                .padding(.horizontal, 13)
+                .frame(height: 28)
+                .background(
+                    Capsule().fill(installed ? Color(.tertiarySystemFill) : Color.accentColor)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// 外部插件详情。
+///
+/// 这一页必须回答一个问题：「我装这个东西，到底能得到什么？」
+/// 所以它把指向的能力包和其中的工具**摊开列出来**，而不是只写一句简介。
+private struct ExternalPluginSheet: View {
+    let ext: ExternalPlugin
+    let pack: PluginManifest?
+    let installed: Bool
+    let onInstall: () -> Void
 
     @Environment(\.presentationMode) private var presentationMode
-    @State private var copied = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                // 头部
                 HStack(spacing: 12) {
-                    PluginIcon(emoji: RefCategory.emoji(ref.category), tint: .gray, size: 46)
+                    PluginIcon(emoji: ext.category.emoji, tint: .blue, size: 46)
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(ref.name)
+                        Text(ext.name)
                             .font(.system(size: 16, weight: .semibold))
-                        Text("★ \(ref.stars) · \(categoryName)")
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(ext.category.displayName + (ext.stars > 0 ? " · ★ \(ext.stars)" : ""))
                             .font(.system(size: 11.5))
                             .foregroundColor(.secondary)
                     }
                     Spacer()
                 }
 
-                Text(ref.summary)
+                Text(ext.summary)
                     .font(.system(size: 13))
                     .fixedSize(horizontal: false, vertical: true)
 
-                // 这段是这一页的核心：说清为什么没有「安装」按钮
-                VStack(alignment: .leading, spacing: 6) {
-                    Label(L10n.t("i18n_1628"), systemImage: "info.circle")
-                        .font(.system(size: 12.5, weight: .semibold))
-                    Text(L10n.t("i18n_1629"))
-                        .font(.system(size: 12))
+                // 关键区块：装它能得到什么
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("安装后你能用这些")
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 11).fill(Color(.tertiarySystemFill)))
 
-                if !ref.pkg.isEmpty {
-                    HStack(spacing: 6) {
-                        Text("npm").font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary)
-                        Text(ref.pkg)
-                            .font(.system(size: 12, design: .monospaced))
-                            .lineLimit(1)
-                        Spacer()
+                    if let p = pack {
+                        Text("← 会装上能力包「\(p.name)」，共 \(p.tools.count) 个工具")
+                            .font(.system(size: 12.5))
+                            .foregroundColor(.accentColor)
+
+                        VStack(alignment: .leading, spacing: 7) {
+                            ForEach(p.tools, id: \.name) { t in
+                                HStack(alignment: .top, spacing: 7) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.green)
+                                        .padding(.top, 2)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(Self.shortToolName(t.name))
+                                            .font(.system(size: 12, weight: .medium))
+                                        Text(t.summary)
+                                            .font(.system(size: 11))
+                                            .foregroundColor(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(11)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemFill)))
+
+                        // 同一能力包被多条外部插件共用这件事，说清楚免得用户反复装
+                        Text("提示：这个能力包被多条同类插件共用，装一次就够了。")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("这条暂时没有可用的能力包")
+                            .font(.system(size: 12))
+                            .foregroundColor(.red)
                     }
                 }
-                if !ref.owner.isEmpty && !ref.repo.isEmpty {
-                    HStack(spacing: 6) {
-                        Text("repo").font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary)
-                        Text("\(ref.owner)/\(ref.repo)")
-                            .font(.system(size: 12, design: .monospaced))
-                            .lineLimit(1)
-                        Spacer()
-                    }
-                }
 
-                Button {
-                    UIPasteboard.general.string = promptText
-                    copied = true
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: copied ? "checkmark.circle.fill" : "square.on.square")
-                        Text(L10n.t(copied ? "i18n_1631" : "i18n_1630"))
-                    }
-                    .font(.system(size: 13, weight: .medium))
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 42)
-                    .background(RoundedRectangle(cornerRadius: 11).fill(Color.accentColor.opacity(0.13)))
+                // 安装按钮
+                Button(action: onInstall) {
+                    Text(installed ? "已安装（点「已安装」页可开关）" : "安装")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 44)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(installed ? Color.gray.opacity(0.45) : Color.accentColor)
+                        )
                 }
-                .buttonStyle(.plain)
-
-                Text(L10n.t("i18n_1632"))
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                .disabled(installed)
 
                 Spacer(minLength: 10)
             }
             .padding(18)
         }
-        .navigationTitle(L10n.t("i18n_1633"))
+        .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
-    }
-
-    /// 复制给用户的指令：带着名字与原始描述，AI 一看就知道要做什么
-    private var promptText: String {
-        """
-        我看到一个外部插件「\(ref.name)」（\(categoryName)），它做的事是：\(ref.summary)
-        \(ref.owner.isEmpty ? "" : "原项目：https://github.com/\(ref.owner)/\(ref.repo)\n")
-        它跑在 Node 环境，我们这边装不了。请你按这个思路，用本机 shell 给我做一个等效的插件：
-        先用 plugin.define 建一个 id 为 \(ref.id) 的插件，工具命令只用 busybox 自带的（ls/find/grep/awk/sed/sort/du/md5sum/base64），
-        不要依赖 npm / node / python。做完告诉我它加了哪些工具、怎么用。
-        """
-    }
-}
-
-struct PluginDetailSheet: View {
-    let manifest: PluginManifest
-    let onInstall: () -> Void
-    let onUninstall: () -> Void
-    let onToggle: (Bool) -> Void
-
-    @ObservedObject private var store = PluginStore.shared
-    @Environment(\.presentationMode) private var presentationMode
-
-    var body: some View {
-        NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    header
-                    actionButton
-                    if !manifest.tools.isEmpty { toolsSection }
-                    if !manifest.skills.isEmpty { skillsSection }
-                    infoSection
-                    if manifest.requiresHook { hookWarning }
-                    if !manifest.changelog.isEmpty { changelogSection }
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-                .padding(.bottom, 30)
-            }
-            .background(Color(.systemGroupedBackground).ignoresSafeArea())
-            .navigationTitle(L10n.t("i18n_1578"))
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button(L10n.t("i18n_1599")) { presentationMode.wrappedValue.dismiss() }
-                }
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button("关闭") { presentationMode.wrappedValue.dismiss() }
+                    .font(.system(size: 14))
             }
         }
     }
 
-    private var header: some View {
-        HStack(alignment: .top, spacing: 13) {
-            PluginIcon(emoji: manifest.icon, tint: .blue, size: 56)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(manifest.name).font(.system(size: 17, weight: .semibold))
-                Text(manifest.pkg)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(.secondary)
-                Text("\(manifest.author) · v\(manifest.version) · \(manifest.sizeKB) KB")
-                    .font(.system(size: 11.5))
-                    .foregroundColor(.secondary)
-            }
-            Spacer()
-        }
-        .padding(.bottom, 4)
-    }
-
-    @ViewBuilder
-    private var actionButton: some View {
-        if store.isInstalled(manifest.id) {
-            HStack(spacing: 10) {
-                Toggle(L10n.t("i18n_1600"), isOn: Binding(
-                    get: { store.isEnabled(manifest.id) },
-                    set: { onToggle($0) }))
-                    .font(.system(size: 13))
-                Spacer()
-                Button(role: .destructive) { onUninstall() } label: {
-                    Text(L10n.t("i18n_1577")).font(.system(size: 13, weight: .medium))
-                }
-            }
-            .padding(12)
-            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
-        } else {
-            Button {
-                onInstall()
-            } label: {
-                Group {
-                    if store.isInstalling(manifest.id) {
-                        HStack(spacing: 6) {
-                            ProgressView().scaleEffect(0.8)
-                            Text(L10n.t("i18n_1575"))
-                        }
-                    } else {
-                        Text(L10n.t("i18n_1574"))
-                    }
-                }
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .frame(height: 44)
-                .background(RoundedRectangle(cornerRadius: 11).fill(Color.accentColor))
-            }
-            .buttonStyle(.plain)
-            .disabled(store.isInstalling(manifest.id))
-        }
-    }
-
-    private var toolsSection: some View {
-        sectionCard(title: L10n.t("i18n_1579")) {
-            ForEach(manifest.tools.indices, id: \.self) { i in
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(manifest.tools[i].name.replacingOccurrences(of: "user.", with: ""))
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundColor(.accentColor)
-                    Text(manifest.tools[i].summary)
-                        .font(.system(size: 12))
-                        .foregroundColor(.primary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 14).padding(.vertical, 9)
-                .overlay(alignment: .bottom) {
-                    Rectangle().fill(Color(.separator)).frame(height: 0.5)
-                }
-            }
-        }
-    }
-
-    private var skillsSection: some View {
-        sectionCard(title: L10n.t("i18n_1601")) {
-            ForEach(manifest.skills.indices, id: \.self) { i in
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(manifest.skills[i].name).font(.system(size: 12.5, weight: .medium))
-                    Text(manifest.skills[i].summary)
-                        .font(.system(size: 11.5))
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 14).padding(.vertical, 9)
-                .overlay(alignment: .bottom) {
-                    Rectangle().fill(Color(.separator)).frame(height: 0.5)
-                }
-            }
-        }
-    }
-
-    private var infoSection: some View {
-        sectionCard(title: L10n.t("i18n_1580")) {
-            infoRow(L10n.t("i18n_1587"), manifest.category.displayName)
-            if !manifest.deps.isEmpty {
-                infoRow(L10n.t("i18n_1581"), manifest.deps.joined(separator: " · "))
-            }
-            infoRow(L10n.t("i18n_1582"), "\(manifest.tools.count)")
-            if !manifest.skills.isEmpty { infoRow(L10n.t("i18n_1601"), "\(manifest.skills.count)") }
-            infoRow(L10n.t("i18n_1602"), L10n.t("i18n_1603"))
-        }
-    }
-
-    private var hookWarning: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 12))
-                .foregroundColor(.orange)
-                .padding(.top, 1)
-            Text(L10n.t("i18n_1604"))
-                .font(.system(size: 11.5))
-                .foregroundColor(.orange)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color.orange.opacity(0.10)))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.orange.opacity(0.22), lineWidth: 1))
-    }
-
-    private var changelogSection: some View {
-        sectionCard(title: L10n.t("i18n_1584")) {
-            ForEach(manifest.changelog.indices, id: \.self) { i in
-                Text(manifest.changelog[i])
-                    .font(.system(size: 12))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14).padding(.vertical, 8)
-                    .overlay(alignment: .bottom) {
-                        Rectangle().fill(Color(.separator)).frame(height: 0.5)
-                    }
-            }
-        }
-    }
-
-    private func infoRow(_ k: String, _ v: String) -> some View {
-        HStack(alignment: .top) {
-            Text(k).foregroundColor(.secondary)
-            Spacer()
-            Text(v).multilineTextAlignment(.trailing)
-        }
-        .font(.system(size: 12.5))
-        .padding(.horizontal, 14).padding(.vertical, 9)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(Color(.separator)).frame(height: 0.5)
-        }
-    }
-
-    private func sectionCard<C: View>(title: String, @ViewBuilder content: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(title)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(.secondary)
-                .padding(.horizontal, 14).padding(.top, 11).padding(.bottom, 5)
-            content()
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+    /// user.plg_cap_archive_unpack → unpack
+    static func shortToolName(_ full: String) -> String {
+        full.components(separatedBy: "_").last ?? full
     }
 }

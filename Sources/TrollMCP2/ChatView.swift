@@ -60,6 +60,14 @@ struct ChatView: View {
     @State private var turnStartedAt: Date?
     @State private var lastTurnSeconds: Double?
     @State private var turnEnded = false
+    /// 2026-11-05：本轮过程中失败过的步骤（人话标题 + 一句原因）。
+    ///
+    /// 用户原话：「在过程中如果出现什么错误他最后的总结报告里面就写一下就完了」。
+    /// 但只靠提示词约束模型去写是不够的 —— 工具卡全被折叠了，模型要是漏写，
+    /// 用户**完全没有第二个渠道**知道中间出过错。所以这里在本地再从消息流里
+    /// 捞一遍失败项，最后一轮结束时贴一行「过程中 2 处出错」，让事实不依赖模型自觉。
+    /// 只在 isLoading 翻 false 时算一次（不是计算属性，避免 body 每次重算都遍历）。
+    @State private var turnIssues: [String] = []
 
     // v2.9.2：多选模式（勾选会话内容 → 复制 / 分享到其他 App）
     @State private var selectionMode = false
@@ -755,7 +763,15 @@ struct ChatView: View {
                                 // 参数没变的行直接跳过整棵子树重算（见 MessageBubble 上方的说明）。
                                 // 没有 .equatable() 的话，== 实现了也不会被调用。
                                 .equatable()
-                                .id(msg.id)
+                                // 2026-11-05 jump-top **关键：id 必须和 ForEach 的一致**。
+                                // 这里以前写的是 `.id(msg.id)`（UUID），而折叠组写的是
+                                // `"t-"+uuid`（String）—— 列表里同时存在两套 identity，
+                                // 于是所有 `scrollTo` 都只能命中其中一半：
+                                //   · 落 .msg 上的滚得动，落 .tools 上的静默失败；
+                                //   · 锚点找不到时代码不报错，视口就停在原地，
+                                //     表现为「点了没反应」或「跳上去就回不来」。
+                                // 现在两边都走 `Item.id`（String），一套到底。
+                                .id(ChatListGrouping.Item.msg(msg).id)
                             case .tools(let msgs):
                                 // 2026-11-03 修「怎么滑都回不到最底部 / 上滑到底内容还在动」：
                                 // 这个分支以前没有 .id()。scrollToBottom 用 last.id 定位，
@@ -788,7 +804,7 @@ struct ChatView: View {
                         // 判据只有一条：isLoading 真的变回 false。所以不会提前冒出来
                         // 骗人说跑完了——模型还在跑下一轮时这里什么都没有。
                         if turnEnded, !store.isLoading, let secs = lastTurnSeconds {
-                            TurnEndedNote(seconds: secs)
+                            TurnEndedNote(seconds: secs, issues: turnIssues)
                         }
                     }
                     // v3.4.0：去掉整行水平 padding —— AI 气泡改为真正占满左右屏边缘；
@@ -809,8 +825,12 @@ struct ChatView: View {
                 MessageNavigator(
                     messages: store.currentMessages,
                     onJump: { id in
+                        // 2026-11-05 jump-top：导航条传的是消息原始 uuid，而列表里
+                        // 渲染的锚点是 `m-<uuid>`（见 Item.msg 的 id）——
+                        // 直接 scrollTo(uuid) 一定落空，点了完全没反应。
+                        // 这里补上前缀，和 ForEach 的 `.id()` 对齐。
                         withAnimation(.easeInOut(duration: 0.28)) {
-                            proxy.scrollTo(id, anchor: .center)
+                            proxy.scrollTo("m-" + id.uuidString, anchor: .center)
                         }
                     }
                 )
@@ -887,10 +907,14 @@ struct ChatView: View {
                         turnEnded = true
                     }
                     turnStartedAt = nil
+                    // 本轮过程中失败过的步骤（见 turnIssues 注释）。在这里算一次就够，
+                    // 不要写成计算属性——那会让 body 每次重算都全量遍历一遍消息。
+                    turnIssues = Self.collectIssues(from: store.currentMessages)
                 } else {
                     // 新的一轮开始（用户发送 / 网络恢复自动重试）
                     if turnStartedAt == nil { turnStartedAt = Date() }
                     turnEnded = false
+                    turnIssues = []
                 }
                 // v7.1.109-peers：请求完成 → 刷新上下文环形指示器（records 读文件，仅此刻读一次）
                 if !loading { refreshRingTok() }
@@ -911,8 +935,80 @@ struct ChatView: View {
         }
     }
 
+    /// 从本轮消息里捞出「过程出错」的项，喂给末尾的结束语。
+    ///
+    /// 2026-11-05：用户要求「过程中出现什么错误，最后的总结报告里写一下」。
+    /// 提示词已经要求模型自己写（SystemPrompts §2b），但工具卡全部折叠后
+    /// 模型一旦漏写，用户就彻底看不到出过错。所以本地再兜一层：
+    /// 扫最后一条 user 消息之后的所有 tool 消息，把 isError 的挑出来。
+    ///
+    /// 只给「人话」——工具名 + 结果里第一句像样的文字。不贴 JSON、不贴堆栈：
+    /// 用户已经明确说过这些他看不懂，看懂的只有"哪一步没成"。
+    private static func collectIssues(from messages: [ChatMessage]) -> [String] {
+        // 本轮起点 = 最后一条 user 消息（它之后才是这一轮的活儿）。
+        // 没有 user 消息时（理论上的空会话/系统会话）整份都算，但要用
+        // startIndex 兜底 —— 直接 index(after:) 会在空数组上越界崩溃。
+        let slice: ArraySlice<ChatMessage>
+        if let ui = messages.lastIndex(where: { $0.role == "user" }) {
+            slice = messages[messages.index(after: ui)...]
+        } else {
+            slice = messages[messages.startIndex...]
+        }
+        var out: [String] = []
+        var seen = Set<String>()
+        for m in slice where m.isTool && m.isError {
+            // 标题优先级：模型给的 tool_title（自然语言）> 工具名。
+            // 不用 `!` 强解：toolTitle 是可选且可能为空白串，这里统一当"没有"处理。
+            var title = m.toolName ?? L10n.t("i18n_1645")
+            if let t = m.toolTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+                title = t
+            }
+            let reason = humanReason(m.content)
+            let line = reason.isEmpty ? title : "\(title)：\(reason)"
+            // 同一种失败重复十次只报一次——细节对用户没意义
+            let key = title + "|" + reason
+            if seen.insert(key).inserted { out.append(line) }
+        }
+        // 太多了反而没人看，最多列 4 条，剩下折成一句
+        if out.count > 4 {
+            let extra = out.count - 4
+            out = Array(out.prefix(4)) + [L10n.t("i18n_1642", extra)]
+        }
+        return out
+    }
+
+    /// 从工具返回内容里抠一句人话原因。
+    ///
+    /// 工具结果大多是 `{"ok":false,"message":"..."}` 这种 JSON，直接展示等于把
+    /// 用户看不懂的东西原样还给他。这里优先取 message/error/detail 字段，
+    /// 取不到就把 JSON 当纯文本截一段；都失败就返回空（只显示标题）。
+    private static func humanReason(_ raw: String) -> String {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "" }
+        // JSON 里找一句现成的
+        if s.hasPrefix("{"),
+           let d = s.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+            for k in ["message", "error", "detail", "stderr", "reason"] {
+                if let v = obj[k] as? String {
+                    let t = v.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !t.isEmpty { return clip(t) }
+                }
+            }
+        }
+        // 非 JSON（纯文本报错）：去掉常见的路径前缀噪声后截第一行
+        let firstLine = s.split(separator: "\n").first.map(String.init) ?? s
+        return clip(firstLine)
+    }
+
+    /// 截短到 60 字：结束语只有一行位置，长了会挤掉真正要紧的结论。
+    private static func clip(_ t: String) -> String {
+        let one = t.replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return one.count <= 60 ? one : String(one.prefix(58)) + "…"
+    }
+
     // v7.4.0-fix73d：悬浮按钮（独立函数——减主表达式 type-check 负担）
-    // v7.1.281-fix：箭头 ↑↓ 改 ︿﹀（chevron 风格，用户指定）
     // 2026-11-03：改为独立订阅 ChatScrollState 的子视图——ChatView.body 本身不读滚动状态，
     // 这样滚动每帧只重算这一个 40pt 圆钮，不再牵动整个聊天列表。
     private func floatingButtons(_ proxy: ScrollViewProxy) -> some View {
@@ -924,8 +1020,10 @@ struct ChatView: View {
                 // 「还在底部附近」会反向吸附，两者互扯就是「点了没反应/回弹」。
                 // 先解除吸附（用户明确要离开底部），再定位。
                 scroll.releaseStick()
-                if let first = store.currentMessages.first {
-                    proxy.scrollTo(first.id, anchor: .top)
+                // 2026-11-05 jump-top：锚点必须用**渲染后**的 id（见 scrollToBottom 的说明）。
+                // 首条若是工具消息，原始 uuid 在列表里根本不存在 → 点了没反应。
+                if let first = renderedAnchorIDs().first {
+                    proxy.scrollTo(first, anchor: .top)
                 }
             },
             onDown: {
@@ -960,9 +1058,17 @@ struct ChatView: View {
     /// 为什么必须有第一步：只靠 setContentOffset 时 SwiftUI 是按可见范围被动建 cell 的，
     /// 第一步一旦落到空白区就可能一直不建；scrollTo 是唯一能主动"告诉" LazyVStack
     /// 「现在需要这几条」的手段。
+    ///
+    /// 2026-11-05 **再修（jump-top）——锚点必须用「渲染后的 id」**：
+    /// 列表是 `ForEach(ChatListGrouping.group(...), id: \.id)`，工具消息渲染后的 id
+    /// 是 `t-<首条 uuid>`，而不是消息自己的 `uuid`。老代码传 `last.id`（原始 uuid），
+    /// 最后一条只要是工具就**根本找不到锚点** → scrollTo 静默失败 → 位置完全交给
+    /// 桥接层；而桥接层此刻 contentSize 可能还没长起来（maxOffset ≤ 0 直接 return），
+    /// 两边都没动，视口就停在原地甚至被夹到 0。现在统一走 `renderedAnchorIDs()`，
+    /// 拿到的 id 一定和 `ForEach` 里的 `.id()` 对得上。
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        guard let last = store.currentMessages.last else { return }
-        proxy.scrollTo(last.id, anchor: .bottom)
+        guard let anchor = renderedAnchorIDs().last else { return }
+        proxy.scrollTo(anchor, anchor: .bottom)
         // 落位交给桥接层分步完成（无动画、不与手势打架、不会落到未渲染区）。
         scroll.requestStickToBottom()
         // 兜底：内容多时第一次 scrollTo 可能因锚点尚未创建而落空，下一帧再要一次。
@@ -971,10 +1077,22 @@ struct ChatView: View {
         // 也不需要：闭包按值捕获这个 struct（含 @ObservedObject 包装器与 ScrollViewProxy），
         // 一次性执行完即释放，不会形成引用环。
         DispatchQueue.main.async {
-            guard let last = store.currentMessages.last else { return }
-            proxy.scrollTo(last.id, anchor: .bottom)
+            guard let anchor = ChatListGrouping.group(store.currentMessages).map({ $0.id }).last
+            else { return }
+            proxy.scrollTo(anchor, anchor: .bottom)
             scroll.requestStickToBottom()
         }
+    }
+
+    /// 当前列表**实际渲染**的锚点 id 序列（和 ForEach 的 `.id()` 一一对应）。
+    ///
+    /// 为什么不直接用 `currentMessages.map(\.id)`：工具消息在渲染时被折叠成一组，
+    /// 组的 id 是 `t-<首条 uuid>`；普通消息的 id 是 `m-<uuid>`。三者只要有一处不一致，
+    /// `proxy.scrollTo` 就找不到锚点并**静默失败**（不报错、不滚）
+    /// ——「点了回顶部没反应」「跳上去回不来」都是这么来的。
+    /// group() 内部有缓存，这里重复调用几乎零成本。
+    private func renderedAnchorIDs() -> [String] {
+        ChatListGrouping.group(store.currentMessages).map { $0.id }
     }
 
     private func dismissKeyboard() {
@@ -1733,11 +1851,17 @@ struct ChatView: View {
     }
     @ViewBuilder
     private func toolsRunGroup(_ msgs: [ChatMessage]) -> some View {
-        let gid = "t-" + (msgs.first?.id.uuidString ?? "") + "-" + String(msgs.count)
+        // 2026-11-05：**展开状态键必须只用首条 id**，不能拼条数。
+        // 拼了条数的话，用户展开后只要又来一个新工具，键就变了 → 组自己折回去。
+        // 它和 `.id()` 用的 `ChatListGrouping.Item.tools(msgs).id` 现在完全一致，
+        // 一个键贯穿「视图身份」和「展开状态」，不会错位。
+        let item = ChatListGrouping.Item.tools(msgs)
+        let gid = item.id
+        let expanded = toolsRunExpanded.contains(gid)
         VStack(alignment: .leading, spacing: 8) {
             Button(action: {
                 withAnimation(.easeInOut(duration: 0.18)) {
-                    if toolsRunExpanded.contains(gid) {
+                    if expanded {
                         toolsRunExpanded.remove(gid)
                     } else {
                         toolsRunExpanded.insert(gid)
@@ -1745,19 +1869,31 @@ struct ChatView: View {
                 }
             }) {
                 HStack(spacing: 8) {
-                    Image(systemName: "hammer.fill")
+                    Image(systemName: item.hasRunning ? "gearshape.2.fill" : "hammer.fill")
                         .font(.system(size: 14))
                         .foregroundColor(.secondary)
-                    Text(String(format: L10n.t("i18n_1260"), msgs.count))
+                    // 用户原话：「他运用了我页看不懂，但是给我干什么，我只要最后我想要的」
+                    // —— 这里只说人话（干了 N 件事 / 正在做第 N 步），不列工具名。
+                    // 还在跑时说「正在处理」，跑完说「运行了」：这两句话的差别
+                    // 就是「还在干活」和「已经干完」的全部区别，用户只要这一条信息。
+                    Text(item.hasRunning
+                         ? String(format: L10n.t("i18n_1644"), msgs.count)
+                         : String(format: L10n.t("i18n_1260"), msgs.count))
                         .font(.subheadline.weight(.medium))
-                        .foregroundColor(.primary)
-                    if let d = ChatListGrouping.Item.tools(msgs).totalDuration {
+                        .foregroundColor(item.hasRunning ? .secondary : .primary)
+                    if let d = item.totalDuration {
                         Text(String(format: "%.1fs", d))
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
+                    // 出错不展开也能看见（一个红色 ❌N），细节交给本轮总结报告。
+                    if item.failedCount > 0 {
+                        Text("❌\(item.failedCount)")
+                            .font(.caption.weight(.medium))
+                            .foregroundColor(.red.opacity(0.85))
+                    }
                     Spacer()
-                    Image(systemName: toolsRunExpanded.contains(gid) ? "chevron.up" : "chevron.down")
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(.secondary)
                 }
@@ -1919,17 +2055,54 @@ struct RunStatusStrip: View {
 
 /// 2026-11-05：本轮结束标记（用户要求「需要加结束话语」）。
 /// 只有 isLoading 真的变回 false 才会出现，所以不会提前骗人说跑完了。
+///
+/// 2026-11-05 追加：带上「过程中出错」清单。
+/// 用户原话：「在过程中如果出现什么错误他最后的总结报告里面就写一下就完了」——
+/// 工具卡已被折叠成一行，出错细节只剩这里能看到。所以只要本轮真出过错，
+/// 这行结束语下面就多出几行小字，一条一个失败，不用展开任何东西。
 struct TurnEndedNote: View {
     let seconds: Double
+    /// 本轮失败过的步骤（人话，已去重截短）。空 = 全部顺利。
+    var issues: [String] = []
+    @State private var showIssues = false
 
     var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 10, weight: .semibold))
-            Text(L10n.t("i18n_1621", RunStatusStrip.clock(seconds)))
-                .font(.system(size: 11))
+        VStack(spacing: 4) {
+            HStack(spacing: 5) {
+                Image(systemName: issues.isEmpty ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(issues.isEmpty ? .secondary : .orange)
+                Text(L10n.t("i18n_1621", RunStatusStrip.clock(seconds)))
+                    .font(.system(size: 11))
+                if !issues.isEmpty {
+                    // 可点：默认只显示"2 处没成"，点开才铺开，不占地方。
+                    Button(action: { withAnimation(.easeInOut(duration: 0.15)) { showIssues.toggle() } }) {
+                        HStack(spacing: 3) {
+                            Text(L10n.t("i18n_1643", issues.count))
+                                .font(.system(size: 11, weight: .medium))
+                            Image(systemName: showIssues ? "chevron.up" : "chevron.down")
+                                .font(.system(size: 8, weight: .semibold))
+                        }
+                        .foregroundColor(.orange)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .foregroundColor(issues.isEmpty ? .secondary.opacity(0.85) : .secondary)
+            if showIssues && !issues.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(issues.enumerated()), id: \.offset) { _, line in
+                        Text("· " + line)
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 2)
+            }
         }
-        .foregroundColor(.secondary.opacity(0.85))
         .frame(maxWidth: .infinity)
         .padding(.top, 2)
         .padding(.bottom, 4)

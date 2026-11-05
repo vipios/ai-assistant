@@ -964,7 +964,7 @@ enum L10n {
             tbl["i18n_668"] = ["zh": "静默安装失败(exit %d), 分享调起也失败: %@", "en": "Silent install failed (exit %d), share fallback also failed: %@"]
             tbl["i18n_669"] = ["zh": "安装调起失败: %@", "en": "Install invocation failed: %@"]
             tbl["i18n_670"] = ["zh": "静默安装失败（exit %d），App 可能已退出或未安装完整——请用「保存到文件」重新安装", "en": "Silent install failed (exit %d), the app may be closed or not fully installed — reinstall via Save to Files"]
-            // 2026-11-05：安装路径改为「本地包直投 TrollStore」（见 UpdateManager.installIPA 注释）
+            // 2026-11-05：更新安装改为「下载完只弹分享菜单，用户自己点安装」
             tbl["i18n_1230"] = ["zh": "安装包已交给 TrollStore：在弹出的界面点「安装」就会覆盖旧版（安装过程中别打开本 App）", "en": "Package handed to TrollStore — tap Install in its prompt to overwrite the old version (don't open this app while it installs)"]
             tbl["i18n_1231"] = ["zh": "没找到能打开安装包的 TrollStore，已打开分享菜单——选 TrollStore，或先储存再用 TrollStore 打开", "en": "No TrollStore found to open the package; share sheet opened — pick TrollStore, or save it and open it in TrollStore"]
             tbl["i18n_1232"] = ["zh": "系统拒绝了安装请求，已打开分享菜单兜底", "en": "System rejected the install request; share sheet opened as fallback"]
@@ -1637,9 +1637,18 @@ enum L10n {
             tbl["i18n_1592"] = ["zh": "会一并撤销它的 %d 个工具和 %d 个技能，不影响 App 本体与其他插件。", "en": "Removes its %d tool(s) and %d skill(s). The app and other plugins are unaffected."]
             tbl["i18n_1593"] = ["zh": "已装 %d 个 · 提供 %d 个工具 · %d 个技能", "en": "%d installed · %d tools · %d skills"]
             tbl["i18n_1594"] = ["zh": "%d 类 · 共 %d 个插件", "en": "%d categories · %d plugins"]
-            // 外部目录页的副标题：明确写「仅供参考、不可直接安装」，
-            // 不然和上一页的「%d 个插件」长得一样，用户以为这 4687 个都能装。
-            tbl["i18n_1634"] = ["zh": "%d 类 · %d 条外部参考 · 不可直接安装", "en": "%d categories · %d shared references · not installable"]
+            // 2026-11-05 更新：外部目录已并入「发现」页且全部可安装，
+            // 这句原来写的是「不可直接安装」，留着会误导后来改代码的人，改成中性描述。
+            tbl["i18n_1634"] = ["zh": "%d 类 · %d 条可安装能力", "en": "%d categories · %d installable"]
+            // 2026-11-05：下载前先测速，这两句是那两个阶段的提示
+            tbl["i18n_1635"] = ["zh": "正在测速，挑最快的源…（最多 8 秒）", "en": "Testing mirrors to pick the fastest… (up to 8s)"]
+            tbl["i18n_1636"] = ["zh": "正在下载 v%@… %d%% · 走 %@", "en": "Downloading v%@… %d%% via %@"]
+            tbl["i18n_1637"] = ["zh": "更新镜像源", "en": "Update mirrors"]
+            tbl["i18n_1638"] = ["zh": "下载前先并发测速，自动选最快的一个（直连也参与比较）", "en": "Speed-tests all sources in parallel before downloading and picks the fastest, GitHub included"]
+            tbl["i18n_1639"] = ["zh": "上次实测最快", "en": "Fastest last time"]
+            // 网页内容进程连续崩溃、重试也没救回来时的提示
+            tbl["i18n_1640"] = ["zh": "网页内容进程反复异常，已停止自动重试。点右边「重新加载」再试一次", "en": "The web content process keeps crashing; auto-retry stopped. Tap Reload to try again"]
+            tbl["i18n_1641"] = ["zh": "改回默认域名", "en": "Restore default domain"]
             tbl["i18n_1595"] = ["zh": "还没有安装任何插件", "en": "No plugins installed yet"]
             tbl["i18n_1596"] = ["zh": "去发现页看看", "en": "Browse plugins"]
             tbl["i18n_1597"] = ["zh": "提供 %d 个工具", "en": "%d tools"]
@@ -1665,6 +1674,11 @@ enum L10n {
             tbl["i18n_1617"] = ["zh": "高风险", "en": "High"]
             tbl["i18n_1618"] = ["zh": "AI 可请求授权", "en": "Let AI ask for permission"]
             tbl["i18n_1619"] = ["zh": "开启后 AI 遇到需要你点头的操作（删文件、改系统配置、注入），会在界面上弹卡问你一次，而不是直接拒绝你说「这不行」。你点允许它才继续，每次授权只能用一次、五分钟过期；点拒绝它就不再纠缠。记录写在 Documents/Policy/decisions.log。", "en": "When on, the assistant pops a card for actions that need your nod (deleting files, changing system config, injecting) instead of refusing outright. It continues only after you tap Allow; each grant is single-use and expires in five minutes. Deny and it drops the request. Every decision is logged to Documents/Policy/decisions.log."]
+            // v1.0.35：本轮结束语的「过程中出错」清单
+            tbl["i18n_1642"] = ["zh": "…另有 %d 处", "en": "…and %d more"]
+            tbl["i18n_1643"] = ["zh": "%d 处没成", "en": "%d failed"]
+            tbl["i18n_1644"] = ["zh": "正在处理 %d 个步骤", "en": "Working on %d steps"]
+            tbl["i18n_1645"] = ["zh": "某一步", "en": "a step"]
         _table = tbl
         return tbl
     }

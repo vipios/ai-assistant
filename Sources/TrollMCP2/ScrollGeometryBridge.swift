@@ -111,6 +111,8 @@ struct ScrollGeometryBridge: UIViewRepresentable {
         private var pinning = false
         /// 防越界修正重复排程（2026-11-05 fix-blank-2）
         private var overshootFixScheduled = false
+        /// 上一次上报的 contentOffset.y（2026-11-05 jump-top：用于识别「布局重建导致掉回顶部」）
+        private var lastOffsetY: CGFloat = 0
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
@@ -192,8 +194,39 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                     // 用户在拖/惯性滚 → 立即解除吸附（上滑看历史绝不被拽回），
                     // 并通知上层「这是用户操作」才允许把正文降级为轻量 Text。
                     self.stickToBottom = false
+                    // 2026-11-05 jump-top：用户滚过的位置同样要记进 lastOffsetY。
+                    // 否则它会一直停在「用户开始滚之前」的旧值，等用户滚上去、
+                    // 再点 ↓ 回底时，那一跳的位移会被算成"掉回顶部"而误判。
+                    self.lastOffsetY = sv.contentOffset.y
                     self.onUserScroll?()
                 } else {
+                    // 2026-11-05 **jump-top 修复**：程序性掉回顶部 → 视为布局重建，重新贴底。
+                    //
+                    // 用户现象：「ai在干活的时候直接从最下面的最新回复中，直接跳到最上面」。
+                    // 触发链：AI 跑工具时消息列表的分组结构在变（单条工具 → 折叠组，
+                    // 或组内又追加一条），LazyVStack 销毁重建那一段 cell → contentSize
+                    // 瞬间塌到接近 0 → UIKit 把 contentOffset 夹到顶部 → 下面那句
+                    // 「stickToBottom = isAtBottom(sv)」看到不在底部，把自动跟随关掉 →
+                    // 视口就永远停在最上面了，直到用户自己滑回来。
+                    //
+                    // 判据只需要两条，同时满足就是"布局塌陷"而不是"用户想上去"：
+                    //   ① 用户没在操作（外层 if 已保证）；
+                    //   ② 这一跳是**往上跳了一大截**（> 视口高度），而上一轮明明已经接近底部。
+                    // 用户自己点「↑ 回顶部」时会先 releaseStick 把 stickToBottom 置 false，
+                    // 所以不会被这里抢回来；正常上滑走的是上面那个分支，也进不来。
+                    let jumpedUp = self.lastOffsetY - sv.contentOffset.y > sv.bounds.height
+                    if self.stickToBottom, self.pinning == false, jumpedUp, self.lastOffsetY > 0 {
+                        self.lastOffsetY = sv.contentOffset.y
+                        // 内容刚要重建，这一帧的 contentSize 还不可信，等一轮再把位置补回去。
+                        self.pinToBottom(sv)
+                        DispatchQueue.main.async { [weak self, weak sv] in
+                            guard let self = self, let sv = sv else { return }
+                            guard self.stickToBottom, !self.userIsScrolling(sv) else { return }
+                            self.pinToBottom(sv)
+                        }
+                        return
+                    }
+                    self.lastOffsetY = sv.contentOffset.y
                     // 静止状态下的 offset 变化 = 代码设的（贴底吸附 / scrollTo）。
                     // 不触发降级，只顺手校正一次吸附判定，保证「程序性滚到底后继续跟随」。
                     //
@@ -481,6 +514,9 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             // 2026-11-05 fix-blank-2：越界修正的排程标记同样要复位，
             // 否则 detach 时正好排着一个未执行的修正，重建后会被这个标记永久挡掉。
             overshootFixScheduled = false
+            // 2026-11-05 jump-top：新会话从顶部开始是正常的，上一会话的 offset 记录必须清掉，
+            // 否则切会话后第一次上报会被误判成"掉回顶部"而强行贴底。
+            lastOffsetY = 0
             // 2026-11-05 fix-blank：切会话/离屏后要允许新一轮补贴底，
             // 否则新会话 attach 上来时 didInitialPin 还是 true → 不再补 → 又停在空白/顶部。
             didInitialPin = false

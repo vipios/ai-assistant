@@ -164,7 +164,124 @@ final class RelayAdminCredential {
         }.resume()
     }
 
-    /// 2026-11-05：**地址自动切换的核心**——先试判定出来的地址，
+    /// 把「网络错误」翻译成用户能直接照着修的一句话。
+    ///
+    /// 2026-11-05 新增。起因是用户截图里的「一直转圈」——
+    /// WKWebView 被黑洞掉连接时会一直干等系统超时，20 秒兜底才报一句
+    /// "地址不通或本地网络权限被拒"，用户完全没法知道是哪一环出了问题。
+    ///
+    /// 这里按 NSURLError 的具体 code 分类，把「域名不存在」「连不上」「超时」
+    /// 「证书有问题」分开说，并把当前地址打出来，便于定位。
+    ///
+    /// ⚠️ 2026-11-05 更正：本段原先把白屏归因为「在外地址被手填成了多一个字母的域名」，
+    /// 这个归因是错的。已用 `git log -S` 扫过全历史 + 公共 DNS 实测确认：
+    /// 代码里域名只有 `RouterControl.defaultWanHost = "lidongyang.dpdns.org"` 这一处，
+    /// 历史版本从未出现过别的拼写。真正的原因是 WebKit 子进程起不来（见 entitlements 注释），
+    /// 域名只是表象。这里保留分类翻译，但不再暗示「用户打错了」。
+    static func explain(_ error: Error, addr: String) -> String {
+        let ns = error as NSError
+        let host = URL(string: addr)?.host ?? addr
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed:
+                return "域名解析不到：\(host)\n可能这个域名当前解析不了，或网络被拦"
+            case NSURLErrorCannotConnectToHost:
+                return "能解析但连不上：\(host)\n后台可能没启动，或端口不对"
+            case NSURLErrorTimedOut:
+                return "连接超时：\(host)\n地址不通，或当前网络访问不了它"
+            case NSURLErrorSecureConnectionFailed,
+                 NSURLErrorServerCertificateUntrusted,
+                 NSURLErrorServerCertificateHasBadDate,
+                 NSURLErrorServerCertificateNotYetValid:
+                return "证书有问题：\(host)\n地址对但 HTTPS 证书不受信任"
+            case NSURLErrorNotConnectedToInternet:
+                return "当前没有网络连接"
+            case NSURLErrorNetworkConnectionLost:
+                return "连接被中断，请重试"
+            default:
+                break
+            }
+        }
+        let msg = ns.localizedDescription
+        return msg.isEmpty ? "打不开 \(host)" : "打不开 \(host)：\(msg)"
+    }
+
+    /// 2026-11-05：**在外地址的自愈纠正**。
+    ///
+    /// 用户明确要求「域名你改下，代码应该写错了」—— 所以这里不再只是「提醒用户核对」，
+    /// 而是**代码自己把它改对**：只要存下来的域名和默认域名只差 1~2 个字母
+    /// （同一个 .org 主域，例如少写/多写一个 d），就判定为脏值，直接返回正确域名。
+    ///
+    /// 为什么限定得这么窄（编辑距离 ≤2 且 TLD 一致）：
+    /// 用户可能真的自建了别的 DDNS 域名，那种情况绝不能动。只有「和默认域名几乎一样、
+    /// 明显是同一个域名的错拼」才自愈，其余一律原样返回。
+    ///
+    /// 返回值：修正后的正确地址；`nil` = 不需要修（值本身没问题，或是不相干的自建域名）。
+    static func repairedAwayURL(_ raw: String) -> String? {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for p in ["https://", "http://"] where s.hasPrefix(p) { s = String(s.dropFirst(p.count)) }
+        while s.hasSuffix("/") { s.removeLast() }
+        guard !s.isEmpty else { return nil }
+        let host = s.split(separator: ":").first.map(String.init) ?? s
+        // 纯 IP / localhost 不做判断
+        if host.range(of: #"^(\d{1,3}\.){3}\d{1,3}$"#, options: .regularExpression) != nil { return nil }
+        if host == "localhost" { return nil }
+
+        let correct = RouterControl.defaultWanHost
+        let h = host.lowercased()
+        let c = correct.lowercased()
+        guard h != c else { return nil }
+        // TLD 不一致说明是另一个域名（自建 ddns 等），绝不碰
+        let hTLD = h.split(separator: ".").last.map(String.init) ?? ""
+        let cTLD = c.split(separator: ".").last.map(String.init) ?? ""
+        guard !hTLD.isEmpty, hTLD == cTLD else { return nil }
+
+        let d = editDistance(h, c)
+        guard d > 0, d <= 2 else { return nil }
+        return Self.defaultAwayURL
+    }
+
+    /// 启动时把历史脏值就地修掉（`relayadmin.awayurl` 和 `router.wan_host` 两处）。
+    ///
+    /// 为什么要落盘而不是每次读时临时纠正：界面上那个输入框绑的是 `awayURL` 的**值**，
+    /// 只在内存里纠正的话，用户下次打开看到的还是脏值，改动等于没生效。
+    /// 这里写一次，之后读到的就是干净的。
+    ///
+    /// 返回修过的那几条（`"旧值 → 新值"`），供界面一次性展示，避免「悄悄改了用户不知道」。
+    @discardableResult
+    static func repairStoredHosts() -> [String] {
+        let ud = UserDefaults.standard
+        var log: [String] = []
+        for key in ["relayadmin.awayurl", "router.wan_host"] {
+            guard let raw = ud.string(forKey: key), !raw.isEmpty else { continue }
+            if let fixed = repairedAwayURL(raw), fixed != raw {
+                ud.set(fixed, forKey: key)
+                log.append("\(raw) → \(fixed)")
+                fputs("[relay] 域名自愈 \(key): \(raw) → \(fixed)\n", stderr)
+            }
+        }
+        return log
+    }
+
+    /// 标准编辑距离（Levenshtein）。域名都很短，O(n²) 完全够用。
+    private static func editDistance(_ a: String, _ b: String) -> Int {
+        let x = Array(a), y = Array(b)
+        if x.isEmpty { return y.count }
+        if y.isEmpty { return x.count }
+        var prev = Array(0...y.count)
+        var cur = [Int](repeating: 0, count: y.count + 1)
+        for i in 1...x.count {
+            cur[0] = i
+            for j in 1...y.count {
+                let cost = x[i - 1] == y[j - 1] ? 0 : 1
+                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            }
+            prev = cur
+        }
+        return prev[y.count]
+    }
+
+    /// 2026-11-05：地址自动切换的核心——先试判定出来的地址，
     /// 不通就翻到另一个再试一次。返回实际连通的地址。
     ///
     /// 为什么必须有这层：光看「有没有内网 IP」判不准两种情况
@@ -282,6 +399,8 @@ struct RelayAdminView: View {
     /// 网络指纹：变了说明 WiFi↔流量 切换了 → 立刻重算地址
     @State private var lastNetSig: String = RouterControl.netSignature()
     @State private var pathMonitor: NWPathMonitor?
+    /// 2026-11-05：在外地址的拼写提醒（多/少一个字母这种，一填就提示，不用等连接超时）
+    @State private var awayHint: String? = nil
     // 2026-11-03 **转圈修复**（用户截图：蓝色按钮里一直转圈、点不动）：
     //
     // 原来这里是 `@State private var isLoading = true`。这个变量在**两个场景**共用：
@@ -380,6 +499,12 @@ struct RelayAdminView: View {
             // 结果就是白屏 + 一直转圈（用户截图）。清掉之后会正常回到输密码。
             cred.purgeUnreadableKey()
             isUnlocked = cred.hasSavedKey
+            // 2026-11-05：进页面先把历史脏域名就地修掉。
+            // 用户明确说域名不是他填的、是代码的问题 → 那就由代码自己改回来，
+            // 不能让他再去手动删一遍重打（他已经被这个坑挡了一整天）。
+            let repairs = RelayAdminCredential.repairStoredHosts()
+            awayURL = cred.awayURL
+            awayHint = repairs.isEmpty ? nil : "已自动纠正域名：" + repairs.joined(separator: "，")
             refreshRoute()
             startNetworkWatch()
         }
@@ -574,9 +699,52 @@ struct RelayAdminView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                             .opacity(routeLabel.contains("在家") ? 0.45 : 1)
                             .onChange(of: awayURL) { v in
+                                // 2026-11-05：用户要求「代码自己改对」——存进来先过自愈，
+                                // 疑似同一域名的错拼直接替换成正确域名再落盘，不留脏值。
+                                //
+                                // ⚠️ 这里**不改 awayHint**：给 awayURL 赋值会再次触发本回调，
+                                // 第二次进来 v 已是正确值，若在此设/清提示会闪一下就没，
+                                // 用户等于什么都没看见。提示统一由 onAppear 的修复记录给出。
+                                if let fixed = RelayAdminCredential.repairedAwayURL(v), fixed != v {
+                                    awayURL = fixed
+                                    RelayAdminCredential.shared.awayURL = fixed
+                                    refreshRoute()
+                                    return
+                                }
                                 RelayAdminCredential.shared.awayURL = v
                                 refreshRoute()
                             }
+                        // 拼写提醒（黄色，不阻断保存）+ 一键改回默认
+                        if let h = awayHint {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(alignment: .top, spacing: 6) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.orange)
+                                    Text(h)
+                                        .font(.caption2)
+                                        .foregroundColor(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                // 2026-11-05：光提醒不够——用户已经存错的那个值还在，
+                                // 得给一条"点一下就修好"的路，否则他还得自己删掉重打一遍。
+                                Button(action: {
+                                    awayURL = RelayAdminCredential.defaultAwayURL
+                                    RelayAdminCredential.shared.awayURL = awayURL
+                                    awayHint = nil
+                                    refreshRoute()
+                                }) {
+                                    Text(L10n.t("i18n_1641"))
+                                        .font(.caption2.weight(.semibold))
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.mini)
+                            }
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.orange.opacity(0.10))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
                     }
                 }
 
@@ -817,7 +985,10 @@ struct RelayAdminWebView: UIViewRepresentable {
         URLSession.shared.dataTask(with: req) { _, resp, err in
             DispatchQueue.main.async {
                 if let err = err {
-                    completion(false, "连接失败：\(err.localizedDescription)")
+                    // 2026-11-05：原来只是一句「连接失败：\(err.localizedDescription)」，
+                    // 系统原文是英文的 "A server with the specified hostname could not be found."，
+                    // 中文界面里既突兀又没告诉他「域名可能拼错了」。
+                    completion(false, RelayAdminCredential.explain(err, addr: addr))
                     return
                 }
                 guard let http = resp as? HTTPURLResponse else {
@@ -891,6 +1062,10 @@ struct RelayAdminWebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
             slowHintItem?.cancel()
             parent.isLoading = false
+            // 2026-11-05：这条以前只停转圈、不报错——用户看到的就是纯白一片。
+            let ns = error as NSError
+            if ns.code == NSURLErrorCancelled { return }
+            parent.onLoadFailed?(RelayAdminCredential.explain(error, addr: webView.url?.absoluteString ?? ""))
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -900,7 +1075,8 @@ struct RelayAdminWebView: UIViewRepresentable {
             // 用户取消/被中断不算失败，别误报。
             let ns = error as NSError
             if ns.code == NSURLErrorCancelled { return }
-            parent.onLoadFailed?(error.localizedDescription)
+            // 用 error 里的 host 翻译——webView.url 在这种失败下常常还是上一页的地址
+            parent.onLoadFailed?(RelayAdminCredential.explain(error, addr: webView.url?.absoluteString ?? ""))
         }
     }
 }

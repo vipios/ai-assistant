@@ -485,7 +485,12 @@ struct SettingsView: View {
             return L10n.t("i18n_228")
         }
         if m.isDownloading {
+            // 测速阶段还没有百分比，单独说一句，否则会显示「正在下载 0%」像卡住
+            if let p = m.phase, !p.isEmpty { return p }
             let pct = Int(m.downloadProgress * 100)
+            if let src = m.downloadSource, !src.isEmpty {
+                return L10n.t("i18n_1636", m.latestVersion ?? "", pct, src)
+            }
             return L10n.t("i18n_229", m.latestVersion ?? "", pct)
         }
         if m.updateAvailable, let v = m.latestVersion {
@@ -590,6 +595,14 @@ struct UpdateView: View {
     
     private var updateSubtitle: String {
         if updateManager.isChecking { return L10n.t("i18n_235") }
+        if updateManager.isDownloading {
+            if let p = updateManager.phase, !p.isEmpty { return p }
+            let pct = Int(updateManager.downloadProgress * 100)
+            if let src = updateManager.downloadSource, !src.isEmpty {
+                return L10n.t("i18n_1636", updateManager.latestVersion ?? "", pct, src)
+            }
+            return L10n.t("i18n_236", updateManager.latestVersion ?? "", pct)
+        }
         if updateManager.downloadProgress > 0 { return L10n.t("i18n_236", updateManager.latestVersion ?? "", Int(updateManager.downloadProgress*100)) }
         if updateManager.updateAvailable, let v = updateManager.latestVersion {
             return L10n.t("i18n_237", v)
@@ -654,10 +667,51 @@ struct UpdateView: View {
                             .font(.caption)
                     }
                 }
+                // 2026-11-05：这里原来只有一行"镜像源"，用户没法知道现在到底用没用上。
+                // 把「怎么选源」和「实测最快的是谁」直接摆出来，省得来回猜。
+                // 这一页一进来就已经自动测过速了（见 body 里的 onAppear），
+                // 所以这里显示的是本次真实结果，不是上次的旧数字。
+                Text(L10n.t("i18n_1638"))
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                HStack {
+                    Text(L10n.t("i18n_1639"))
+                        .font(.caption)
+                    Spacer()
+                    if updateManager.isProbingSources {
+                        HStack(spacing: 5) {
+                            ProgressView().scaleEffect(0.6)
+                            Text(L10n.t("i18n_1642"))
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    } else if let best = updateManager.bestSourceLabel() {
+                        Text(best)
+                            .font(.caption)
+                            .foregroundColor(.green)
+                    } else {
+                        Text(L10n.t("i18n_1643"))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                // 手动重测：网络环境变了（比如刚切了流量）可以立刻重排一次
+                Button(action: { updateManager.probeSourcesIfNeeded(force: true) }) {
+                    HStack {
+                        Image(systemName: "speedometer")
+                            .foregroundColor(.blue)
+                        Text(L10n.t("i18n_1644"))
+                        Spacer()
+                    }
+                }
+                .disabled(updateManager.isProbingSources)
             }
         }
         .navigationTitle(L10n.t("i18n_1170"))
         .navigationBarTitleDisplayMode(.inline)
+        // 2026-11-05（用户要求）：进这一页就自动判定哪条线路最快，
+        // 点更新时直接用最快的那个，不用当场等测速。
+        .onAppear { updateManager.probeSourcesIfNeeded() }
         .sheet(isPresented: $showMirrorEditor) {
             NavigationView {
                 Form {

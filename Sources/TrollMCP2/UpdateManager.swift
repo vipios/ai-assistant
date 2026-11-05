@@ -17,9 +17,7 @@ final class UpdateManager: ObservableObject {
     @Published var hasUpdateRedDot = false
     @Published var errorMessage: String?
     @Published var downloadedIPAURL: URL?
-    /// 2026-11-05：本次下载的包在 Documents 里的落点（安装与兜底分享都用它）
-    private var stagedURL: URL?
-    /// v4.3.35：自动安装成功提示（副标题/状态行显示"已自动安装"）
+    /// v4.3.35：下载完成后的提示（副标题/状态行显示"安装包已下载好"）
     @Published var installMessage: String?
     /// v4.5.x：最近一次静默安装失败码（170/171/177/178/181 等），UI 可显示具体原因
     @Published var installFailureCode: Int32?
@@ -417,7 +415,96 @@ final class UpdateManager: ObservableObject {
 
     // MARK: - 下载 + 安装（v4.3.30 多源链）
 
-    /// 下载链：GitHub artifact(直连) → 滚动 Release(latest, 直连) → 各镜像前缀 × (artifact / Release)
+    /// 2026-11-05：本次实际从哪个源下载（界面副标题显示）
+    @Published var downloadSource: String?
+    /// 2026-11-05：测速后记下的最快镜像前缀（空串 = GitHub 直连）。
+    /// 只用于界面展示和落盘记录——**不再用于把直链交给 TrollStore**，
+    /// 自动安装那条路已经整段删掉了（用户要求只走分享菜单手动装）。
+    private(set) var bestPrefix: String = ""
+    /// 2026-11-05：测速结果缓存（按速度降序）。空数组 = 还没测过。
+    private var rankedCache: [(label: String, prefix: String, speed: Double)] = []
+    /// 2026-11-05：正在测速时置 true。界面用它显示「正在测速…」
+    @Published var isProbingSources = false
+    /// 上次测速的时间。超过 `probeTTL` 就重测（网络环境会变）
+    private var lastProbeAt: Date?
+    /// 2026-11-05：测速结果有效期。
+    ///
+    /// 为什么需要过期：用户可能早上连 WiFi 测出 ghfast 最快，中午切到流量，
+    /// 下午点更新还拿早上的结果去下——那时候 gh-proxy 可能才是通的。
+    /// 10 分钟够覆盖「进设置页看一眼→回来点更新」这个真实使用节奏，
+    /// 又不会把几小时前的旧排名当真。
+    private let probeTTL: TimeInterval = 600
+
+    /// 测速入口（可在进入更新页时提前调用）。
+    ///
+    /// 2026-11-05 用户要求：「进来就自动判定哪条线路最快，点更新就直接用最快的那个」。
+    /// 所以测速不再绑在 `downloadAndInstall` 里等下载时才跑，
+    /// 而是页面一进来就并发测好并缓存。点更新时如果缓存还新鲜（10 分钟内），
+    /// 直接用它——用户点了按钮立刻就开始下，不用再干等 8 秒。
+    ///
+    /// `force = true` 用于「用户手动点重新测速」或上次测速全部失败的情况。
+    func probeSourcesIfNeeded(force: Bool = false) {
+        if !force, !rankedCache.isEmpty, let t = lastProbeAt,
+           Date().timeIntervalSince(t) < probeTTL {
+            return   // 缓存新鲜，不重复测（省流量也省时间）
+        }
+        probeSources(force: force)
+    }
+
+    private func probeSources(force: Bool) {
+        guard !isProbingSources else { return }
+        isProbingSources = true
+
+        let releaseURL = Self.releaseURL(repo: repo)
+        // 参与测速的源：GitHub 直连 + 各镜像。直连也测——它要是真的快（有梯子/海外网络），
+        // 不该被硬性排到镜像后面。
+        var targets: [(label: String, prefix: String, url: String)] = [("GitHub", "", releaseURL)]
+        for m in mirrors { targets.append((Self.prettyHost(m), m, m + releaseURL)) }
+
+        UpdateSourceProbe.shared.rank(targets) { [weak self] ranked in
+            guard let self = self else { return }
+            var ordered = Self.orderBySpeed(ranked)
+            // 兜底：rank 在某些情况下会返回空（URL 构造失败、所有 target 都被过滤）。
+            // 那时候不能直接报「所有源都失败」——测速失败不等于下载不了，
+            // 老老实实按「镜像优先、直连垫底」的原顺序再走一遍。
+            if ordered.isEmpty {
+                // 注意这里必须显式写标签：Swift 的元组标签不会隐式推断，
+                // 写成 `($0.label, $0.prefix, 0.0)` 得到的是无标签元组，
+                // 跟 orderBySpeed 的签名对不上，编译直接报错。
+                ordered = Self.orderBySpeed(targets.map {
+                    (label: $0.label, prefix: $0.prefix, speed: 0.0)
+                })
+            }
+            self.rankedCache = ordered
+            self.lastProbeAt = Date()
+            self.isProbingSources = false
+            self.bestPrefix = ordered.first?.prefix ?? ""
+            UserDefaults.standard.set(self.bestPrefix, forKey: "trollmcp2.update_best_prefix")
+            // 落到 UserDefaults 的不只是前缀，还有"这次测出来哪个最快"的显示名，
+            // 让设置页不用等第二次测速就能显示结果。
+            UserDefaults.standard.set(ordered.first?.label ?? "", forKey: "trollmcp2.update_best_label")
+        }
+    }
+
+    /// 当前测速结论的一句话（给界面显示，测过才有值）
+    func bestSourceLabel() -> String? {
+        if isProbingSources { return nil }
+        if let l = rankedCache.first?.label, let s = rankedCache.first?.speed, s > 0 {
+            return "\(l) · \(Int(s / 1024)) KB/s"
+        }
+        if let l = rankedCache.first?.label { return l }
+        let saved = UserDefaults.standard.string(forKey: "trollmcp2.update_best_label") ?? ""
+        return saved.isEmpty ? nil : saved
+    }
+
+    /// 下载链：**用已测好的排序**，从最快的源开始下，失败依次降级。
+    ///
+    /// 2026-11-05 改动（用户要求「哪个快用哪个」+「点更新直接用最快那条」）：
+    ///   旧顺序是写死的 GitHub 直连 → ghfast → gh-proxy。
+    ///   国内直连 GitHub 下载基本只能等到 30 秒超时，等于加速镜像是失败后的备胎，
+    ///   主路径永远是「先白等半分钟」。
+    ///   现在：测速在进入更新页时就已经做完（见 probeSourcesIfNeeded），
+    ///   点更新时若缓存新鲜就直接开下；不新鲜才当场补测一次。
     func downloadAndInstall() {
         guard let version = latestVersion else {
             errorMessage = L10n.t("i18n_663")
@@ -425,22 +512,100 @@ final class UpdateManager: ObservableObject {
         }
         isDownloading = true
         downloadProgress = 0
+        downloadSource = nil
         errorMessage = nil
 
-        let releaseURL = "https://github.com/\(repo)/releases/download/latest/TrollAgent.tipa"
+        // 缓存新鲜 → 直接开下，不等测速。这是「点更新立刻就用最快线路」的关键：
+        // 早先版本把测速塞在下载函数里，用户点一下要先看 8 秒「正在测速」才动，
+        // 体感上就是"点了没反应"。
+        if !rankedCache.isEmpty, let t = lastProbeAt,
+           Date().timeIntervalSince(t) < probeTTL {
+            startDownload(ordered: rankedCache, version: version)
+            return
+        }
+
+        // 缓存是空的或过期了（用户可能没进过更新页直接点的更新）→ 当场补测一次
+        phase = L10n.t("i18n_1635")
+        isProbingSources = true
+        let releaseURL = Self.releaseURL(repo: repo)
+        var targets: [(label: String, prefix: String, url: String)] = [("GitHub", "", releaseURL)]
+        for m in mirrors { targets.append((Self.prettyHost(m), m, m + releaseURL)) }
+
+        UpdateSourceProbe.shared.rank(targets) { [weak self] ranked in
+            guard let self = self else { return }
+            self.isProbingSources = false
+            var ordered = Self.orderBySpeed(ranked)
+            if ordered.isEmpty {
+                ordered = Self.orderBySpeed(targets.map {
+                    (label: $0.label, prefix: $0.prefix, speed: 0.0)
+                })
+            }
+            self.rankedCache = ordered
+            self.lastProbeAt = Date()
+            self.bestPrefix = ordered.first?.prefix ?? ""
+            UserDefaults.standard.set(self.bestPrefix, forKey: "trollmcp2.update_best_prefix")
+            UserDefaults.standard.set(ordered.first?.label ?? "", forKey: "trollmcp2.update_best_label")
+            self.startDownload(ordered: ordered, version: version)
+        }
+    }
+
+    /// 按已排序的源列表开下。分离出来是因为两条路（缓存命中 / 当场补测）最后都走这里。
+    private func startDownload(ordered: [(label: String, prefix: String, speed: Double)],
+                               version: String) {
+        let releaseURL = Self.releaseURL(repo: repo)
+        phase = nil
+        // 尝试链：排序后的每个源先下 Release 本体；
+        // artifact（需要 token 的 zip）统一压到最后——它是兜底，不该占主路径的时间。
         var attempts: [(url: String, isArtifact: Bool)] = []
-        if let art = artifactDownloadURL { attempts.append((art, true)) }
-        attempts.append((releaseURL, false))
-        for m in mirrors {
-            if let art = artifactDownloadURL { attempts.append((m + art, true)) }
-            attempts.append((m + releaseURL, false))
+        for s in ordered {
+            attempts.append((s.prefix + releaseURL, false))
+        }
+        if let art = artifactDownloadURL {
+            attempts.append((art, true))
+            for s in ordered where !s.prefix.isEmpty {
+                attempts.append((s.prefix + art, true))
+            }
+        }
+        if let first = ordered.first {
+            downloadSource = first.label
         }
         attemptDownload(attempts, index: 0, version: version)
+    }
+
+    private static func releaseURL(repo: String) -> String {
+        "https://github.com/\(repo)/releases/download/latest/TrollAgent.tipa"
+    }
+
+    /// 当前阶段提示（测速中 / 下载中），界面优先显示这句
+    @Published var phase: String?
+
+    /// 测速结果排序 + 全挂时的人工兜底顺序。
+    private static func orderBySpeed(_ ranked: [(label: String, prefix: String, speed: Double)])
+        -> [(label: String, prefix: String, speed: Double)] {
+        // rank() 已经按速度降序排好。这里只处理一种情况：**全都是 0**。
+        // 全 0 说明测速时一个都没连上（机场抖动、镜像临时挂），
+        // 此时镜像比直连更可能通，所以把镜像提到前面，直连垫底。
+        let allZero = ranked.allSatisfy { $0.speed <= 0 }
+        guard allZero else { return ranked }
+        let mirrors = ranked.filter { !$0.prefix.isEmpty }
+        let direct = ranked.filter { $0.prefix.isEmpty }
+        return mirrors + direct
+    }
+
+    /// 镜像前缀 → 好读的域名（界面显示用，去掉协议和末尾斜杠）
+    static func prettyHost(_ prefix: String) -> String {
+        var s = prefix
+        for p in ["https://", "http://"] where s.hasPrefix(p) {
+            s = String(s.dropFirst(p.count))
+        }
+        while s.hasSuffix("/") { s.removeLast() }
+        return s.isEmpty ? prefix : s
     }
 
     private func attemptDownload(_ attempts: [(url: String, isArtifact: Bool)], index: Int, version: String) {
         guard index < attempts.count else {
             isDownloading = false
+            phase = nil
             errorMessage = L10n.t("i18n_664")
             return
         }
@@ -449,6 +614,10 @@ final class UpdateManager: ObservableObject {
             attemptDownload(attempts, index: index + 1, version: version)
             return
         }
+        // 真正开始下载了，测速阶段那句话就该撤掉
+        phase = nil
+        // 界面照实说这次走的是哪个源（换源降级时也跟着变）
+        downloadSource = Self.sourceLabel(for: attempt.url)
         var req = URLRequest(url: url)
         req.timeoutInterval = 30
         let task = URLSession.shared.downloadTask(with: req) { [weak self] tempURL, resp, error in
@@ -475,6 +644,20 @@ final class UpdateManager: ObservableObject {
             DispatchQueue.main.async { self?.downloadProgress = p.fractionCompleted }
         }
         task.resume()
+    }
+
+    /// 从完整下载 URL 反推「这次走的是哪个源」，给界面显示用。
+    /// 不用 bestPrefix —— 换源降级时那条已经不准了，直接看 URL 前缀最诚实。
+    private static func sourceLabel(for url: String) -> String {
+        if url.hasPrefix("https://github.com/") || url.hasPrefix("https://api.github.com/") {
+            return "GitHub"
+        }
+        if let r = url.range(of: "://") {
+            let rest = url[r.upperBound...]
+            let host = rest.split(separator: "/").first.map(String.init) ?? ""
+            return host.isEmpty ? "Mirror" : host
+        }
+        return "Mirror"
     }
 
     /// 处理下载结果：artifact zip → 解压出 TrollAgent.tipa；Release 资产 → tipa 本体。
@@ -516,9 +699,16 @@ final class UpdateManager: ObservableObject {
             let staged = Self.stageIPAForInstall(f)
             DispatchQueue.main.async {
                 self.isDownloading = false
-                self.stagedURL = staged
+                self.phase = nil
                 self.downloadedIPAURL = staged
                 self.installMessage = L10n.t("i18n_1620")
+                // 2026-11-05：包已经下好、分享菜单也弹出来了，这一轮的「有新版」到此结束。
+                // 原来这件事由 markHandedOff 做（它跟着自动安装那段一起被删了），
+                // 现在归到这里——否则红点会一直亮着，用户以为没更新成功。
+                self.updateAvailable = false
+                self.hasUpdateRedDot = false
+                UserDefaults.standard.set("same", forKey: self.kResult)
+                self.lastResult = "same"
                 SharePresenter.present([staged]) { [weak self] ok, error in
                     if let error = error {
                         self?.errorMessage = L10n.t("i18n_669", error.localizedDescription)
@@ -533,143 +723,7 @@ final class UpdateManager: ObservableObject {
         }
     }
 
-    /// 更新安装交给 TrollStore 接管（根治自覆盖闪退/半覆盖）。
-    /// 背景：trollstorehelper install 装的是本 App 自己——helper 安装前先杀运行中进程，
-    /// 本 App 被 kill → 闪退 + 后续 UI 全部丢失；若安装/注册失败则半覆盖（TrollStore 不显示）。
-    /// 交给 TrollStore 后由它完成 杀进程→安装→注册→失败回滚，全程它的 UI。
-    ///
-    /// **2026-11-05 起自动调用已停用**（用户要求）。`processDownloaded` 不再走这里，
-    /// 改为下载完只弹分享菜单，用户手动点「用 TrollStore 安装」才跳（那条路在 ShareCenter.openInTrollStore）。
-    /// 本函数保留原样，仅作为「自动跳转」旧逻辑的存档；要恢复自动跳转，把
-    /// processDownloaded 末尾那段换回 `installIPA(at: f)` 即可。
-    /// 注意它包含 3.5 秒兜底 → installViaRemotePackage()，那是 TrollStore「再下一遍」的来源。
-    func installIPA(at url: URL) {
-        // v7.1.96：强制主线程——downloadTask 完成回调在后台线程，后台线程
-        // canOpenURL/open 静默失败 → 更新完不跳 TrollStore（用户实测：
-        // '检查更新没跳转到巨魔安装，只有分享菜单的储存按钮有效'）
-        guard Thread.isMainThread else {
-            DispatchQueue.main.async { self.installIPA(at: url) }
-            return
-        }
-        // 先把包挪出 tmp，并统一成 .ipa 后缀（TrollStore 只认 ipa / tipa 两种后缀）
-        let target = Self.stageIPAForInstall(url)
-        stagedURL = target
-
-        // ── 2026-11-05 重写：这次是照着 TrollStore 真源码改的，不是猜 ──
-        // 源码（TSSceneDelegate.m）里 TrollStore 只有两条收包入口：
-        //   ① 文件 URL 直接打进来（isFileURL 分支）→ 读本地包 → 弹安装确认 → 安装。
-        //      这是从 1.x 起就有的「把 ipa 交给 TrollStore」正路，也是你在「文件」里
-        //      分享给 TrollStore 走的那条 —— **跟版本无关，Lite 版同一条代码**。
-        //   ② apple-magnifier://install?url=... → 走 handleAppInstallFromRemoteURL，
-        //      内部是 NSURLSessionDownloadTask，**只认 http/https**。
-        //      给它 file:// 必报 "unsupported URL" —— 这就是「跳过去了却装不上」的真因。
-        //      以前那几个 trollstore:// 前缀更是白写：TrollStore 根本没注册这个 scheme。
-        // 所以顺序改成：本地包直投 → 没接住再让 TrollStore 自己去下直链。
-        UIApplication.shared.open(target, options: [:]) { [weak self] ok in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                guard ok else {
-                    // 没有任何 App 认领 ipa/tipa（TrollStore 没装或被禁用）
-                    self.installViaRemotePackage()
-                    return
-                }
-                // open 返回 true 也可能是「其实没人接」——系统有时会静默吞掉。
-                // 判据：真把包交出去了，本 App 一定会被切到后台。
-                //
-                // 2026-11-05 修用户反馈「跳转安装时又要下载一遍，ipa 下了一遍、
-                // 巨魔里又下了一遍」：那是走了兜底 installViaRemotePackage（http 直链，
-                // TrollStore 自己再下一遍）。误触发的根源是判定太粗糙。
-                //
-                // 现在改成「**是否曾经离开过前台**」判定，而不是看 3.5 秒那一刻的状态：
-                //   · App 一旦进过后台，说明系统真的把 ipa 交给别的 App 了 → 交付成功；
-                //   · 只有从头到尾一直停在前台，才是真没交出去 → 才允许走远程兜底。
-                // 用「曾经」而不是「此刻」，是因为用户可能手动切回本 App 看进度，
-                // 那一刻 applicationState 又是 .active —— 旧写法会因此误判、白下一遍。
-                self.wasBackgroundedForInstall = false
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) {
-                    if self.wasBackgroundedForInstall {
-                        // 交出去过 → 成功，绝不重复下载
-                        self.markHandedOff()
-                    } else {
-                        // 全程没离开前台 → TrollStore 没接住
-                        self.installViaRemotePackage()
-                    }
-                }
-            }
-        }
-    }
-
-    /// 本次交接期间 App 是否进过后台。
-    /// 由 SceneDelegate / 生命周期通知写入（见 UpdateManager 的 observeLifecycle）。
-    /// 只要进过一次，就说明 ipa 真的被别的 App 接走了。
-    private(set) var wasBackgroundedForInstall = false
-
-    /// 标记「交接期间进过后台」。供 App 生命周期回调调用（只在安装交接窗口内有效）。
-    func noteBackgroundedForInstall() {
-        if stagedURL != nil { wasBackgroundedForInstall = true }
-    }
-
-    /// 兜底二：把公开 Release 里的 tipa 直链交给 TrollStore，由它自己下载并安装。
-    /// 仓库是公开的，这条 https 直链不需要任何 token —— 和「浏览器里点链接直装」是同一条路。
-    ///
-    /// 2026-11-05：**不绑定 TrollStore 版本**。用户机上是 com.opa334.TrollStoreLite，不是 2.1.1，
-    /// 而 scheme 名字在历史上换过：1.3 以前用 trollstore://，1.3 起改成顶替系统的
-    /// apple-magnifier://。所以两个都试一遍，哪个能打开就用哪个，都打不开才走分享。
-    private func installViaRemotePackage() {
-        let rel = "https://github.com/\(repo)/releases/latest/download/TrollAgent.tipa"
-        // 整段完全百分号编码：TrollStore 拿到的是 queryItems 里已经解码的值，
-        // 少编一个 `&` `#` 它就只读到半截地址。
-        let encoded = rel.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? rel
-        tryRemoteSchemes(prefixes: ["apple-magnifier://install?url=",
-                                    "trollstore://install?url=",
-                                    "trollstore://install/?url="],
-                         encoded: encoded, index: 0)
-    }
-
-    private func tryRemoteSchemes(prefixes: [String], encoded: String, index: Int) {
-        guard index < prefixes.count else {
-            giveUpToShare()
-            return
-        }
-        guard let u = URL(string: prefixes[index] + encoded) else {
-            tryRemoteSchemes(prefixes: prefixes, encoded: encoded, index: index + 1)
-            return
-        }
-        UIApplication.shared.open(u, options: [:]) { [weak self] ok in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if ok { self.markHandedOff() }
-                else { self.tryRemoteSchemes(prefixes: prefixes, encoded: encoded, index: index + 1) }
-            }
-        }
-    }
-
-    /// 两条自动路径都不通 → 分享菜单兜底（用户自己选 TrollStore / 储存）
-    ///
-    /// **2026-11-05 起已无调用方**：`processDownloaded` 不再走 installIPA → 不会再进到这里。
-    /// 保留是因为 `installIPA` 整段作为「自动跳转」存档还在，它内部会调过来。
-    /// 真要恢复自动跳转时这行代码仍然是对的。
-    private func giveUpToShare() {
-        guard let f = stagedURL ?? downloadedIPAURL else {
-            errorMessage = L10n.t("i18n_1231")
-            return
-        }
-        errorMessage = L10n.t("i18n_1231")
-        fallbackShareInstall(f)
-    }
-
-    /// 已经交出去了：熄灭红点、清掉落盘的「有新版」，并提示别在安装过程中打开本 App
-    private func markHandedOff() {
-        isDownloading = false
-        downloadedIPAURL = nil
-        updateAvailable = false
-        hasUpdateRedDot = false
-        installMessage = L10n.t("i18n_1230")
-        UserDefaults.standard.set("same", forKey: kResult)
-        lastResult = "same"
-    }
-
-    /// 把下载好的包放到 Documents 下再交给 TrollStore（tmp 不可靠）
+    /// 把下载好的包放到 Documents 下，交给分享菜单去处理（tmp 目录不可靠）。
     /// 后缀统一成 .ipa：TrollStore 的文件分支只认 ipa / tipa，而 .ipa 是系统已知类型，
     /// 交给系统时被正确识别的概率最高。
     private static func stageIPAForInstall(_ url: URL) -> URL {
@@ -685,15 +739,6 @@ final class UpdateManager: ObservableObject {
             return dest
         } catch {
             return url
-        }
-    }
-
-    /// 分享菜单兜底：TrollStore OpenIn 或保存安装包（不再 spawnRoot 自装——自装=闪退根因）
-    private func fallbackShareInstall(_ url: URL) {
-        SharePresenter.present([url]) { [weak self] completed, error in
-            if let error = error {
-                self?.errorMessage = L10n.t("i18n_669", error.localizedDescription)
-            }
         }
     }
 }

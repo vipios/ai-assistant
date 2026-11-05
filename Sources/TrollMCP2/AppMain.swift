@@ -126,6 +126,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         Workspace.ensure()
         Workspace.ensureBundledTweaks()  // v2.9.62：把内置 dylib（MemoryTweak 等）复制到工作区，AI 可直接 artifact.find 定位
         ConfigMigration.migrateIfNeeded()  // v2.9.126：配置 schema 迁移（防模块脱节：升级后旧配置结构自动搬运）
+        // 2026-11-05：启动时把历史脏域名就地纠正（`relayadmin.awayurl` / `router.wan_host`）。
+        // 用户明确「域名不是我填的、是代码写错了」—— 那就在任何页面读它之前由代码自己修好，
+        // 不依赖用户进到中转站页面才触发，避免别的入口先读到脏值。
+        RelayAdminCredential.repairStoredHosts()
         // v7.1.51：强制初始化 ModelStore——static let 是懒加载，用户只开关于页不碰聊天/模型页时
         // load() 永不执行 → 共享配置文件不写 → HUD 读 sharedFile=NO 401 无回复（17:21 实测根因）
         _ = ModelStore.shared
@@ -255,11 +259,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     // v2.9.10：进后台时申请后台任务，让正在进行的请求有保活窗口（最多 3 分钟）
     func applicationDidEnterBackground(_ application: UIApplication) {
-        // 2026-11-05：安装交接期间进过后台 → 说明 ipa 真的被 TrollStore 接走了。
-        // UpdateManager.installIPA 靠这个标记判断「要不要走远程兜底」——
-        // 旧写法看 3.5 秒那一刻的 applicationState，用户手动切回来就会误判，
-        // 于是又走 http 直链、TrollStore 又下一遍（用户反馈「ipa 下了一遍、巨魔里又下了一遍」）。
-        UpdateManager.shared.noteBackgroundedForInstall()
+        // 2026-11-05（用户要求）：这里原来调 UpdateManager.noteBackgroundedForInstall()，
+        // 是给「下载完自动跳 TrollStore」那套判定用的 —— 它靠「这次进过后台没有」
+        // 来猜 ipa 有没有交出去，猜错就走 apple-magnifier 让 TrollStore 再下一遍。
+        // 现在自动安装整段删掉了（更新成功只弹分享菜单，用户自己点安装），
+        // 这套判定没有任何用处，调用一并删除，免得以后又被当成"还在用"。
         // 2026-11-03：进后台时补写「正常退出」标记。
         // 用户平时是划到后台而不是杀进程，所以这个时机最能代表「App 是正常被挂起的」。
         // 下次冷启动若发现标记太旧/不存在，才判定上次是崩了。

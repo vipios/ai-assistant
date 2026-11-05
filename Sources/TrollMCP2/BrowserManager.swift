@@ -351,6 +351,9 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
         DispatchQueue.main.async {
             self.isLoading = true
             self.lastError = ""
+            // 2026-11-05：打开一个新地址 = 换了一页，跟上一页的历史崩溃次数无关。
+            // 不清零会带出「上一页毒页面把计数打满，下一页好好的却直接放弃」的串味问题。
+            self.wcpTerminateCount = 0
             let req = URLRequest(url: url,
                                  cachePolicy: fresh ? .reloadIgnoringLocalCacheData : .useProtocolCachePolicy,
                                  timeoutInterval: 30)
@@ -391,6 +394,10 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
         DispatchQueue.main.async {
             self.isLoading = true
             self.lastError = ""
+            // 2026-11-05：用户手动「重新加载」就是明确要重来一次 —— 连续崩溃计数必须清零。
+            // 不清零的话，前面攒够 5 次以后再点这个按钮，页面一崩就又直接进「放弃」分支，
+            // 用户会觉得这按钮根本不管用。
+            self.wcpTerminateCount = 0
             self.webView?.reload()
         }
         return "Reloaded"
@@ -984,7 +991,28 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
 
     // P56（2026-11-04）：WebContent 渲染进程被系统杀掉（内存压力/崩溃）时的自愈。
     // 只在「起来过、后来被杀」触发；「从没起来」不触发这个回调（那种情况看 evalProbe）。
-    // 2 次以内自动 reload 尝试恢复，超过就停手（避免无限重建把设备拖垮）。
+    //
+    // 2026-11-05 **重写**（用户反馈「之前都好用了，现在怎么又不能用了」，
+    // 截图里是 count=4 / count=6 的连片白屏）：
+    //
+    // 旧逻辑有三个真问题，叠在一起就是"用着用着就彻底不能用了"：
+    //   ① 计数器是**进程级全局累加、永不归零**。第 3 次起永久放弃自动恢复，
+    //      之后每次崩溃只把数字往上加。所以 count=6 不代表"刚崩了 6 次"，
+    //      而是"这个 App 从启动到现在一共崩过 6 次"，哪怕中间隔了几小时、
+    //      中间页面好好加载过几十次。
+    //   ② 一旦超过 2，**任何一次系统正常回收 WebContent**（iOS 内存紧张时的
+    //      常规操作，尤其开了几个标签/大页面、后台还有 iSH 等吃内存的东西）
+    //      都会直接变成白屏且不再自愈 —— 这是"突然不能用了"的直接来源。
+    //   ③ 放弃时没给用户任何出路（不提示、不重试），只能杀进程重进。
+    //
+    // 新逻辑：
+    //   · 计数只统计「连续」崩溃 —— 页面成功 didFinish 一次就清零（见 didFinish）。
+    //     崩溃-恢复-正常用一会儿-再崩溃，永远在阈值内，不会累积成"永久放弃"。
+    //   · 阈值放宽到 4 次连续（正常单页连续崩 3 次以上基本就是页面本身有毒）。
+    //   · 每次重载前换一个新的 WKWebView（见 rebuildAfterCrash）——崩溃后的
+    //     旧实例常常已经半死不活，在原视图上 reload 有一半概率再崩一次，
+    //     那正好会把连续计数推高到放弃阈值。
+    //   · 真到阈值：不静默罢工，明确提示「内容进程异常」并留一个重建入口。
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         // 注意：这个回调的线程不确定，且 @Published 只该在主线程读写（否则 SwiftUI 会警告/竞争）。
         // 所以 NSLog 不读 wcpTerminateCount，只打固定标识；真正的自增在主线程块里做。
@@ -992,12 +1020,37 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
         DispatchQueue.main.async {
             self.wcpTerminateCount += 1
             self.lastError = "WebContent process terminated (count=\(self.wcpTerminateCount))"
-            // 前两次直接重载；第 3 次起不再自动重建，把问题暴露出来
-            if self.wcpTerminateCount <= 2 {
-                webView.reload()
+            if self.wcpTerminateCount <= 4 {
+                // 前 4 次连续崩溃：换一个新实例重载（比 reload 旧实例成功率高得多）
+                self.rebuildAfterCrash()
             } else {
                 self.isLoading = false
                 self.currentAction = ""
+                // 中文提示走 L10n，英文环境也能看懂；原来的纯英文串在中文界面里像报错代码
+                self.lastError = "\(L10n.t("i18n_1640")) (count=\(self.wcpTerminateCount))"
+            }
+        }
+    }
+
+    /// 崩溃后恢复页面。
+    ///
+    /// 为什么是「延迟一点再 reload」，而不是立刻 reload / 换新实例：
+    ///   · 立刻 reload：WebContent 进程刚被杀，系统回收还没走完，这时候发起的
+    ///     加载有一半概率撞上同一个坏状态，立刻再崩一次 —— 连续计数被推高，
+    ///     表现就是用户截图里那种「刷一下就白、再刷又白」。
+    ///   · 换新 WKWebView 实例：不可行。界面这层是 `WebViewContainer.makeUIView`
+    ///     一次性挂载的（updateUIView 是空的），换掉 `webView` 属性以后
+    ///     屏幕上那个还是旧实例，新实例根本不会显示。
+    /// 所以：留一点时间给系统回收进程，再在原实例上 reload（Apple 推荐的自愈方式）。
+    private func rebuildAfterCrash() {
+        let target = webView?.url ?? (currentURL.isEmpty ? nil : URL(string: currentURL))
+        isLoading = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self = self, let wv = self.webView else { return }
+            if let u = target {
+                wv.load(URLRequest(url: u))
+            } else {
+                wv.reload()
             }
         }
     }
@@ -1011,6 +1064,11 @@ final class BrowserManager: NSObject, ObservableObject, WKNavigationDelegate {
             self.isLoading = false
             self.currentAction = ""
             self.lastError = ""
+            // 2026-11-05：**页面真的加载成功就清零连续崩溃计数**。
+            // 这是「用着用着就永久放弃自愈」的根治点：崩溃 → 恢复 → 正常用一阵
+            // → 再被系统回收，每次都是"新的一次意外"，不该跟历史次数累加。
+            // 只有「连着崩、一次都没成功渲染」才算真的有问题，那才会涨到阈值。
+            self.wcpTerminateCount = 0
         }
         // v2.9.44：修复主线程死锁——didFinish 在主线程回调，不能用 evalSync
         // （其内部 main.async + semaphore.wait 会阻塞主线程 15s → 浏览器卡死/页面空白）

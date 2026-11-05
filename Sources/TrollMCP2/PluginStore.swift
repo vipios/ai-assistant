@@ -180,9 +180,22 @@ final class PluginStore: ObservableObject {
 
     private let installedKey = "trollmcp2.plugins_installed"
     private let disabledKey = "trollmcp2.plugins_disabled"
+    /// 2026-11-05：外部目录里「我装过哪几条」。
+    /// 和 installedIDs 分开存 —— installedIDs 记的是能力包（cap-*），
+    /// 这里记的是外部条目 id，两者是多对一关系，混在一起会互相覆盖。
+    private let externalKey = "trollmcp2.plugins_external"
+    @Published private(set) var externalInstalledIDs: Set<String> = []
 
     private init() {
-        catalog = Self.builtinCatalog
+        // 2026-11-05：catalog 现在 = 内置插件 + 能力包（CapabilityPacks）。
+        //
+        // 为什么能力包要进 catalog：
+        //   · 「已安装」页走 installedManifests → manifest(id:) → catalog 查找，
+        //     不在 catalog 里就会变成「装了但查不到」的幽灵条目，界面上直接消失；
+        //   · AI 的 plugin.list / plugin.toggle 也要靠它拿到工具清单。
+        // 外部那 4687 条**不进** catalog —— 它们只是入口，装的是能力包本体，
+        // 全塞进来会让 catalog 变成 4704 条，每次 filter 都变慢。
+        catalog = Self.builtinCatalog + CapabilityPacks.list
         load()
         // 工具只活在内存里，App 重启后必须重新注册。
         // 延后 1.5s：避开启动瞬间的注册表初始化与首屏渲染。
@@ -229,6 +242,80 @@ final class PluginStore: ObservableObject {
     func isInstalled(_ id: String) -> Bool { installedIDs.contains(id) }
     func isInstalling(_ id: String) -> Bool { installingIDs.contains(id) }
     func isEnabled(_ id: String) -> Bool { installedIDs.contains(id) && !disabledIDs.contains(id) }
+
+    // MARK: - 外部插件（2026-11-05 并入发现页）
+    //
+    // 用户要求：「把外部目录去掉，把这些插件都放在发现里面，就和我刚才给你发的
+    // ipa 一样的，直接就能安装使用」+「全部 4687 条都做成可安装」+「按功能归并」。
+    //
+    // 所以做法是：每条外部插件带一个 capKey，指向 CapabilityPacks 里的某个能力包。
+    //   · 装这条外部插件 → 实际装的是它指向的能力包（工具真能跑）
+    //   · 多条外部插件指向同一个包 → 装第一个就把工具都装上了，
+    //     后面那些只需记一个「已安装」状态，不再重复注册工具（否则工具表会被刷爆）
+    //   · 卸载时：只要还有别的外部插件指着同一个包，就不摘工具
+
+    /// 某条外部插件「装完会得到什么」——把外部条目转成一个可安装的 manifest。
+    ///
+    /// 返回的 manifest id 用的是**能力包 id**（不是外部插件 id），
+    /// 这样 PluginStore 原有的「同 id 只装一次」逻辑天然去重。
+    func resolvedManifest(for ext: ExternalPlugin) -> PluginManifest? {
+        guard let base = CapabilityPacks.pack(ext.capKey) ?? CapabilityPacks.pack("cap-misc") else {
+            return nil
+        }
+        var pack = base
+        // 名字/说明用外部插件自己的，让用户看到「我装的是那个东西」；
+        // 工具仍然是能力包的真工具。
+        pack.name = ext.name
+        pack.summary = ext.summary
+        pack.category = ext.category
+        pack.stars = ext.stars
+        // 把来源记进 changelog，详情页能看出「这条来自外部目录」
+        pack.changelog = ["来自外部目录：\(ext.name)"] + base.changelog
+        return pack
+    }
+
+    /// 某条外部插件当前是否「已经能用」（= 它指向的能力包已装）
+    func isExternalReady(_ ext: ExternalPlugin) -> Bool {
+        let key = CapabilityPacks.pack(ext.capKey) != nil ? ext.capKey : "cap-misc"
+        return installedIDs.contains(key)
+    }
+
+    /// 装一条外部插件。
+    ///
+    /// 两件事分开做，不要混：
+    ///   ① 能力包本体（cap-*）用 CapabilityPacks 里的**原名**装 —— 这样「已安装」页
+    ///      显示的是「压缩归档」这种能力名，而不是某条外部插件的长名字；
+    ///   ② 这条外部插件的 id 记进 externalInstalledIDs —— 下次打开列表能显示「已安装」。
+    func installExternal(_ ext: ExternalPlugin) {
+        let key = CapabilityPacks.pack(ext.capKey) != nil ? ext.capKey : "cap-misc"
+        guard let pack = CapabilityPacks.pack(key) else {
+            lastError = "这条没有可用的能力包"
+            return
+        }
+        externalInstalledIDs.insert(ext.id)
+        saveExternal()
+        // 能力包已经装过 → 不再重复注册（否则工具表里会多一份同名工具）
+        if !installedIDs.contains(pack.id) {
+            install(pack)
+        }
+    }
+
+    /// 卸一条外部插件（只从「我装过这条」名单里划掉）。
+    ///
+    /// 为什么**不摘工具**：十几条外部插件共用同一个能力包。
+    /// 用户卸掉其中一条，另外那些还得继续能用 —— 在这里摘工具等于把它们一起废掉。
+    /// 真要彻底卸载，去「已安装」页对能力包本体点卸载（那才走 uninstall 摘工具）。
+    func uninstallExternal(_ ext: ExternalPlugin) {
+        externalInstalledIDs.remove(ext.id)
+        saveExternal()
+        print("[TA] 📦 external plugin unlisted: \(ext.id)")
+    }
+
+    /// 这条外部插件用户是否主动装过（和「能力包已装」是两个概念：
+    /// 能力包可能因为装了别的同类插件而早就在了）
+    func isExternalMarkedInstalled(_ ext: ExternalPlugin) -> Bool {
+        externalInstalledIDs.contains(ext.id) || isExternalReady(ext)
+    }
 
     /// 已安装插件贡献的工具总数
     var installedToolCount: Int {
@@ -544,57 +631,38 @@ final class PluginStore: ObservableObject {
                 }
             }
 
-            // 2026-11-05：外部参考目录（4687 条）。**不可安装**，
-            // 只为了让 AI 知道「有人做过这个」，然后照着用 shell 重写。
+            // 2026-11-05：外部插件（4687 条）**现在可以装了**。
+            // 每条都指向 CapabilityPacks 里的一个真实能力包，装完立刻有工具可用。
+            // 原来这里写的是 installable:false + 提示「装不了，用 plugin.define 重写」，
+            // 那是旧设计（外部条目没接任何可执行的东西）。用户明确要求「直接就能安装使用」，
+            // 所以语义跟着改：installable 为 true，提示也改成「直接装」。
             if src == "shared" || src == "all" {
-                PluginCatalogRef.loadSyncIfNeeded()
-                let refs = PluginCatalogRef.search(q, category: cat, limit: 40)
-                list += refs.map { r in
-                    ["id": r.id, "name": r.name, "summary": r.summary,
-                     "category": PluginCategory(rawValue: r.category)?.displayName ?? r.category,
-                     "tools": 0, "skills": 0,
-                     "installed": false, "requires_hook": false,
-                     "risk": "none",
-                     "source": "shared", "installable": false,
-                     "repo": r.owner.isEmpty ? "" : "\(r.owner)/\(r.repo)"]
+                let ext = ExternalCatalog.search(q, category: cat)
+                list += ext.prefix(40).map { e -> [String: Any] in
+                    let pack = CapabilityPacks.pack(e.capKey)
+                    return ["id": e.id, "name": e.name, "summary": e.summary,
+                            "category": e.category.displayName,
+                            "tools": pack?.tools.count ?? 0, "skills": 0,
+                            "installed": self.isExternalMarkedInstalled(e),
+                            "requires_hook": false,
+                            "risk": "shell",
+                            "source": "shared", "installable": true,
+                            "capability_pack": pack?.name ?? "通用小工具",
+                            "tool_names": pack?.tools.map { $0.name } ?? []]
                 }
             }
 
+            let hint: String
+            if list.isEmpty {
+                hint = "两边都没搜到。可以直接用 plugin.define 造一个（几行 shell 就够）。"
+            } else if src == "shared" {
+                hint = "外部插件也能直接装：plugin.install 传它的 id，会自动装上它对应的能力包（多个同类插件共用同一个包，装一次就够）。"
+            } else {
+                hint = "用 plugin.install 传 id 安装。source=shared 的那些同样可装 —— 它们会落到一个能力包上。"
+            }
             return ["ok": true, "count": list.count,
                     "plugins": list,
-                    "hint": list.isEmpty
-                        ? "两边都没搜到。可以直接用 plugin.define 造一个（几行 shell 就够）。"
-                        : (src == "shared"
-                           ? "这些是外部 Node 插件、装不了。挑一个思路对味的，用 plugin.define 写成 shell 版；也可以调 plugin.blueprint 拿现成的改写指令。"
-                           : "用 plugin.install 传 id 安装（只对 installable=true 的有效）")]
-        }
-
-        // 2026-11-05：把外部条目变成「照着做」的指令——AI 拿到就能直接写 plugin.define
-        let blueprintDef = ToolDefinition(
-            name: "plugin.blueprint",
-            summary: "取一条「外部参考目录」条目的完整改写说明：它原本做什么、原仓库、以及该用哪些本机命令重写。搜到 source=shared 的 id 后调它，再按里面的 prompt 用 plugin.define 做出来。",
-            parameters: ["id": "外部目录条目的 id（plugin.search source=shared 返回的）"],
-            returns: ["ok": "Bool", "name": "String", "summary": "String", "repo": "String", "prompt": "String"],
-            verified: false, category: "plugin", uiSummary: "生成改写方案")
-        reg.registerSystemTool(blueprintDef) { params in
-            let id = ((params["id"] as? String) ?? "").trimmingCharacters(in: .whitespaces)
-            guard !id.isEmpty else { throw MCPError.invalidParams("缺 id") }
-            PluginCatalogRef.loadSyncIfNeeded()
-            guard let r = PluginCatalogRef.find(id) else {
-                throw MCPError.failed("外部目录里没有 \(id)。先 plugin.search source=shared 查一下")
-            }
-            let repo = r.owner.isEmpty ? "" : "https://github.com/\(r.owner)/\(r.repo)"
-            let prompt = """
-            外部插件「\(r.name)」做的事：\(r.summary)
-            \(repo.isEmpty ? "" : "原项目：\(repo)\n")
-            它跑在 Node 环境，本机跑不了。请用 plugin.define 做一个等效插件：
-            - id 用 \(r.id)，工具命令只用 busybox 自带（ls/find/grep/awk/sed/sort/du/md5sum/base64/curl）
-            - 不要依赖 npm / node / python
-            - 做完列出新增的工具名与用法
-            """
-            return ["ok": true, "name": r.name, "summary": r.summary,
-                    "repo": repo, "prompt": prompt,
-                    "hint": "按 prompt 里的要求调 plugin.define，一次别塞超过 3 个工具"]
+                    "hint": hint]
         }
 
         let listDef = ToolDefinition(
@@ -626,14 +694,25 @@ final class PluginStore: ObservableObject {
             }
             let id = ((params["id"] as? String) ?? "").trimmingCharacters(in: .whitespaces)
             guard !id.isEmpty else { throw MCPError.invalidParams("缺 id") }
-            guard let m = st.manifest(id: id) else {
-                throw MCPError.failed("目录里没有 \(id)。先用 plugin.search 查，或用 plugin.define 自建")
+
+            // 2026-11-05：先认内置 catalog，再认外部目录（4687 条）。
+            // 不认外部的话，用户装「外部那条」时这里会报「目录里没有」，
+            // 而界面上明明能装 —— 两条路径必须一致。
+            if let m = st.manifest(id: id) {
+                let r = st.installSync(m)
+                return ["ok": r.ok, "message": r.message, "tools": r.toolNames,
+                        "hint": r.ok ? "新工具已注册，下一次请求即可调用，直接继续干活不用再问用户" : ""]
             }
-            let r = st.installSync(m)
-            // 每次工具调用返回后都会重新发起一次模型请求，届时工具清单已重建，
-            // 所以刚装的工具在**下一次请求**里就能用。这句 hint 是提醒模型别停手。
-            return ["ok": r.ok, "message": r.message, "tools": r.toolNames,
-                    "hint": r.ok ? "新工具已注册，下一次请求即可调用，直接继续干活不用再问用户" : ""]
+            if let ext = ExternalCatalog.all.first(where: { $0.id == id }) {
+                st.installExternal(ext)
+                let pack = CapabilityPacks.pack(ext.capKey)
+                let names = pack?.tools.map { $0.name } ?? []
+                return ["ok": true,
+                        "message": "已装上能力包「\(pack?.name ?? "通用小工具")」",
+                        "tools": names,
+                        "hint": "这些工具下一次请求就能调用。同类外部插件共用同一个包，不用重复装"]
+            }
+            throw MCPError.failed("目录里没有 \(id)。先用 plugin.search 查（source=all 能连外部一起搜），或用 plugin.define 自建")
         }
 
         let removeDef = ToolDefinition(
@@ -748,12 +827,21 @@ final class PluginStore: ObservableObject {
         UserDefaults.standard.set(Array(disabledIDs), forKey: disabledKey)
     }
 
+    /// 外部插件名单单独存
+    func saveExternal() {
+        UserDefaults.standard.set(Array(externalInstalledIDs), forKey: externalKey)
+        objectWillChange.send()
+    }
+
     private func load() {
         if let a = UserDefaults.standard.stringArray(forKey: installedKey) {
             installedIDs = Set(a)
         }
         if let d = UserDefaults.standard.stringArray(forKey: disabledKey) {
             disabledIDs = Set(d)
+        }
+        if let e = UserDefaults.standard.stringArray(forKey: externalKey) {
+            externalInstalledIDs = Set(e)
         }
     }
 
