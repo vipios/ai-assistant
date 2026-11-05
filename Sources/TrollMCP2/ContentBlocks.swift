@@ -320,6 +320,21 @@ enum ContentBlocks {
                 continue
             }
             var j = i + marker.count
+            // 2026-11-05 **参数名恒为空串的根因修复（用户截图里全是 `"::"` 的那个）**：
+            //
+            // markers 里的每一条都以 `"` 结尾（`<parameter name="` / `<|DSML|parameter name="`），
+            // 也就是 `j` 已经站在**开引号上**了。而旧代码从 `j` 开始「往后找引号」：
+            //   `while chars[j] != "\"" { pname.append(...) }`
+            // 第一次循环就看见引号 → 循环体一次都不执行 → pname 恒为 `""`，
+            // 然后 `j += 1` 跳过这个引号 → 接着一路跳到 `>`。
+            //
+            // 结果：每一个参数的名字都丢了，只剩下值。渲染侧再把空 key 拼成
+            // JSON 就是 `"": "30"` —— 用户看到的 `"::"  "30"` 正是这个。
+            // 这也解释了为什么 `tool.describe` 那张卡直接显示成一整段原始 XML
+            // （因为它只有一个 parameter，名字丢了之后 dict 是 {"": ...}，看起来就是原样）。
+            //
+            // 修法：跳过开引号，再读到下一个引号为止，那才是参数名。
+            if j < chars.count, chars[j] == "\"" { j += 1 }
             var pname = ""
             while j < chars.count, chars[j] != "\"" { pname.append(chars[j]); j += 1 }
             j += 1
