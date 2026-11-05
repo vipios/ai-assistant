@@ -789,61 +789,85 @@ struct MarkdownCodeBlockView: View {
     }
 }
 
-/// Markdown 表格渲染（LazyVGrid，iOS 14+ 兼容；部署目标 iOS 15 不能使用 Grid）
-/// v7.1.109-peers：大厂式滚动——列均分屏宽（≤3 列满宽自适应，>3 列固定 3 列宽 → 横向可滑）、
-/// 内容多时限高垂直内部滚动（不再把气泡撑无限高），对齐豆包/Kimi 表格交互
+/// Markdown 表格渲染
+///
+/// 2026-11-05 **fix-table-gesture 重写**——修两个用户实测问题：
+///   1) 「手指点在表格框里，滑动的是框里的内容；表格一旦占满屏，整个聊天就滑不动了，
+///      想看别的记录只能点右下角上下箭头」；
+///   2) 「表格显示成一个巨大的空白框，里面什么都没有」（截图里 一、运行环境 /
+///      二、工具链 下面各一个大空框）。
+///
+/// 根因：
+///   · 旧实现是 `ScrollView(.horizontal) { ScrollView(.vertical) { ... } }`。
+///     **内层垂直 ScrollView 会把垂直拖拽手势全部吃掉**，外层聊天列表根本收不到 ——
+///     表格高过一屏时，手指落在表格上就彻底滑不动聊天，只剩悬浮按钮可用。
+///   · 内层 ScrollView 上还挂了 `.frame(maxHeight: .infinity)`。它的父级处在
+///     「高度无界」的滚动内容里，maxHeight: .infinity 会被撑成一个很大的框，
+///     而里面用 `LazyVGrid` 在无界高度里布局会塌陷 —— 于是只剩一个空边框大框。
+///
+/// 现在的做法：
+///   · **不再有任何垂直嵌套滚动**。表格随消息流完整展开，垂直手势全部交给外层聊天列表。
+///   · `LazyVGrid` 换成 `HStack` + 固定列宽：行高 = 内容高，确定性布局，不会再塌陷。
+///   · 只有列数 > 3（内容确实超宽）才套**横向** ScrollView —— 横向滚动不抢垂直手势。
 struct MarkdownTableView: View {
     let header: [String]
     let rows: [[String]]
 
     var body: some View {
         let columns = max(1, header.count)
-        // 列宽：≤3 列均分可用宽度满宽；>3 列按 3 列均分宽度 → 总宽溢出 → 横向滑动
         let screenW = UIScreen.main.bounds.width
+        // 列宽：≤3 列均分可用宽度满宽；>3 列按 3 列宽度算 → 总宽溢出 → 横向可滑
         let colWidth: CGFloat = max(96, (screenW - 64) / CGFloat(min(columns, 3)))
-        let gridCols = (0..<columns).map { _ in GridItem(.fixed(colWidth), spacing: 8) }
-        ScrollView(.horizontal, showsIndicators: false) {
-            ScrollView(.vertical, showsIndicators: rows.count > 4) {
-                VStack(alignment: .leading, spacing: 0) {
-                    // 表头（蓝 + 半粗等宽）
-                    LazyVGrid(columns: gridCols, spacing: 6) {
-                        ForEach(0..<columns, id: \.self) { i in
-                            Text(i < header.count ? header[i] : "")
-                                // v7.2.3-fix39：表格字体 13→15pt（用户仍反馈表格文字小）
-                                .font(.system(size: 15, design: .monospaced).weight(.semibold))
-                                .foregroundColor(.blue)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    .padding(.bottom, 4)
-                    // 数据行
-                    ForEach(rows, id: \.self) { row in
-                        LazyVGrid(columns: gridCols, spacing: 6) {
-                            ForEach(0..<columns, id: \.self) { i in
-                                Text(i < row.count ? row[i] : "")
-                                    .font(.system(size: 15, design: .monospaced))
-                                    .foregroundColor(.primary)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .textSelection(.enabled)
-                            }
-                        }
-                        .padding(.vertical, 2)
+
+        if columns > 3 {
+            // 内容必然超宽 → 只允许横向滑动（横向不抢外层聊天列表的垂直手势）
+            ScrollView(.horizontal, showsIndicators: false) {
+                tableBody(columns: columns, colWidth: colWidth, fillWidth: false)
+            }
+        } else {
+            // 列数不多 → 完全不套滚动容器，随消息流自然展开、手势全交给外层
+            tableBody(columns: columns, colWidth: colWidth, fillWidth: true)
+        }
+    }
+
+    /// 表格本体。用 HStack 逐行铺开（不用 LazyVGrid：无界高度下会塌陷成空框）。
+    private func tableBody(columns: Int, colWidth: CGFloat, fillWidth: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // 表头（蓝 + 半粗等宽）
+            HStack(alignment: .top, spacing: 8) {
+                ForEach(Array(0..<columns), id: \.self) { i in
+                    Text(i < header.count ? header[i] : "")
+                        .font(.system(size: 15, design: .monospaced).weight(.semibold))
+                        .foregroundColor(.blue)
+                        .frame(width: colWidth, alignment: .leading)
+                }
+            }
+            .padding(.bottom, 2)
+
+            // 数据行
+            // 用 offset 作 id（原来用 `id: \.self`，两行内容完全相同时 id 冲突 →
+            // SwiftUI 会丢行/错行，表格里重复行很常见）
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                HStack(alignment: .top, spacing: 8) {
+                    ForEach(Array(0..<columns), id: \.self) { i in
+                        Text(i < row.count ? row[i] : "")
+                            .font(.system(size: 15, design: .monospaced))
+                            .foregroundColor(.primary)
+                            .frame(width: colWidth, alignment: .leading)
+                            .textSelection(.enabled)
                     }
                 }
-                .padding(8)
-                .background(Color(.secondarySystemBackground))
-                .cornerRadius(8)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(Color(.separator), lineWidth: 0.5)
-                )
             }
-            // v7.1.109-peers：行数多限高内部滚动（<4 行不触发，自适应高度）
-            // v7.1.278-fix：表格随内容变长而变长——移除 300pt 硬限高（用户实测长表格
-            // 只能看到正方形窗口、内容要一直内部滑动）；表格直接在消息流完整展开，
-            // 随页面滚动阅读。仅极端超长（>60 行）保留内部滚动，防单 cell 过高卡顿。
-            .frame(maxHeight: rows.count > 60 ? 480 : .infinity)
         }
+        .padding(8)
+        // ≤3 列时把边框铺满气泡宽度；>3 列时不铺（内容本来就比屏宽）
+        .frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color(.separator), lineWidth: 0.5)
+        )
     }
 }
 

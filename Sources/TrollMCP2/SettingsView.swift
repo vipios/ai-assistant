@@ -150,7 +150,12 @@ struct SettingsView: View {
             SettingsItem(title: L10n.t("i18n_200"),
                          subtitle: L10n.t("i18n_1162", ToolRegistry.shared.toolCount),
                          icon: "wrench.and.screwdriver.fill", color: .green,
-                         destination: AnyView(ToolCenterView(inSheet: false)))
+                         destination: AnyView(ToolCenterView(inSheet: false))),
+            // v1.0.32：插件市场——装插件即给 AI 加工具/技能，不用重装 App
+            SettingsItem(title: L10n.t("i18n_1570"),
+                         subtitle: "\(PluginStore.shared.installedManifests.count) / \(PluginStore.shared.catalog.count)",
+                         icon: "shippingbox.fill", color: .indigo,
+                         destination: AnyView(PluginStoreView()))
         ]))
 
         // 网络与抓包（v3.3.1：独立分组，不依赖开发者模式——普通用户也能直接看到抓包入口）

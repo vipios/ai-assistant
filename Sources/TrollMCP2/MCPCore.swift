@@ -430,6 +430,30 @@ public final class ToolRegistry: ObservableObject {
         print("[TA] ✅ external tool registered: \(def.name)")
     }
 
+    /// v1.0.32：插件工具注册（插件市场）。
+    /// 与 registerExternalTool 的差别：
+    ///   1. 插件由用户显式安装、来自审核过的目录，属于「用户信任」范畴（同 MCP 服务器），
+    ///      因此跳过 AI 自写工具那套危险词检查——否则 guard-rm / skill-inject 这类
+    ///      正常插件会因为名字里带 rm / inject 被直接拒掉。
+    ///   2. 仍强制 `user.plg_` 前缀：卸载时用 removeTools(prefix:) 一次摘干净，
+    ///      也保证 AI 一眼能看出这是用户装的插件而不是内置能力。
+    ///   3. 注册后立刻置为 enabled——内置白名单里没有插件工具，不置位的话 AI 看不到。
+    @discardableResult
+    public func registerPluginTool(_ def: ToolDefinition,
+                                   handler: @escaping ([String: Any]) throws -> [String: Any]) -> Bool {
+        guard def.name.hasPrefix("user.plg_") else {
+            print("[TA] ❌ plugin tool rejected: name must start with 'user.plg_' (got \(def.name))")
+            return false
+        }
+        if tools[def.name] != nil {
+            print("[TA] ❌ plugin tool rejected: name already exists \(def.name)")
+            return false
+        }
+        register(ExternalMCPTool(definition: def, handler: handler))
+        setEnabled(name: def.name, enabled: true)
+        return true
+    }
+
     public var definitions: [ToolDefinition] {
         // v3.0.90：去掉锁——只读操作
         return tools.values.map { $0.definition }.sorted { $0.name < $1.name }
@@ -968,6 +992,32 @@ public final class ToolRegistry: ObservableObject {
         // 模型按 schema 返回 injection_enable 时 dispatch 找不到 → unknown tool。
         if tool == nil {
             tool = tools.values.first { $0.definition.apiName == name }
+        }
+        // 2026-11-05（用户日志实测：同一轮里 `shell_exec` 成功、`shell.exec` 失败，
+        // `tool_describe` 成功、`tool.describe` 失败 —— 反复重试到"连续失败 8 次"被强制停）：
+        //
+        // 原因是归一化只有**单向**的。`apiName` 把注册名 `shell.exec` 压成 `shell_exec`
+        // （见 ToolDefinition.apiName：非 [_-a-zA-Z0-9] 的字符一律替换成 `_`），
+        // 但反过来 `shell.exec` → `shell_exec` 的**反查**从来没做过：
+        //   · `tools["shell.exec"]` 命中（注册名就是它）；
+        //   · `tools["shell_exec"]` 靠下面 `apiName == name` 兜底命中；
+        //   · 一旦模型用点号写出来、而 ghostAlias 没有这一条（它只有 control./device. 那批），
+        //     两条路都落空 → unknownTool → 模型以为换写法能行，于是两种写法来回试。
+        //
+        // 修法：补一层**通用**归一反查，把点号形式按 apiName 重建一次再找。
+        // 不往 ghostAlias 里逐条加（那张表是"别名→子命令"的语义映射，不是名字归一），
+        // 这里要的是纯粹的字符归一，才能覆盖所有含点的注册名（shell.exec / tool.describe /
+        // web.search / subagent.run ……）。
+        if tool == nil {
+            let dottedCompat = name.replacingOccurrences(of: "_", with: ".")
+            if dottedCompat != name, let t2 = tools[dottedCompat] {
+                tool = t2
+            } else if let t3 = tools.values.first(where: {
+                $0.definition.apiName == dottedCompat
+                    || $0.definition.name.replacingOccurrences(of: "_", with: ".") == dottedCompat
+            }) {
+                tool = t3
+            }
         }
         // v3.0.90：去掉 lock.unlock()，因为已经去掉了 lock.lock()
         guard let t = tool else { throw MCPError.unknownTool(name) }
