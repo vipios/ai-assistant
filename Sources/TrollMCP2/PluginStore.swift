@@ -444,24 +444,42 @@ final class PluginStore: ObservableObject {
                                           instruction: (item["instruction"] as? String) ?? ""))
         }
 
-        let m = PluginManifest(
-            id: safe, name: name, pkg: (obj["pkg"] as? String) ?? "@local/\(safe)",
-            version: (obj["version"] as? String) ?? "0.1.0",
-            author: (obj["author"] as? String) ?? "AI",
+        // 字段先各自落到具体类型再构造：18 个参数混着一堆 `as?` / `??` / 插值
+        // 会让类型检查器指数级展开，CI 直接报 "unable to type-check this
+        // expression in reasonable time"（1.0.34 首构建就是这么红的）。
+        let pkgValue: String = (obj["pkg"] as? String) ?? ("@local/" + safe)
+        let versionValue: String = (obj["version"] as? String) ?? "0.1.0"
+        let authorValue: String = (obj["author"] as? String) ?? "AI"
+        let iconValue: String = (obj["icon"] as? String) ?? "🧩"
+        let tintValue: Int = (obj["tint"] as? Int) ?? 3
+        let depsValue: [String] = (obj["deps"] as? [String]) ?? []
+        let hookValue: Bool = (obj["requiresHook"] as? Bool) ?? false
+        let riskValue: String = (obj["risk"] as? String) ?? "shell"
+        let newToday: String = Self.today()
+
+        // init 不带 pkg / risk（内置 28 个插件都靠默认值），
+        // 这两项只能构造完再赋值，否则报 extra argument。
+        var m = PluginManifest(
+            id: safe,
+            name: name,
+            version: versionValue,
             category: cat,
-            icon: (obj["icon"] as? String) ?? "🧩",
-            tint: (obj["tint"] as? Int) ?? 3,
+            icon: iconValue,
+            tint: tintValue,
             sizeKB: 1,
             summary: summary,
-            deps: (obj["deps"] as? [String]) ?? [],
-            requiresHook: (obj["requiresHook"] as? Bool) ?? false,
+            deps: depsValue,
+            requiresHook: hookValue,
             tools: tools,
             skills: skills,
             changelog: ["AI 自建"],
-            stars: 0, downloads: 0,
-            updatedAt: Self.today(),
-            risk: (obj["risk"] as? String) ?? "shell"
+            stars: 0,
+            downloads: 0,
+            updatedAt: newToday,
+            author: authorValue
         )
+        m.pkg = pkgValue
+        m.risk = riskValue
         // 自建插件也要进目录，否则重启后 manifest(id:) 找不到、工具注册不回来
         if !catalog.contains(where: { $0.id == safe }) {
             catalog.append(m)
