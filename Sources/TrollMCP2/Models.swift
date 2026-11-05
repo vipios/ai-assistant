@@ -1271,9 +1271,20 @@ final class ConversationStore: ObservableObject {
     private var pendingEmptyReplyCorrection: String? = nil
     /// v4.3.25：空回复纠正连续次数——最多 2 次仍空就停止，避免无限重跑。
     private var emptyReplyCorrectionCount = 0
-    /// 2026-11-03：文本式工具调用自动纠正次数——模型把 DSML/XML 调用当正文打印时，
+    /// 文本式工具调用自动纠正次数——模型把 DSML/XML 调用当正文打印时，
     /// 代码层直接反解成 ToolCall 执行。连续 8 次仍反复同样写法就停手（防死循环烧 token）。
     private var textualToolCallCorrections = 0
+    /// 2026-11-05：上一次「文本式工具调用」的签名（工具名+参数）。
+    ///
+    /// 用来区分「真的卡死了」和「模型只是习惯用文本写调用」——
+    /// 用户诊断报告 13:00:40～13:02:04 连着四轮，每轮都成功解析并真跑了工具
+    /// （user.mcp_probe / tools.audit / skills_list / tool_describe…），
+    /// 每次调用的内容都不一样、活儿在推进，可计数照样涨到 8 被整轮砍掉。
+    /// 那是「这个模型不会发结构化 tool_calls」，不是「它卡住了」。
+    ///
+    /// 判据改成：**同样的调用重复出现才算卡死**。只要签名在变，就允许一直兜底下去，
+    /// 不管兜了多少轮（模型本来就这脾气，兜底是我们的能力，不该被当成错误累计）。
+    private var lastTextualCallSignature: String = ""
     /// v3.1.70：活动请求绑定的会话 ID——请求由哪个会话发起就写回哪个会话。
     /// 修复"请求进行中切换会话，AI 输出错位/写错会话" (用户实测：老会话未暂停，切换新会话后输出仍乱）。
     private var activeConvId: UUID?
@@ -2233,10 +2244,34 @@ final class ConversationStore: ObservableObject {
                     // 现在：直接把这段文本**反解成 ToolCall 并执行**，模型用什么格式写都能
                     // 接着干下去，不需要用户再说「继续」。
                     let textualCalls = Self.parseTextualToolCalls(text)
-                    // 防死循环：万一模型每轮都吐同样的调用、工具又毫无进展，会无限烧 token。
-                    // 连续 8 次就停止自动执行，剩下的交给用户判断。
-                    if !textualCalls.isEmpty && self.textualToolCallCorrections < 8 {
-                        self.textualToolCallCorrections += 1
+                    // 防死循环：真正要防的是「模型反复吐同一个调用、活儿一点没推进」。
+                    // 2026-11-05 改判据（用户诊断报告 13:00:40～13:02:04）：
+                    //
+                    // 旧判据是「兜底次数 < 8」，可它连一次都没判断过进展——
+                    // 那四轮每轮的工具都真跑了、每次调用内容都不一样（mcp_probe → tools.audit →
+                    // skills_list → tool_describe），活儿明明在往前走，
+                    // 光因为「这个模型只会用文本写调用」就数到 8 直接砍掉整轮。
+                    //
+                    // 新判据：拿「工具名 + 参数」的签名去比上一轮。
+                    //   · 签名变了 → 活儿在推进，无论兜多少轮都继续（兜底是我们的能力，不是错误）
+                    //   · 签名一模一样 → 这是真的在原地打转：允许重复 3 次（stuckCount 1→3），
+                    //     第 4 次（stuckCount 4 > 3）判定卡死并停手。
+                    // 逐个落成带类型标注的常量再拼，别写成一行长链——
+                    // 1.0.34 已经栽过一次「unable to type-check this expression in reasonable time」。
+                    var sigParts: [String] = []
+                    sigParts.reserveCapacity(textualCalls.count)
+                    for c0 in textualCalls {
+                        let n0: String = c0.name
+                        let a0: String = c0.arguments
+                        sigParts.append(n0 + "|" + a0)
+                    }
+                    let signature: String = sigParts.joined(separator: "&&")
+                    let sameAsLast: Bool = !signature.isEmpty && signature == self.lastTextualCallSignature
+                    let stuckCount: Int = sameAsLast ? (self.textualToolCallCorrections + 1) : 1
+                    self.lastTextualCallSignature = signature
+
+                    if !textualCalls.isEmpty && stuckCount <= 3 {
+                        self.textualToolCallCorrections = stuckCount
                         self.trailStep(.done(.note, "自动解析文本形式的工具调用",
                                              detail: "模型把调用写成了正文，已解析出 \(textualCalls.count) 个并直接执行",
                                              ok: true))
@@ -2261,33 +2296,37 @@ final class ConversationStore: ObservableObject {
                                               personaPrompt: personaPrompt)
                         return
                     }
-                    // 2026-11-03 静默停止修复（用户原话「不知道怎么就停止了，也没有原因」）：
-                    // 走到这里说明模型连续 8 轮都在把工具调用写成正文（DSML/XML 文本），
-                    // 说明「反解 + 重跑」这条路对它无效，再转下去只会一直烧 token。
-                    // 以前是直接 return —— 工具没执行、正文里一屏英文、界面就这么停住了，
-                    // 用户完全不知道发生了什么。现在必须写一条看得懂的中文说明 + 给出路。
+                    // 2026-11-03 静默停止修复（用户原话「不知道怎么就停止了，也没有原因」）。
+                    // 2026-11-05：这里现在只在「确实原地打转」时才走到——
+                    // 同一个调用连续重复 4 次，说明模型陷在循环里，再转只会烧 token。
                     if !textualCalls.isEmpty {
-                        self.trailStep(.done(.note, "已停止自动重试", detail: "连续 8 轮把工具调用写成正文", ok: false))
+                        self.trailStep(.done(.note, "已停止自动重试",
+                                             detail: "同一个工具调用连续重复 \(stuckCount) 次，没有进展",
+                                             ok: false))
                         Self.reportStop(
                             to: self,
-                            title: "AI 停下了：工具调用格式不对",
+                            title: "AI 停下了：在重复同一个动作",
                             body: """
-                            这个模型连续 8 轮把「工具调用」写成正文（形如 <tool.xxx name="..." />），\
-                            而不是正常的结构化调用，自动执行已经重试到上限，所以停在这里。
+                            这个模型连续 \(stuckCount) 次发出**完全相同**的工具调用，\
+                            每次结果都一样，活儿没有往前走，所以停在这里。
 
-                            这样处理最省事：
-                            1. 换一个支持工具调用的模型（DeepSeek、GLM-4、GPT 系列都正常）
-                            2. 或者把下面这段复制给它，让它改回来：「请用 function calling 调用工具，\
-                            不要把调用写成 XML 正文」
+                            这种情况通常是：
+                            1. 工具返回的内容它没看懂，于是又调了一遍（可以让它先总结再决定下一步）
+                            2. 或者它想做的事本机做不到，一直在试同一个办法
+
+                            建议直接说一句「别重复了，说说你卡在哪」，它会把卡点讲出来。
+                            换个模型也行（DeepSeek、GLM-4、GPT 系列的结构化调用更稳）。
 
                             原始内容已保留在下面的气泡里，没有丢。
                             """,
-                            reason: "文本工具调用连续失败 \(self.textualToolCallCorrections) 次")
+                            reason: "同一工具调用连续重复 \(stuckCount) 次无进展")
                         self.textualToolCallCorrections = 0
+                        self.lastTextualCallSignature = ""
                         self.activeConvId = nil
                         return
                     }
                     self.textualToolCallCorrections = 0
+                    self.lastTextualCallSignature = ""
                     // 2026-11-03：一轮正常收尾 → 记进诊断日志。
                     // 有了这条，诊断页才能区分「正常完成」和「一句话没说完就没了」。
                     CrashBreadcrumb.shared.mark("完成 正文:\(text.count)字 轮次:\(depth)")
@@ -2305,6 +2344,22 @@ final class ConversationStore: ObservableObject {
                     // v3.1.70：整条请求链 (含工具递归）结束——解除活动会话绑定
                     self.activeConvId = nil
                 case .success(.toolCalls(let calls, let thinking, let narrationContent)):
+                    // 2026-11-05 修「明明一直在正常干活，却报『文本工具调用连续失败 8 次』」：
+                    //
+                    // 这个计数器原本只在**模型最终返回纯文本**那条路上复位（第 2290 行）。
+                    // 而结构性调用成功走的是本分支——它从头到尾没碰过计数器。
+                    // 于是一轮对话里只要模型偶尔把调用写成正文（哪怕中间成功跑了 7 次真实工具），
+                    // 计数只会一路累加，到第 8 次就整轮被掐断。
+                    // 用户看到的就是「干到一半突然停了，还说格式不对」。
+                    //
+                    // 语义本来就是「**连续**失败」：只要这一次模型用的是正确的结构化调用，
+                    // 序列就断了，计数必须归零。
+                    //
+                    // 2026-11-05：签名也要一起清。否则模型「文本兜底一轮 → 结构化一轮 →
+                    // 又文本兜底」时，第三个文本轮会跟第一个文本轮签名相同，
+                    // 被误判成「原地打转」。中间插了正常调用，就说明它没卡住。
+                    self.textualToolCallCorrections = 0
+                    self.lastTextualCallSignature = ""
                     // v3.5.2：系统级"一次一个工具"硬约束——模型一次批几个 toolCalls，
                     // 都裁成第一个：assistant 消息与执行只带这一个，执行完回模型让它看到
                     // 结果再决定下一步（一个接一个）。依赖调用必须等前一个结果才能决定下一步，

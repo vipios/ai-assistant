@@ -54,6 +54,13 @@ struct ChatView: View {
     // v2.9.10：统一待发送附件（图片缩略图 / 应用图标 / 文件），输入栏上方预览
     @State private var pendingAttachments: [PendingAttachment] = []
 
+    // 2026-11-05：本轮「真的跑完了没有」——用户反馈分不清 AI 是停了还是在干活。
+    //   只在 isLoading 翻转时写，不参与流式输出的高频更新，所以不会牵动 body 重算。
+    //   turnStartedAt 给顶部状态条走秒表；lastTurnSeconds 给列表末尾那行「本轮结束」。
+    @State private var turnStartedAt: Date?
+    @State private var lastTurnSeconds: Double?
+    @State private var turnEnded = false
+
     // v2.9.2：多选模式（勾选会话内容 → 复制 / 分享到其他 App）
     @State private var selectionMode = false
     @State private var selectedIds = Set<UUID>()
@@ -86,6 +93,11 @@ struct ChatView: View {
                 } else {
                     messageList
                 }
+                // 2026-11-05：固定状态条（不随列表滚动）。
+                // 用户原话「我都不知道他是停止工作了还是正在工作」——列表里的
+                // ThinkingPanel 一往上翻就看不见，而「运行了 N 个工具 12.7s」那行是
+                // **已完成工具的汇总**，长得像结论。所以把实时状态钉在输入框上方。
+                RunStatusStrip(startedAt: turnStartedAt)
                 // v2.9.72：工作流可视化步骤条
                 WorkflowProgressView()
             }
@@ -772,6 +784,12 @@ struct ChatView: View {
                         if store.isLoading {
                             ThinkingPanel()
                         }
+                        // 2026-11-05：本轮结束标记（用户要求「需要加结束话语」）。
+                        // 判据只有一条：isLoading 真的变回 false。所以不会提前冒出来
+                        // 骗人说跑完了——模型还在跑下一轮时这里什么都没有。
+                        if turnEnded, !store.isLoading, let secs = lastTurnSeconds {
+                            TurnEndedNote(seconds: secs)
+                        }
                     }
                     // v3.4.0：去掉整行水平 padding —— AI 气泡改为真正占满左右屏边缘；
                     // 用户气泡的右留白由 MessageBubble 内部按 isUser 处理
@@ -852,12 +870,27 @@ struct ChatView: View {
                 scrollToBottom(proxy)
             }
             .onChange(of: store.selectedId) { _ in
+                // 2026-11-05：换会话就清掉上一轮的「本轮结束」标记——否则切到别的会话
+                // 底部还挂着上一条会话的结束语，看着像这轮已经跑完了。
+                turnEnded = false
+                lastTurnSeconds = nil
                 scrollToBottom(proxy)
             }
             // v2.9.72：AI 回复完成时结束工作流
             .onChange(of: store.isLoading) { loading in
                 if !loading {
                     WorkflowManager.shared.finishRun(success: true)
+                    // 2026-11-05：本轮真的结束了——记下用时，列表末尾落一行「✓ 本轮结束」。
+                    // 只有走到这里才算结束（工具循环中途 isLoading 一直是 true，不会误触发）。
+                    if let start = turnStartedAt {
+                        lastTurnSeconds = Date().timeIntervalSince(start)
+                        turnEnded = true
+                    }
+                    turnStartedAt = nil
+                } else {
+                    // 新的一轮开始（用户发送 / 网络恢复自动重试）
+                    if turnStartedAt == nil { turnStartedAt = Date() }
+                    turnEnded = false
                 }
                 // v7.1.109-peers：请求完成 → 刷新上下文环形指示器（records 读文件，仅此刻读一次）
                 if !loading { refreshRingTok() }
@@ -1828,6 +1861,78 @@ struct ThinkingPanel: View {
                 }
             }
         }
+    }
+}
+
+/// 2026-11-05：固定在输入框上方的「还在干活」状态条。
+///
+/// 用户原话：「我都不知道他是停止工作了还是正在工作」。
+/// 原来唯一的进度提示是消息列表里的 ThinkingPanel，往上翻历史就看不见了；
+/// 而列表里那行「运行了 2 个工具 12.7s」是**已完成工具**的汇总胶囊，
+/// 长得像结论，很容易被当成"整轮跑完了"（用户就是这么误判的）。
+/// 所以这里做一条不随列表滚动的常驻条：小菊花 + 当前动作 + 秒表，
+/// 只要 isLoading 就一直在，扫一眼就知道还在跑。
+struct RunStatusStrip: View {
+    @ObservedObject private var store = ConversationStore.shared
+    /// 本轮起始时间（ChatView 在 isLoading 翻转时写入；nil 时从 0 开始计）
+    let startedAt: Date?
+
+    var body: some View {
+        if store.isLoading {
+            // TimelineView 每秒只刷新这一条，不会牵动消息列表
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .scaleEffect(0.55)
+                        .frame(width: 14, height: 14)
+                    Text(title)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 8)
+                    Text(Self.clock(ctx.date.timeIntervalSince(startedAt ?? ctx.date)))
+                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 7)
+                .frame(maxWidth: .infinity)
+                .background(Color(.systemGray6).opacity(0.96))
+            }
+        }
+    }
+
+    /// 优先用 store 的实时状态（"正在请求模型 第 2 轮 · 调用 xxx"），
+    /// 没有就退回一句通用文案，别让条子空着——空着又变成"看不出在干嘛"。
+    private var title: String {
+        if let s = store.statusText, !s.isEmpty { return s }
+        return L10n.t("i18n_1623")
+    }
+
+    /// 秒表格式 m:ss（1:12 = 1 分 12 秒）
+    static func clock(_ seconds: Double) -> String {
+        let t = max(0, Int(seconds))
+        return String(format: "%d:%02d", t / 60, t % 60)
+    }
+}
+
+/// 2026-11-05：本轮结束标记（用户要求「需要加结束话语」）。
+/// 只有 isLoading 真的变回 false 才会出现，所以不会提前骗人说跑完了。
+struct TurnEndedNote: View {
+    let seconds: Double
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 10, weight: .semibold))
+            Text(L10n.t("i18n_1621", RunStatusStrip.clock(seconds)))
+                .font(.system(size: 11))
+        }
+        .foregroundColor(.secondary.opacity(0.85))
+        .frame(maxWidth: .infinity)
+        .padding(.top, 2)
+        .padding(.bottom, 4)
     }
 }
 

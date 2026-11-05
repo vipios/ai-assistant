@@ -504,9 +504,29 @@ final class UpdateManager: ObservableObject {
                 return false
             }
             guard let f = finalURL, FileManager.default.fileExists(atPath: f.path) else { return false }
-            isDownloading = false
-            downloadedIPAURL = f
-            installIPA(at: f)
+            // ── 2026-11-05（用户要求）：关闭「下载完自动跳转 TrollStore 安装」 ──
+            // 旧行为：open(file://) 把包丢给 TrollStore，然后 3.5 秒后判「有没有进过后台」；
+            //   判不出来就走 apple-magnifier://install?url=<https 直链> 兜底 ——
+            //   那条路是让 TrollStore **自己再下一遍**（用户实测：App 里下一遍、红魔 R 里又下一遍），
+            //   而且 App 回到前台后这套判定还会再触发一次跳转，表现为「每次杀后台回来都跳一下红魔 R」。
+            // 新行为：下载完只在本 App 内弹分享菜单（存储到文件 / 用 TrollStore 安装 / 取消），
+            //   由用户自己点「用 TrollStore 安装」才跳，跳之前不会二次下载。
+            // 原生系统分享面板（UIActivityViewController）在本机侧载环境会 SIGSEGV
+            //   （ShareCenter 顶部注释有两次真机崩溃栈），所以这里用自建分享菜单。
+            let staged = Self.stageIPAForInstall(f)
+            DispatchQueue.main.async {
+                self.isDownloading = false
+                self.stagedURL = staged
+                self.downloadedIPAURL = staged
+                self.installMessage = L10n.t("i18n_1620")
+                SharePresenter.present([staged]) { [weak self] ok, error in
+                    if let error = error {
+                        self?.errorMessage = L10n.t("i18n_669", error.localizedDescription)
+                    } else if !ok {
+                        self?.errorMessage = L10n.t("i18n_1231")
+                    }
+                }
+            }
             return true
         } catch {
             return false
@@ -517,6 +537,12 @@ final class UpdateManager: ObservableObject {
     /// 背景：trollstorehelper install 装的是本 App 自己——helper 安装前先杀运行中进程，
     /// 本 App 被 kill → 闪退 + 后续 UI 全部丢失；若安装/注册失败则半覆盖（TrollStore 不显示）。
     /// 交给 TrollStore 后由它完成 杀进程→安装→注册→失败回滚，全程它的 UI。
+    ///
+    /// **2026-11-05 起自动调用已停用**（用户要求）。`processDownloaded` 不再走这里，
+    /// 改为下载完只弹分享菜单，用户手动点「用 TrollStore 安装」才跳（那条路在 ShareCenter.openInTrollStore）。
+    /// 本函数保留原样，仅作为「自动跳转」旧逻辑的存档；要恢复自动跳转，把
+    /// processDownloaded 末尾那段换回 `installIPA(at: f)` 即可。
+    /// 注意它包含 3.5 秒兜底 → installViaRemotePackage()，那是 TrollStore「再下一遍」的来源。
     func installIPA(at url: URL) {
         // v7.1.96：强制主线程——downloadTask 完成回调在后台线程，后台线程
         // canOpenURL/open 静默失败 → 更新完不跳 TrollStore（用户实测：
@@ -619,6 +645,10 @@ final class UpdateManager: ObservableObject {
     }
 
     /// 两条自动路径都不通 → 分享菜单兜底（用户自己选 TrollStore / 储存）
+    ///
+    /// **2026-11-05 起已无调用方**：`processDownloaded` 不再走 installIPA → 不会再进到这里。
+    /// 保留是因为 `installIPA` 整段作为「自动跳转」存档还在，它内部会调过来。
+    /// 真要恢复自动跳转时这行代码仍然是对的。
     private func giveUpToShare() {
         guard let f = stagedURL ?? downloadedIPAURL else {
             errorMessage = L10n.t("i18n_1231")

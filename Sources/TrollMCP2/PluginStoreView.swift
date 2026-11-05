@@ -11,11 +11,15 @@ struct PluginStoreView: View {
     // v1.0.35：授权确认门总开关
     @ObservedObject private var gate = ConfirmGate.shared
 
-    @State private var tab = 1                 // 0 = 已安装, 1 = 发现
+    @State private var tab = 1                 // 0 = 已安装, 1 = 发现, 2 = 外部目录
     @State private var query = ""
     @State private var category: PluginCategory? = nil
     @State private var detail: PluginManifest? = nil
     @State private var alertItem: PluginAlert? = nil
+    /// 2026-11-05：外部参考目录（竞品 12 类 / 4687 条）——
+    /// 这些是 Node 插件，本机装不了，只能「照着做一个」。所以单独一屏，别和可安装的混在一起。
+    @State private var refsVersion = 0
+    @State private var refDetail: RefPlugin? = nil
 
     /// 同一个视图只能挂一个 .alert——安装确认与卸载确认合并成同一入口
     enum PluginAlert: Identifiable {
@@ -44,8 +48,12 @@ struct PluginStoreView: View {
                 subtitleRow
                 segmented
                 searchField
-                if tab == 1 { chips }
-                if tab == 0 { installedList } else { discoverList }
+                if tab != 0 { chips }
+                switch tab {
+                case 0: installedList
+                case 2: referenceList
+                default: discoverList
+                }
                 aiControlRow
                 // v1.0.35：授权确认门开关——紧跟在 AI 自主权限下面，
                 // 两个开关是同一类东西：都是「AI 能自己干到什么程度」的闸。
@@ -63,6 +71,14 @@ struct PluginStoreView: View {
                 onUninstall: { alertItem = .uninstall(m); detail = nil },
                 onToggle: { on in store.setEnabled(m, on) }
             )
+        }
+        // 2026-11-05：外部目录详情——只展示，不提供「安装」，提供「让 AI 照做一个」
+        .sheet(item: $refDetail) { r in
+            RefPluginSheet(ref: r, categoryName: RefCategory.name(r.category))
+        }
+        .onAppear {
+            // 懒加载：只在真正打开市场时才解析那份 1.5MB 的 JSON
+            PluginCatalogRef.loadIfNeeded { refsVersion += 1 }
         }
         .alert(item: $alertItem) { item in
             switch item {
@@ -155,6 +171,10 @@ struct PluginStoreView: View {
             if tab == 0 {
                 Text(L10n.t("i18n_1593", store.installedManifests.count,
                             store.installedToolCount, store.installedSkillCount))
+            } else if tab == 2 {
+                // 外部目录页单独一句：这一页 4687 条一条都装不上，副标题必须说清楚，
+                // 否则跟「发现」页一样写"共 N 个插件"，用户点进去找不到安装按钮会以为坏了。
+                Text(L10n.t("i18n_1634", PluginCategory.allCases.count, PluginCatalogRef.totalCount))
             } else {
                 Text(L10n.t("i18n_1594", PluginCategory.allCases.count, store.catalog.count))
             }
@@ -174,6 +194,8 @@ struct PluginStoreView: View {
         HStack(spacing: 0) {
             segmentButton(0, L10n.t("i18n_1571"))
             segmentButton(1, L10n.t("i18n_1572"))
+            // 2026-11-05：第三页是外部参考目录（竞品那 12 类），只能查不能直接装
+            segmentButton(2, L10n.t("i18n_1624"))
         }
         .padding(2)
         .background(RoundedRectangle(cornerRadius: 9).fill(Color(.secondarySystemFill)))
@@ -227,7 +249,10 @@ struct PluginStoreView: View {
     private var chips: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 7) {
-                chipItem(nil, L10n.t("i18n_1585"), store.catalog.count)
+                // 2026-11-05：两个页签的分类计数口径不同——
+                // 发现页算「能装的」，外部目录页算「能参考的」，混用会让数字对不上。
+                let total = tab == 2 ? PluginCatalogRef.totalCount : store.catalog.count
+                chipItem(nil, L10n.t("i18n_1585"), total)
                 ForEach(PluginCategory.allCases) { c in
                     chipItem(c, c.shortName, count(in: c))
                 }
@@ -235,6 +260,8 @@ struct PluginStoreView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 10)
         }
+        // refsVersion 变了说明外部目录解析完了 → 强制刷新一次计数
+        .id(refsVersion)
     }
 
     private func chipItem(_ c: PluginCategory?, _ title: String, _ n: Int) -> some View {
@@ -262,7 +289,9 @@ struct PluginStoreView: View {
     }
 
     private func count(in c: PluginCategory) -> Int {
-        store.catalog.filter { $0.category == c }.count
+        // 外部目录页用另一套计数（那边 4687 条，不分流会让「工具」显示成 8 个，明显不对）
+        if tab == 2 { return PluginCatalogRef.count(in: c) }
+        return store.catalog.filter { $0.category == c }.count
     }
 
     // MARK: 列表
@@ -315,6 +344,53 @@ struct PluginStoreView: View {
                             }
                             .padding(.trailing, 13)
                         }
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+    }
+
+    // MARK: - 外部参考目录（2026-11-05）
+    //
+    // 这一屏是「别处做过什么」，不是「本机能装什么」。
+    // 用户要的是「桌面上那个 ipa 里的插件」——那些是 Node 插件，本机跑不了，
+    // 所以这里点开只能看到原项目信息 + 一句「让 AI 照着做一个（shell 版）」。
+    // 混进「发现」页会让用户点安装然后失败，比没有更糟，因此单独一屏。
+
+    private var referenceList: some View {
+        let hits = PluginCatalogRef.search(query, category: category)
+        return LazyVStack(spacing: 8) {
+            if !PluginCatalogRef.isLoaded {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text(L10n.t("i18n_1625"))
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 40)
+            } else if hits.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 30, weight: .light))
+                        .foregroundColor(Color(.tertiaryLabel))
+                    Text(L10n.t("i18n_1588"))
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 40)
+            } else {
+                // 只渲染前 200 条：4687 条全铺进 LazyVStack 也会让首屏卡
+                ForEach(hits) { r in
+                    RefPluginRow(ref: r, categoryName: RefCategory.name(r.category))
+                        .onTapGesture { refDetail = r }
+                }
+                if hits.count >= 200 {
+                    Text(L10n.t("i18n_1626"))
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .padding(.top, 6)
                 }
             }
         }
@@ -517,6 +593,183 @@ private struct PluginIcon: View {
 }
 
 // MARK: - 详情页
+
+// MARK: - 外部参考目录的行 / 详情（2026-11-05）
+
+/// 分类 id → 中文短名。外部目录里存的是英文 rawValue（tools / session ...），
+/// 界面上要显示和内置目录一致的「工具 / 会话 / 记忆」。
+enum RefCategory {
+    static func name(_ raw: String) -> String {
+        PluginCategory(rawValue: raw)?.shortName ?? raw
+    }
+    static func emoji(_ raw: String) -> String {
+        switch raw {
+        case "tools":    return "🧰"
+        case "session":  return "💬"
+        case "model":    return "🔌"
+        case "memory":   return "🧠"
+        case "skill":    return "🧩"
+        case "vision":   return "👁"
+        case "docs":     return "📄"
+        case "usage":    return "📈"
+        case "remote":   return "📡"
+        case "security": return "🛡"
+        case "browser":  return "🌐"
+        case "git":      return "🔀"
+        default:         return "🧩"
+        }
+    }
+}
+
+/// 外部目录的一行。刻意长得和 PluginRow 相似，但有两点必须不同：
+///   第一，不显示「安装」按钮——装了也跑不了，那是骗人；
+///   第二，明确标一句「参考 · 需改写」。
+private struct RefPluginRow: View {
+    let ref: RefPlugin
+    let categoryName: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 11) {
+            PluginIcon(emoji: RefCategory.emoji(ref.category),
+                       tint: .gray, size: 40)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(ref.name)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .lineLimit(1)
+                Text(ref.summary)
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 6) {
+                    Text("★ \(num(ref.stars))")
+                    Text("·").opacity(0.4)
+                    Text(categoryName)
+                        .padding(.horizontal, 5).padding(.vertical, 1.5)
+                        .background(Capsule().fill(Color(.tertiarySystemFill)))
+                    Text("·").opacity(0.4)
+                    Text(L10n.t("i18n_1627"))     // 「参考 · 需改写」
+                        .padding(.horizontal, 5).padding(.vertical, 1.5)
+                        .background(Capsule().fill(Color.gray.opacity(0.16)))
+                }
+                .font(.system(size: 10.5))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 13).fill(Color(.secondarySystemGroupedBackground)))
+        .contentShape(Rectangle())
+    }
+
+    private func num(_ n: Int) -> String {
+        if n >= 1000 { return String(format: "%.1fk", Double(n) / 1000) }
+        return "\(n)"
+    }
+}
+
+/// 外部目录详情：说明「这是什么、为什么装不了、能拿它干什么」。
+/// 唯一可执行的动作是「让 AI 照着做一个 shell 版」——把需求写进剪贴板，
+/// 用户回聊天框粘贴即可（这里不直接跳转，避免抢走当前会话上下文）。
+private struct RefPluginSheet: View {
+    let ref: RefPlugin
+    let categoryName: String
+
+    @Environment(\.presentationMode) private var presentationMode
+    @State private var copied = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 12) {
+                    PluginIcon(emoji: RefCategory.emoji(ref.category), tint: .gray, size: 46)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(ref.name)
+                            .font(.system(size: 16, weight: .semibold))
+                        Text("★ \(ref.stars) · \(categoryName)")
+                            .font(.system(size: 11.5))
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                }
+
+                Text(ref.summary)
+                    .font(.system(size: 13))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // 这段是这一页的核心：说清为什么没有「安装」按钮
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(L10n.t("i18n_1628"), systemImage: "info.circle")
+                        .font(.system(size: 12.5, weight: .semibold))
+                    Text(L10n.t("i18n_1629"))
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 11).fill(Color(.tertiarySystemFill)))
+
+                if !ref.pkg.isEmpty {
+                    HStack(spacing: 6) {
+                        Text("npm").font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary)
+                        Text(ref.pkg)
+                            .font(.system(size: 12, design: .monospaced))
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                }
+                if !ref.owner.isEmpty && !ref.repo.isEmpty {
+                    HStack(spacing: 6) {
+                        Text("repo").font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary)
+                        Text("\(ref.owner)/\(ref.repo)")
+                            .font(.system(size: 12, design: .monospaced))
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                }
+
+                Button {
+                    UIPasteboard.general.string = promptText
+                    copied = true
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: copied ? "checkmark.circle.fill" : "square.on.square")
+                        Text(L10n.t(copied ? "i18n_1631" : "i18n_1630"))
+                    }
+                    .font(.system(size: 13, weight: .medium))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 42)
+                    .background(RoundedRectangle(cornerRadius: 11).fill(Color.accentColor.opacity(0.13)))
+                }
+                .buttonStyle(.plain)
+
+                Text(L10n.t("i18n_1632"))
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Spacer(minLength: 10)
+            }
+            .padding(18)
+        }
+        .navigationTitle(L10n.t("i18n_1633"))
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    /// 复制给用户的指令：带着名字与原始描述，AI 一看就知道要做什么
+    private var promptText: String {
+        """
+        我看到一个外部插件「\(ref.name)」（\(categoryName)），它做的事是：\(ref.summary)
+        \(ref.owner.isEmpty ? "" : "原项目：https://github.com/\(ref.owner)/\(ref.repo)\n")
+        它跑在 Node 环境，我们这边装不了。请你按这个思路，用本机 shell 给我做一个等效的插件：
+        先用 plugin.define 建一个 id 为 \(ref.id) 的插件，工具命令只用 busybox 自带的（ls/find/grep/awk/sed/sort/du/md5sum/base64），
+        不要依赖 npm / node / python。做完告诉我它加了哪些工具、怎么用。
+        """
+    }
+}
 
 struct PluginDetailSheet: View {
     let manifest: PluginManifest

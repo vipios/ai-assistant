@@ -200,7 +200,7 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                     // 2026-11-05 fix-blank-2：**先判越界**。滚过真实底部时绝不能往下走
                     // 那个「stickToBottom = isAtBottom(sv)」——那时它必然是 false，
                     // 等于把自动跟随关掉，空白就永久留下了。这里改为夹回并保持跟随。
-                    if self.isOverscrolled(sv) {
+                    if self.shouldFixOvershoot(sv) {
                         self.scheduleOvershootFix(sv)
                         return
                     }
@@ -222,7 +222,7 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                 // 于是「offset 停在旧内容高度」这个越界状态会一直留着 = 空白。
                 // 这是发送消息后最容易踩到的一条：新消息进 LazyVStack 会触发分组重算 /
                 // 估算高度重算，contentSize 可能先鼓后缩。所以这里必须主动判一次越界。
-                if self.isOverscrolled(sv) {
+                if self.shouldFixOvershoot(sv) {
                     self.scheduleOvershootFix(sv)
                     return
                 }
@@ -239,7 +239,7 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                 self.onViewportHeight?(sv.bounds.height)
                 // 视口变高（键盘收起）→ maxOffset 变小 → 原来「在底部」的 offset 现在越界。
                 // 同上，先夹回再贴底。
-                if self.isOverscrolled(sv) {
+                if self.shouldFixOvershoot(sv) {
                     self.scheduleOvershootFix(sv)
                     return
                 }
@@ -252,8 +252,18 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                 guard let self = self else { return }
                 guard !self.userIsScrolling(sv) else { return }
                 self.stickToBottom = self.isAtBottom(sv)
-                // 停稳后如果确实在底部，把最后那点估算误差补上（LazyVStack 常见差几十 pt）
-                if self.stickToBottom { self.pinToBottom(sv) }
+                // 停稳后如果确实在底部，把最后那点估算误差补上（LazyVStack 常见差几十 pt）。
+                //
+                // v1.0.35 **必须一步到位**：上一版这里调的是 pinToBottom，
+                // 而 pinToBottom 是「分 3 步渐进」。用户滑到底松手时已经 rendering 完毕、
+                // 只差个位数到几十 pt，却还要走三步 —— 视觉上就是「松开手抖两下」。
+                // 这里直接一次 setContentOffset（无动画），不会有可见的中间态。
+                if self.stickToBottom {
+                    let m = self.maxOffset(sv)
+                    if m > 0, abs(sv.contentOffset.y - m) > 0.5 {
+                        sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: m), animated: false)
+                    }
+                }
             }
 
             observeStickRequest()
@@ -318,6 +328,29 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             return sv.contentOffset.y > m + 1
         }
 
+        /// 是否**该做**越界修正（v1.0.35：修「上滑看历史，松手抖两下 + 被拽回底部」）。
+        ///
+        /// 上一版直接用 `isOverscrolled`（容差 1pt）就修，踩了两个坑：
+        ///
+        /// ① LazyVStack 的 contentSize 是**估算值**。滚动中陆续建 cell，估算高度频繁
+        ///    被替换成真实高度，contentOffset 于是会短暂越过当时的估算底部几十 pt。
+        ///    1pt 的容差等于把这当成「越界」，立刻夹回底部并分步贴底 ——
+        ///    用户看到的就是「松开手抖两下，历史全被顶没」。
+        ///    真实越界（发完消息那种）至少是几百上千 pt，48pt 足够区分。
+        ///
+        /// ② 用户主动上滑去看历史时 stickToBottom 已经是 false，这时候越界是
+        ///    估算误差造成的假象，夹回 = 硬把用户拽回最新消息。只有处于
+        ///    「跟随底部」状态才需要防空白；用户在看历史时，越界交给系统回弹。
+        ///
+        /// ③ 手指还在拖 / 惯性还在滑时也不修 —— 那是系统在管，插手只会打架。
+        private func shouldFixOvershoot(_ sv: UIScrollView) -> Bool {
+            guard stickToBottom else { return false }
+            guard !userIsScrolling(sv) else { return false }
+            let m = maxOffset(sv)
+            guard m > 0 else { return false }
+            return sv.contentOffset.y > m + 48
+        }
+
         /// 越界修正：夹回真实底部，并恢复「跟随底部」状态。
         ///
         /// 为什么必须单独做这件事：越界时 `contentOffset` 本身不会再变（除非用户动手），
@@ -331,13 +364,15 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             DispatchQueue.main.async { [weak self, weak sv] in
                 guard let self = self else { return }
                 self.overshootFixScheduled = false
-                guard let sv = sv, !self.userIsScrolling(sv) else { return }
+                // v1.0.35：排程期间用户可能已经开始上滑看历史了 —— 那就绝不能夹回。
+                guard let sv = sv, self.stickToBottom, !self.userIsScrolling(sv) else { return }
                 let m = self.maxOffset(sv)
                 guard m > 0, sv.contentOffset.y > m + 1 else { return }
                 sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: m), animated: false)
                 self.stickToBottom = true
-                // 夹回之后再请分步贴底一次：内容可能还在长（LazyVStack 陆续建 cell）。
-                self.pinToBottom(sv)
+                // v1.0.35：这里**不再**调 pinToBottom。
+                // 夹回本身已经精确落到 m；后面内容若继续长（流式追加 / cell 陆续渲染），
+                // contentSize 观察者会自己再贴一次。多调一次分步贴底只会让画面抖。
             }
         }
 
@@ -366,8 +401,30 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             guard stickToBottom, !userIsScrolling(sv), !pinning else { return }
             let m = maxOffset(sv)
             guard m > 0 else { return }
-            guard abs(sv.contentOffset.y - m) > 0.5 else { return }   // 已到底，不重复设
+            let distance = abs(sv.contentOffset.y - m)
+            guard distance > 0.5 else { return }   // 已到底，不重复设
             pinning = true
+            // v1.0.35：近距离（< 160pt）一步到位。
+            //
+            // 分步的唯一理由是「离得太远，一次性跳过去 LazyVStack 来不及建 cell，
+            // 视口会落在尚未渲染的空白上」。已经在底部附近时，需要的 cell 全都
+            // 渲染好了，再分三步只会在视觉上「抖几下」—— 这正是用户反馈的
+            // 「上滑一下松开，抖二下」。
+            if distance < 160 {
+                DispatchQueue.main.async { [weak self, weak sv] in
+                    guard let self = self else { return }
+                    guard let sv = sv, self.stickToBottom, !self.userIsScrolling(sv) else {
+                        self.pinning = false
+                        return
+                    }
+                    let mm = self.maxOffset(sv)
+                    if mm > 0, abs(sv.contentOffset.y - mm) > 0.5 {
+                        sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: mm), animated: false)
+                    }
+                    self.pinning = false
+                }
+                return
+            }
             stepTowardBottom(sv, remaining: 3)
         }
 

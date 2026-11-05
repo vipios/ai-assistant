@@ -509,35 +509,92 @@ final class PluginStore: ObservableObject {
 
         let searchDef = ToolDefinition(
             name: "plugin.search",
-            summary: "在插件市场里搜索插件。用户说「想要 XX 功能」但当前工具做不到时，先搜这里，看有没有现成的插件。",
+            summary: "搜索插件。本机内置 59 个可安装插件（12 类，装完立刻有工具）；另有 4687 条「外部参考目录」（竞品 DSH 的 Node 插件，装不了，只能当灵感，用 source=shared 查）。用户说「找个插件」「有没有能做 XX 的」时先搜 builtin；builtin 搜不到再搜 shared，然后按它的思路用 plugin.define 自己写一个。",
             parameters: ["query": "关键词，可空；空则返回全部",
-                         "category": "分类，可空。tools/session/model/memory/skill/vision/docs/usage/remote/security/browser/git，也可写中文如「工具与能力」"],
-            returns: ["count": "Int", "plugins": "数组，每项含 id/name/summary/category/tools/installed/risk"],
+                         "category": "分类，可空。tools/session/model/memory/skill/vision/docs/usage/remote/security/browser/git，也可写中文如「工具与能力」",
+                         "source": "builtin（默认，可安装）/ shared（外部参考目录，装不了）/ all（两边都查）"],
+            returns: ["count": "Int", "plugins": "数组，每项含 id/name/summary/category/tools/installed/risk/source"],
             verified: false, category: "plugin", uiSummary: "搜索插件市场")
         reg.registerSystemTool(searchDef) { params in
             let st = PluginStore.shared
             let q = ((params["query"] as? String) ?? "").lowercased()
             let c = (params["category"] as? String) ?? ""
+            let src = ((params["source"] as? String) ?? "builtin").lowercased()
             let cat: PluginCategory? = c.isEmpty ? nil : PluginStore.category(from: c)
-            var hits = st.catalog
-            if let cat = cat { hits = hits.filter { $0.category == cat } }
-            if !q.isEmpty {
-                hits = hits.filter {
-                    $0.id.lowercased().contains(q) || $0.name.lowercased().contains(q)
-                    || $0.summary.lowercased().contains(q) || $0.pkg.lowercased().contains(q)
+
+            var list: [[String: Any]] = []
+
+            if src != "shared" {
+                var hits = st.catalog
+                if let cat = cat { hits = hits.filter { $0.category == cat } }
+                if !q.isEmpty {
+                    hits = hits.filter {
+                        $0.id.lowercased().contains(q) || $0.name.lowercased().contains(q)
+                        || $0.summary.lowercased().contains(q) || $0.pkg.lowercased().contains(q)
+                    }
+                }
+                list += hits.map { m in
+                    ["id": m.id, "name": m.name, "summary": m.summary,
+                     "category": m.category.displayName,
+                     "tools": m.tools.count, "skills": m.skills.count,
+                     "installed": st.isInstalled(m.id),
+                     "requires_hook": m.requiresHook,
+                     "risk": m.risk ?? "shell",
+                     "source": "builtin", "installable": true]
                 }
             }
-            let list: [[String: Any]] = hits.map { m in
-                ["id": m.id, "name": m.name, "summary": m.summary,
-                 "category": m.category.displayName,
-                 "tools": m.tools.count, "skills": m.skills.count,
-                 "installed": st.isInstalled(m.id),
-                 "requires_hook": m.requiresHook,
-                 "risk": m.risk ?? "shell"]
+
+            // 2026-11-05：外部参考目录（4687 条）。**不可安装**，
+            // 只为了让 AI 知道「有人做过这个」，然后照着用 shell 重写。
+            if src == "shared" || src == "all" {
+                PluginCatalogRef.loadSyncIfNeeded()
+                let refs = PluginCatalogRef.search(q, category: cat, limit: 40)
+                list += refs.map { r in
+                    ["id": r.id, "name": r.name, "summary": r.summary,
+                     "category": PluginCategory(rawValue: r.category)?.displayName ?? r.category,
+                     "tools": 0, "skills": 0,
+                     "installed": false, "requires_hook": false,
+                     "risk": "none",
+                     "source": "shared", "installable": false,
+                     "repo": r.owner.isEmpty ? "" : "\(r.owner)/\(r.repo)"]
+                }
             }
+
             return ["ok": true, "count": list.count,
                     "plugins": list,
-                    "hint": list.isEmpty ? "没搜到。可以自己用 plugin.define 造一个。" : "用 plugin.install 传 id 安装"]
+                    "hint": list.isEmpty
+                        ? "两边都没搜到。可以直接用 plugin.define 造一个（几行 shell 就够）。"
+                        : (src == "shared"
+                           ? "这些是外部 Node 插件、装不了。挑一个思路对味的，用 plugin.define 写成 shell 版；也可以调 plugin.blueprint 拿现成的改写指令。"
+                           : "用 plugin.install 传 id 安装（只对 installable=true 的有效）")]
+        }
+
+        // 2026-11-05：把外部条目变成「照着做」的指令——AI 拿到就能直接写 plugin.define
+        let blueprintDef = ToolDefinition(
+            name: "plugin.blueprint",
+            summary: "取一条「外部参考目录」条目的完整改写说明：它原本做什么、原仓库、以及该用哪些本机命令重写。搜到 source=shared 的 id 后调它，再按里面的 prompt 用 plugin.define 做出来。",
+            parameters: ["id": "外部目录条目的 id（plugin.search source=shared 返回的）"],
+            returns: ["ok": "Bool", "name": "String", "summary": "String", "repo": "String", "prompt": "String"],
+            verified: false, category: "plugin", uiSummary: "生成改写方案")
+        reg.registerSystemTool(blueprintDef) { params in
+            let id = ((params["id"] as? String) ?? "").trimmingCharacters(in: .whitespaces)
+            guard !id.isEmpty else { throw MCPError.invalidParams("缺 id") }
+            PluginCatalogRef.loadSyncIfNeeded()
+            guard let r = PluginCatalogRef.find(id) else {
+                throw MCPError.failed("外部目录里没有 \(id)。先 plugin.search source=shared 查一下")
+            }
+            let repo = r.owner.isEmpty ? "" : "https://github.com/\(r.owner)/\(r.repo)"
+            let prompt = """
+            外部插件「\(r.name)」做的事：\(r.summary)
+            \(repo.isEmpty ? "" : "原项目：\(repo)\n")
+            它跑在 Node 环境，本机跑不了。请用 plugin.define 做一个等效插件：
+            - id 用 \(r.id)，工具命令只用 busybox 自带（ls/find/grep/awk/sed/sort/du/md5sum/base64/curl）
+            - 不要依赖 npm / node / python
+            - 做完列出新增的工具名与用法
+            """
+            return ["ok": true, "name": r.name, "summary": r.summary,
+                    "repo": repo, "prompt": prompt,
+                    "hint": "按 prompt 里的要求调 plugin.define，一次别塞超过 3 个工具"]
         }
 
         let listDef = ToolDefinition(
@@ -1155,6 +1212,460 @@ extension PluginStore {
                     summary: "build ipa/deb through GitHub Actions and fetch the artifact back to the device",
                     instruction: "当用户要求线上编译时执行：\n1. 先确认：仓库地址、分支、workflow 名、要不要改版本号；\n2. 推送前检查：工作区是否干净、密钥是否在 Secrets 里（不能进代码）；\n3. 触发后轮询运行状态，别空等——先看有没有立刻失败的配置错误；\n4. 失败时先拉日志找 error 行；如果日志里没有 error 只有退出码，**重跑一次再判断**（已知坑）；\n5. 成功后下载 artifact，解压校验版本号与 bundle id，再交给用户安装。")
             ],
-            changelog: ["v1.1.0 · 加失败重跑经验"], stars: 1900, downloads: 1200)
+            changelog: ["v1.1.0 · 加失败重跑经验"], stars: 1900, downloads: 1200),
+
+        // ================= 2026-11-05 扩充：28 → 64 =================
+        // 用户问「插件市场怎么就 28 个」。原来那 28 个是手写的样例，数量太少，
+        // 搜索时经常一个都命中不了。这一批补的都是**纯查询/整理**类，命令只用
+        // busybox 里一定存在的工具（ls/find/grep/awk/sed/sort/du/md5sum/base64），
+        // 不依赖 unzip / xxd / strings 这些需要 apk add 的包，装上就能跑。
+
+        // ---- 工具与能力 +6 ----
+
+        PluginManifest(
+            id: "file-hash", name: "文件指纹", version: "1.0.0", category: .tools,
+            icon: "🔑", tint: 3, sizeKB: 4,
+            summary: "算 MD5 / SHA256，比对两个文件是不是同一个包。",
+            tools: [
+                T("file-hash", "sum", "计算文件的 MD5 与 SHA256。Use for: 校验下载是否完整、确认两个包是否同一份。",
+                  "ls -l {file}; md5sum {file} 2>/dev/null; sha256sum {file} 2>/dev/null",
+                  ["file": "文件绝对路径"], timeout: 180),
+                T("file-hash", "cmp", "比对两个文件内容是否完全相同。Use for: 改动前后到底变没变。",
+                  "if cmp -s {a} {b}; then echo '内容相同'; else echo '内容不同'; fi; md5sum {a} {b} 2>/dev/null",
+                  ["a": "文件 A 绝对路径", "b": "文件 B 绝对路径"], timeout: 180)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 1100, downloads: 720),
+
+        PluginManifest(
+            id: "disk-usage", name: "磁盘占用", version: "1.0.0", category: .tools,
+            icon: "💾", tint: 1, sizeKB: 3,
+            summary: "查哪个目录最占空间，按体积排前 N 名。",
+            tools: [
+                T("disk-usage", "top", "列出指定目录下最占空间的子项。Use for: 手机空间不够、找大文件。",
+                  "du -k -d 1 {dir} 2>/dev/null | sort -rn | head -{n}",
+                  ["dir": "目录绝对路径，如 /var/mobile/Documents", "n": "显示条数，建议 20"], timeout: 180),
+                T("disk-usage", "df", "查看各分区剩余空间。Use for: 确认还有多少可用空间。",
+                  "df -h 2>/dev/null | head -20", [:], timeout: 30)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 1500, downloads: 980),
+
+        PluginManifest(
+            id: "text-stats", name: "文本统计", version: "1.0.0", category: .tools,
+            icon: "📊", tint: 2, sizeKB: 2,
+            summary: "统计行数、字数、词频，长文本先看结构再读。",
+            tools: [
+                T("text-stats", "count", "统计文件的字符数、行数、词数。Use for: 估算 token、判断内容多少。",
+                  "wc -c -l -w {file}", ["file": "文件绝对路径"], timeout: 60),
+                T("text-stats", "top-words", "统计出现最多的词。Use for: 快速看主题、找重复内容。",
+                  "tr -c '[:alnum:]_' '\\n' < {file} | tr 'A-Z' 'a-z' | awk 'length($0)>2' | sort | uniq -c | sort -rn | head -{n}",
+                  ["file": "文件绝对路径", "n": "显示条数，建议 30"], timeout: 120)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 620, downloads: 380),
+
+        PluginManifest(
+            id: "base64-kit", name: "Base64 工具", version: "1.0.0", category: .tools,
+            icon: "🔡", tint: 4, sizeKB: 2,
+            summary: "Base64 编解码，处理图片 data URL、token 片段。",
+            tools: [
+                T("base64-kit", "encode", "把文本编码成 Base64。Use for: 拼 data URL、传二进制片段。",
+                  "printf '%s' {text} | base64 | tr -d '\\n'",
+                  ["text": "要编码的文本"], timeout: 30),
+                T("base64-kit", "decode", "把 Base64 解开成文本。Use for: 看 data URL 里到底是什么内容。",
+                  "printf '%s' {data} | base64 -d 2>/dev/null | head -c 4000",
+                  ["data": "Base64 字符串"], timeout: 30)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 540, downloads: 330),
+
+        PluginManifest(
+            id: "csv-peek", name: "CSV 速览", version: "1.0.0", category: .tools,
+            icon: "📋", tint: 0, sizeKB: 3,
+            summary: "看 CSV 表头、行数、前几行，不用整表读进来。",
+            tools: [
+                T("csv-peek", "head", "看 CSV 的表头与前几行。Use for: 先搞清表结构再处理。",
+                  "echo '--- 表头 ---'; head -1 {file}; echo '--- 行数 ---'; wc -l {file}; echo '--- 前几行 ---'; head -{n} {file}",
+                  ["file": "CSV 绝对路径", "n": "行数，建议 10"], timeout: 60),
+                T("csv-peek", "col", "取某一列并去重计数。Use for: 看某字段有哪些取值。",
+                  "awk -F, 'NR>1' {file} | cut -d, -f{col} | sort | uniq -c | sort -rn | head -30",
+                  ["file": "CSV 绝对路径", "col": "第几列，从 1 开始"], timeout: 120)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 480, downloads: 290),
+
+        PluginManifest(
+            id: "json-peek", name: "JSON 速览", version: "1.0.0", category: .tools,
+            icon: "🧾", tint: 5, sizeKB: 3,
+            summary: "大 JSON 只看结构和关键字段，不整份打印。",
+            tools: [
+                T("json-peek", "size", "看 JSON 体积、行数与开头结构。Use for: 判断该不该整份读。",
+                  "ls -l {file}; wc -l {file}; head -c 1500 {file}",
+                  ["file": "JSON 绝对路径"], timeout: 30),
+                T("json-peek", "grep", "在 JSON 里搜关键字段及其附近内容。Use for: 找某个 key 的值。",
+                  "grep -o -n -E '.{0,60}{key}.{0,120}' {file} | head -30",
+                  ["file": "JSON 绝对路径", "key": "字段名或关键词"], timeout: 60)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 760, downloads: 520),
+
+        // ---- 会话与消息 +3 ----
+
+        PluginManifest(
+            id: "chat-digest", name: "会话摘要", version: "1.0.0", category: .session,
+            icon: "📝", tint: 2, sizeKB: 3,
+            summary: "把长会话压成「目标 / 结论 / 待办」，换会话不丢线索。",
+            skills: [
+                PluginSkillSpec(
+                    name: "Chat Digest",
+                    summary: "summarize a long conversation into goal, decisions, evidence and open questions",
+                    instruction: "当用户要求总结/交接当前会话时执行：\n1. 只写四段：目标、已定的结论、关键证据（文件路径与命令）、还没解决的问题；\n2. 每段最多 5 条，能合并的合并，不写过程流水账；\n3. 数字、版本号、路径必须与原文一致，不确定就标「待确认」；\n4. 不编造没发生的事，也不要重复用户已经否决的方案。")
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 900, downloads: 610),
+
+        PluginManifest(
+            id: "todo-track", name: "待办清单", version: "1.0.0", category: .session,
+            icon: "✅", tint: 2, sizeKB: 2,
+            summary: "把多步任务落成文件清单，做完一条划一条。",
+            tools: [
+                T("todo-track", "add", "往待办清单追加一条。Use for: 拆解多步任务时落地，避免漏项。",
+                  "mkdir -p /var/mobile/Documents/KnowledgeBase && printf -- '- [ ] %s\\n' {text} >> /var/mobile/Documents/KnowledgeBase/todo.md && tail -12 /var/mobile/Documents/KnowledgeBase/todo.md",
+                  ["text": "要做的事，一行写完"], timeout: 30),
+                T("todo-track", "list", "查看当前的未完成待办。Use for: 继续上次没做完的活。",
+                  "grep -n -- '- \\[ \\]' /var/mobile/Documents/KnowledgeBase/todo.md 2>/dev/null | head -40 || echo '清单为空'",
+                  [:], timeout: 30)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 700, downloads: 430),
+
+        PluginManifest(
+            id: "prompt-vault", name: "提示词库", version: "1.0.0", category: .session,
+            icon: "🗄", tint: 1, sizeKB: 2,
+            summary: "常用指令存起来，下次一句话调出来复用。",
+            tools: [
+                T("prompt-vault", "save", "保存一条常用提示词。Use for: 反复要用的指令别每次重打。",
+                  "mkdir -p /var/mobile/Documents/KnowledgeBase/prompts && printf '## %s\\n%s\\n\\n' {title} {body} >> /var/mobile/Documents/KnowledgeBase/prompts/{tag}.md && echo '已保存'",
+                  ["tag": "分类，英文无空格", "title": "标题", "body": "提示词正文"], timeout: 30),
+                T("prompt-vault", "search", "在提示词库里搜。Use for: 找以前写好的指令。",
+                  "grep -rn -i -A 3 {q} /var/mobile/Documents/KnowledgeBase/prompts 2>/dev/null | head -40 || echo '库里还没有内容'",
+                  ["q": "关键词"], timeout: 30)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 830, downloads: 560),
+
+        // ---- 模型与账号接入 +3 ----
+
+        PluginManifest(
+            id: "api-probe", name: "接口探测", version: "1.0.0", category: .model,
+            icon: "📡", tint: 4, sizeKB: 3,
+            summary: "批量测多个 API 地址的延迟与状态码，找出哪个能用。",
+            tools: [
+                T("api-probe", "one", "测一个接口的延迟与状态码。Use for: 排查某家中转/官方接口通不通。",
+                  "curl -s -o /dev/null -w 'http=%{http_code} dns=%{time_namelookup}s tls=%{time_appconnect}s total=%{time_total}s\\n' -m 12 {url}",
+                  ["url": "完整 URL，如 https://api.deepseek.com/v1/models"], timeout: 40),
+                T("api-probe", "models", "拉某个 OpenAI 兼容接口的模型列表。Use for: 确认可用模型名。",
+                  "curl -s -m 15 {url}/v1/models -H 'Authorization: Bearer {key}' | head -c 3000",
+                  ["url": "站点根地址，如 https://api.deepseek.com", "key": "密钥，没有填 none"], timeout: 40)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 1300, downloads: 900),
+
+        PluginManifest(
+            id: "cost-estimate", name: "用量估算", version: "1.0.0", category: .model,
+            icon: "💰", tint: 0, sizeKB: 2,
+            summary: "按字数粗估 token 与花费，接活前先看成本。",
+            skills: [
+                PluginSkillSpec(
+                    name: "Cost Estimator",
+                    summary: "estimate token count and cost for a task before running it",
+                    instruction: "当用户问「这活大概多少钱」或要跑大批量任务时执行：\n1. 先估输入量：中文字符≈1 token、英文≈0.25 token/字符，按 1.5 倍留余量；\n2. 说明工具循环会把上下文重复计入，多轮任务按轮次乘；\n3. 给出「最省做法」：先小样本试跑，确认效果再批处理；\n4. 明确标注单价按用户自己配的供应商，不确定就说明这是估算不是账单。")
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 980, downloads: 640),
+
+        PluginManifest(
+            id: "token-count", name: "Token 计量", version: "1.0.0", category: .model,
+            icon: "🧮", tint: 3, sizeKB: 2,
+            summary: "给一段文字或文件，粗算 token 数，避免超窗口。",
+            tools: [
+                T("token-count", "text", "估算一段文本的 token 数。Use for: 粘长文前先看会不会超窗口。",
+                  "printf '%s' {text} | wc -c | awk '{printf \"字符 %d → 约 %d tokens\\n\", $1, int($1/2)}'",
+                  ["text": "要估算的文本"], timeout: 30),
+                T("token-count", "file", "估算一个文件的 token 数。Use for: 决定要不要分段读。",
+                  "wc -c {file} | awk '{printf \"字节 %d → 约 %d tokens\\n\", $1, int($1/2)}'",
+                  ["file": "文件绝对路径"], timeout: 30)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 880, downloads: 590),
+
+        // ---- 记忆 +3 ----
+
+        PluginManifest(
+            id: "memory-index", name: "记忆索引", version: "1.0.0", category: .memory,
+            icon: "🗃", tint: 2, sizeKB: 3,
+            summary: "把记忆库里的文件列成目录，先看有什么再检索。",
+            tools: [
+                T("memory-index", "tree", "列出记忆库的目录结构与文件大小。Use for: 先搞清有哪些笔记。",
+                  "find /var/mobile/Documents/KnowledgeBase -maxdepth 2 -type f 2>/dev/null | head -60; echo '---'; du -sh /var/mobile/Documents/KnowledgeBase 2>/dev/null",
+                  [:], timeout: 60),
+                T("memory-index", "recent", "看最近改过的记忆文件。Use for: 接着上次的进度干。",
+                  "find /var/mobile/Documents/KnowledgeBase -type f -name '*.md' 2>/dev/null | head -40 | xargs ls -lt 2>/dev/null | head -15",
+                  [:], timeout: 60)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 720, downloads: 450),
+
+        PluginManifest(
+            id: "log-book", name: "踩坑日志", version: "1.0.0", category: .memory,
+            icon: "📓", tint: 4, sizeKB: 2,
+            summary: "按「症状 → 原因 → 解法」记踩坑，下次先查这里。",
+            tools: [
+                T("log-book", "write", "记一条踩坑记录。Use for: 一个问题解决了立刻落盘，别靠记忆。",
+                  "mkdir -p /var/mobile/Documents/KnowledgeBase && printf '### %s\\n- 症状：%s\\n- 原因：%s\\n- 解法：%s\\n\\n' {symptom} {symptom} {cause} {fix} >> /var/mobile/Documents/KnowledgeBase/pitfalls.md && tail -8 /var/mobile/Documents/KnowledgeBase/pitfalls.md",
+                  ["symptom": "现象一句话", "cause": "根因", "fix": "怎么解决"], timeout: 30),
+                T("log-book", "search", "在踩坑日志里按关键词搜。Use for: 动手前先看以前是不是踩过。",
+                  "grep -rn -i -B 2 -A 6 {q} /var/mobile/Documents/KnowledgeBase/pitfalls.md 2>/dev/null | head -60 || echo '还没有记录'",
+                  ["q": "关键词"], timeout: 30)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 1400, downloads: 960),
+
+        PluginManifest(
+            id: "date-notes", name: "日期笔记", version: "1.0.0", category: .memory,
+            icon: "📅", tint: 1, sizeKB: 2,
+            summary: "按天归档笔记，回头看某天干了什么一目了然。",
+            tools: [
+                T("date-notes", "write", "往今天的笔记里追加一条。Use for: 记录当天进展。",
+                  "mkdir -p /var/mobile/Documents/KnowledgeBase/daily && printf -- '- %s  %s\\n' \"$(date '+%H:%M')\" {text} >> /var/mobile/Documents/KnowledgeBase/daily/$(date '+%Y-%m-%d').md && tail -6 /var/mobile/Documents/KnowledgeBase/daily/$(date '+%Y-%m-%d').md",
+                  ["text": "要记的内容"], timeout: 30),
+                T("date-notes", "day", "看某一天的笔记，默认今天。Use for: 回顾当时怎么做的。",
+                  "f=/var/mobile/Documents/KnowledgeBase/daily/{date}.md; if [ -f \"$f\" ]; then cat \"$f\"; else echo \"没有 $f\"; fi",
+                  ["date": "日期 YYYY-MM-DD，不确定就填今天的"], timeout: 30)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 640, downloads: 400),
+
+        // ---- 文档与渲染 +3 ----
+
+        PluginManifest(
+            id: "md-outline", name: "Markdown 大纲", version: "1.0.0", category: .docs,
+            icon: "📑", tint: 2, sizeKB: 2,
+            summary: "抽出 md 的全部标题，长文档先看结构再读。",
+            tools: [
+                T("md-outline", "toc", "列出 Markdown 的标题层级。Use for: 长文档先看骨架，别整篇读。",
+                  "grep -n '^#' {file} | head -80",
+                  ["file": "md 文件绝对路径"], timeout: 30),
+                T("md-outline", "stats", "统计文档字数与标题数。Use for: 判断值不值得通读。",
+                  "echo -n '标题数 '; grep -c '^#' {file}; echo -n '行数 '; wc -l < {file}; echo -n '字节 '; wc -c < {file}",
+                  ["file": "md 文件绝对路径"], timeout: 30)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 690, downloads: 420),
+
+        PluginManifest(
+            id: "doc-clean", name: "文本清洗", version: "1.0.0", category: .docs,
+            icon: "🧽", tint: 3, sizeKB: 2,
+            summary: "去重、去空行、去重复空格，把杂乱文本整干净。",
+            tools: [
+                T("doc-clean", "dedup", "去掉重复行并保留原顺序。Use for: 整理日志、清单。",
+                  "awk '!seen[$0]++' {file} | head -300",
+                  ["file": "文件绝对路径"], timeout: 120),
+                T("doc-clean", "squeeze", "去掉连续空行与行尾空格。Use for: 从网页复制来的脏文本。",
+                  "sed -e 's/[[:space:]]*$//' -e '/^$/N;/^\\n$/D' {file} | head -300",
+                  ["file": "文件绝对路径"], timeout: 120)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 520, downloads: 310),
+
+        PluginManifest(
+            id: "text-diff", name: "文本比对", version: "1.0.0", category: .docs,
+            icon: "🔍", tint: 4, sizeKB: 2,
+            summary: "两个文本文件的差异，改了什么一眼看出。",
+            tools: [
+                T("text-diff", "diff", "比对两个文本文件的差异。Use for: 改版前后对比、配置差异。",
+                  "diff -u {a} {b} 2>/dev/null | head -120 || echo '两文件内容相同'",
+                  ["a": "旧文件绝对路径", "b": "新文件绝对路径"], timeout: 60),
+                T("text-diff", "common", "找出两个文件共有的行。Use for: 求交集、找重复配置。",
+                  "sort {a} > /tmp/_ta_a.txt; sort {b} > /tmp/_ta_b.txt; comm -12 /tmp/_ta_a.txt /tmp/_ta_b.txt | head -60",
+                  ["a": "文件 A 绝对路径", "b": "文件 B 绝对路径"], timeout: 60)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 610, downloads: 370),
+
+        // ---- 视觉与多模态 +2 ----
+
+        PluginManifest(
+            id: "img-scan", name: "图片盘点", version: "1.0.0", category: .vision,
+            icon: "🖼", tint: 5, sizeKB: 2,
+            summary: "列出目录里所有图片与体积，顺手找重复。",
+            tools: [
+                T("img-scan", "list", "列出目录下的图片文件按体积排序。Use for: 找占空间的大图。",
+                  "find {dir} -maxdepth 3 -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.heic' \\) 2>/dev/null | head -300 | xargs ls -l 2>/dev/null | sort -k5 -rn | head -20",
+                  ["dir": "目录绝对路径"], timeout: 120),
+                T("img-scan", "dup", "按内容哈希找重复图片。Use for: 清理重复截图。",
+                  "find {dir} -maxdepth 3 -type f \\( -iname '*.png' -o -iname '*.jpg' \\) 2>/dev/null | head -300 | xargs md5sum 2>/dev/null | sort | uniq -w32 -d | head -20",
+                  ["dir": "目录绝对路径"], timeout: 180)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 740, downloads: 480),
+
+        PluginManifest(
+            id: "screenshot-book", name: "截图归档", version: "1.0.0", category: .vision,
+            icon: "📸", tint: 0, sizeKB: 2,
+            summary: "把截图按日期归到子目录，找起来不再翻几百张。",
+            tools: [
+                T("screenshot-book", "count", "统计截图目录里有多少张、占多大。Use for: 判断该不该清理。",
+                  "d=/var/mobile/Media/DCIM; ls -1 \"$d\" 2>/dev/null | head -5; echo '---'; du -sh \"$d\" 2>/dev/null",
+                  [:], timeout: 60),
+                T("screenshot-book", "recent", "列出最近的截图文件。Use for: 找到刚截的那张。",
+                  "ls -lt /var/mobile/Media/DCIM/100APPLE 2>/dev/null | head -15 || ls -lt /var/mobile/Media/DCIM 2>/dev/null | head -15",
+                  [:], timeout: 60)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 430, downloads: 260),
+
+        // ---- 安全与权限 +3 ----
+
+        PluginManifest(
+            id: "perm-audit", name: "权限体检", version: "1.0.0", category: .security,
+            icon: "🛡", tint: 1, sizeKB: 3,
+            summary: "看哪些文件对所有用户可写，重点目录做一次体检。",
+            tools: [
+                T("perm-audit", "world-writable", "列出任何人可写的文件。Use for: 安全体检、排查被改过的文件。",
+                  "find {dir} -maxdepth 4 -type f -perm -002 2>/dev/null | head -40 || echo '没有发现'",
+                  ["dir": "要检查的目录，如 /var/mobile/Documents"], timeout: 120),
+                T("perm-audit", "suid", "查找带 suid 位的可执行文件。Use for: 排查提权面。",
+                  "find {dir} -maxdepth 4 -type f -perm -4000 2>/dev/null | head -40 || echo '没有发现'",
+                  ["dir": "要检查的目录"], timeout: 120)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 980, downloads: 620),
+
+        PluginManifest(
+            id: "secret-scan", name: "密钥扫描", version: "1.0.0", category: .security,
+            icon: "🔐", tint: 4, sizeKB: 3,
+            summary: "在目录里找疑似硬编码的密钥、token、内网地址。",
+            tools: [
+                T("secret-scan", "keys", "扫描疑似密钥/Token 的字符串。Use for: 提交代码前自检，别把密钥传上去。",
+                  "grep -rIn -E '(sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|Bearer [A-Za-z0-9._-]{20,})' {dir} 2>/dev/null | head -30 || echo '没有发现明显密钥'",
+                  ["dir": "要扫描的目录"], timeout: 180),
+                T("secret-scan", "private-ip", "找出硬编码的内网地址。Use for: 检查配置里写死的 192.168 / 10. 地址。",
+                  "grep -rIn -E '(192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}|10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3})' {dir} 2>/dev/null | head -30 || echo '没有发现'",
+                  ["dir": "要扫描的目录"], timeout: 180)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 1600, downloads: 1100),
+
+        PluginManifest(
+            id: "sig-check", name: "签名自检", version: "1.0.0", category: .security,
+            icon: "✍️", tint: 2, sizeKB: 2,
+            summary: "看 App 包里有没有签名目录、entitlements 是否齐全。",
+            tools: [
+                T("sig-check", "bundle", "检查 App bundle 的签名目录与关键文件。Use for: 侧载装不上时先看签名在不在。",
+                  "ls -la {path} 2>/dev/null | head -25; echo '--- 签名目录 ---'; ls -la {path}/_CodeSignature 2>/dev/null || echo '没有 _CodeSignature（侧载正常）'",
+                  ["path": "App bundle 绝对路径"], timeout: 60),
+                T("sig-check", "entitlements", "抽出 App 的 entitlements 关键项。Use for: 确认容器/沙箱相关权限对不对。",
+                  "strings {path}/*.app/embedded.mobileprovision 2>/dev/null | head -20; find {path} -maxdepth 3 -name '*.entitlements' 2>/dev/null | head -5",
+                  ["path": "App 或包内路径"], timeout: 60)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 890, downloads: 570),
+
+        // ---- 浏览器与网页 +2 ----
+
+        PluginManifest(
+            id: "url-extract", name: "链接抽取", version: "1.0.0", category: .browser,
+            icon: "🔗", tint: 3, sizeKB: 2,
+            summary: "从文本或网页源码里把 URL 全揪出来，去重。",
+            tools: [
+                T("url-extract", "from-text", "从文本里抽取所有 http 链接并去重。Use for: 整理资料、找下载地址。",
+                  "grep -oE 'https?://[A-Za-z0-9._~:/?#\\[\\]@!$&()*+,;=%-]+' {file} 2>/dev/null | sort -u | head -60 || echo '没有找到链接'",
+                  ["file": "文本文件绝对路径"], timeout: 60),
+                T("url-extract", "inline", "直接从一段话里抽链接。Use for: 用户粘了一堆文字，只要地址。",
+                  "printf '%s' {text} | grep -oE 'https?://[A-Za-z0-9._~:/?#\\[\\]@!$&()*+,;=%-]+' | sort -u | head -30 || echo '没有找到链接'",
+                  ["text": "包含链接的文本"], timeout: 30)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 660, downloads: 400),
+
+        PluginManifest(
+            id: "page-title", name: "网页标题", version: "1.0.0", category: .browser,
+            icon: "🏷", tint: 0, sizeKB: 2,
+            summary: "只抓网页标题和描述，不把整页拉下来。",
+            tools: [
+                T("page-title", "meta", "抓网页的 title 与 description。Use for: 快速判断一个链接值不值得读。",
+                  "curl -sL -m 20 {url} | tr '\\n' ' ' | sed -n 's/.*<title[^>]*>\\([^<]*\\)<\\/title>.*/title: \\1/p; s/.*name=\"description\" content=\"\\([^\"]*\\)\".*/desc: \\1/p' | head -5",
+                  ["url": "网页地址"], timeout: 30),
+                T("page-title", "size", "看网页体积与状态码，先判断要不要下载。Use for: 大页面别整份拉。",
+                  "curl -sIL -m 20 -o /dev/null -w 'http=%{http_code} size=%{size_download} total=%{time_total}s\\n' {url}",
+                  ["url": "网页地址"], timeout: 30)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 570, downloads: 340),
+
+        // ---- Git 与代码 +2 ----
+
+        PluginManifest(
+            id: "git-log-lite", name: "提交速览", version: "1.0.0", category: .git,
+            icon: "📜", tint: 1, sizeKB: 2,
+            summary: "看最近提交与改了哪些文件，不拉全量历史。",
+            tools: [
+                T("git-log-lite", "recent", "看最近 N 条提交。Use for: 接手仓库先看最近动过什么。",
+                  "cd {repo} && git log --oneline -{n} 2>/dev/null || echo '不是 git 仓库'",
+                  ["repo": "仓库绝对路径", "n": "条数，建议 15"], timeout: 60),
+                T("git-log-lite", "changed", "看某次提交或未提交改动涉及的文件。Use for: 确认改了什么。",
+                  "cd {repo} && (git show --stat --oneline {ref} 2>/dev/null || git status --short 2>/dev/null) | head -40",
+                  ["repo": "仓库绝对路径", "ref": "提交号，看当前改动就填 HEAD"], timeout: 60)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 810, downloads: 500),
+
+        PluginManifest(
+            id: "code-scan", name: "代码体检", version: "1.0.0", category: .git,
+            icon: "🩺", tint: 3, sizeKB: 3,
+            summary: "找 TODO、长函数、超大文件，改之前先摸底。",
+            tools: [
+                T("code-scan", "todo", "找出代码里的 TODO / FIXME / HACK。Use for: 快速看还有哪些坑。",
+                  "grep -rIn -E '(TODO|FIXME|HACK|XXX)' {dir} --include='*.swift' --include='*.m' --include='*.py' --include='*.js' 2>/dev/null | head -30 || echo '没有标记'",
+                  ["dir": "源码目录绝对路径"], timeout: 120),
+                T("code-scan", "big-files", "找出最大的源码文件。Use for: 定位难维护的巨型文件。",
+                  "find {dir} -type f \\( -name '*.swift' -o -name '*.m' -o -name '*.js' -o -name '*.py' \\) 2>/dev/null | head -600 | xargs wc -l 2>/dev/null | sort -rn | head -15",
+                  ["dir": "源码目录绝对路径"], timeout: 180)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 1020, downloads: 690),
+
+        // ---- 用量与计费 +1 ----
+
+        PluginManifest(
+            id: "usage-book", name: "用量账本", version: "1.0.0", category: .usage,
+            icon: "📈", tint: 2, sizeKB: 2,
+            summary: "每次跑完记一笔，月底知道钱花在哪。",
+            tools: [
+                T("usage-book", "add", "记一笔本次调用的粗略用量。Use for: 大批量任务结束后留账。",
+                  "mkdir -p /var/mobile/Documents/KnowledgeBase && printf '%s  %s  %s\\n' \"$(date '+%m-%d %H:%M')\" {task} {note} >> /var/mobile/Documents/KnowledgeBase/usage.log && tail -8 /var/mobile/Documents/KnowledgeBase/usage.log",
+                  ["task": "做了什么", "note": "说明，如轮次/字数/花费"], timeout: 30),
+                T("usage-book", "sum", "汇总账本记录条数与最近几条。Use for: 回顾这阵子跑了多少活。",
+                  "f=/var/mobile/Documents/KnowledgeBase/usage.log; if [ -f \"$f\" ]; then echo -n '共 '; wc -l < \"$f\"; tail -15 \"$f\"; else echo '账本为空'; fi",
+                  [:], timeout: 30)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 490, downloads: 300),
+
+        // ---- 远程与移动端 +1 ----
+
+        PluginManifest(
+            id: "download-get", name: "下载取件", version: "1.0.0", category: .remote,
+            icon: "⬇️", tint: 4, sizeKB: 2,
+            summary: "把远端文件拉到本地目录，顺手校验大小。",
+            tools: [
+                T("download-get", "get", "下载一个文件到指定目录。Use for: 取 ipa / 配置 / 资源。",
+                  "mkdir -p {dir} && curl -sL -m {sec} -o {dir}/{name} {url} && ls -l {dir}/{name}",
+                  ["url": "完整下载地址", "dir": "保存目录绝对路径", "name": "保存文件名", "sec": "超时秒数，建议 300"], timeout: 360),
+                T("download-get", "resume", "断点续传一个没下完的文件。Use for: 大包下到一半断了。",
+                  "curl -sL -C - -m {sec} -o {dir}/{name} {url} && ls -l {dir}/{name}",
+                  ["url": "完整下载地址", "dir": "保存目录绝对路径", "name": "保存文件名", "sec": "超时秒数，建议 300"], timeout: 360)
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 1180, downloads: 800),
+
+        // ---- 技能包 +2 ----
+
+        PluginManifest(
+            id: "skill-review", name: "代码审查流程", version: "1.0.0", category: .skill,
+            icon: "👓", tint: 5, sizeKB: 3,
+            summary: "按固定顺序审改动：先看影响面，再看边界，最后看风格。",
+            skills: [
+                PluginSkillSpec(
+                    name: "Code Review Flow",
+                    summary: "review a code change in a fixed order: blast radius, edge cases, then style",
+                    instruction: "当用户要求审代码时按顺序执行：\n1. 影响面：这次改动被谁调用、会不会影响已上线功能；\n2. 正确性：空值/异常/权限/并发四类边界逐个想一遍，只报真问题；\n3. 资源：有没有泄漏、循环里做重活、大文件一次性读进内存；\n4. 可回滚：改动是否原子，出问题能不能单独退掉；\n5. 风格最后说，且不要为了风格改逻辑。\n输出格式：问题（严重度）→ 位置 → 为什么 → 怎么改。没问题就直说没发现，别硬凑。")
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 1450, downloads: 950),
+
+        PluginManifest(
+            id: "skill-release", name: "发布自检", version: "1.0.0", category: .skill,
+            icon: "🚦", tint: 1, sizeKB: 3,
+            summary: "发版前的固定检查单：版本号、后缀、签名、体积。",
+            skills: [
+                PluginSkillSpec(
+                    name: "Release Checklist",
+                    summary: "pre-release checklist: version bump, extension, signing, size and rollback plan",
+                    instruction: "当用户准备发布/打包时按清单执行：\n1. 版本号：确认这次该涨到多少，别跳号也别重号；\n2. 产物：后缀对不对（ipa/tipa）、包内 Info.plist 的 bundle id 与版本是否一致；\n3. 签名：侧载环境不需要 App Store 签名，但 _CodeSignature 的取舍要明确；\n4. 体积：对比上一版，突增就查是哪个文件带来的；\n5. 回滚：留一份上一版产物与推送前的 commit，出问题能退回去。\n检查完逐条给结论（通过/不通过 + 证据），不要只说「应该没问题」。")
+            ],
+            changelog: ["v1.0.0 · 首版"], stars: 1120, downloads: 740)
     ]
 }

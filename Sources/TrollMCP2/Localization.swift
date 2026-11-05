@@ -968,6 +968,22 @@ enum L10n {
             tbl["i18n_1230"] = ["zh": "安装包已交给 TrollStore：在弹出的界面点「安装」就会覆盖旧版（安装过程中别打开本 App）", "en": "Package handed to TrollStore — tap Install in its prompt to overwrite the old version (don't open this app while it installs)"]
             tbl["i18n_1231"] = ["zh": "没找到能打开安装包的 TrollStore，已打开分享菜单——选 TrollStore，或先储存再用 TrollStore 打开", "en": "No TrollStore found to open the package; share sheet opened — pick TrollStore, or save it and open it in TrollStore"]
             tbl["i18n_1232"] = ["zh": "系统拒绝了安装请求，已打开分享菜单兜底", "en": "System rejected the install request; share sheet opened as fallback"]
+            // 2026-11-05：关闭「下载完自动跳 TrollStore」后的提示——只弹菜单，等用户自己点
+            tbl["i18n_1620"] = ["zh": "安装包已下载好：点「用 TrollStore 安装」覆盖升级，或先「存储到文件」", "en": "Package downloaded — tap \"Install via TrollStore\" to upgrade, or \"Save to Files\" first"]
+            // 2026-11-05：本轮结束标记（用户要求「需要加结束话语」）+ 兜底状态文案
+            tbl["i18n_1621"] = ["zh": "本轮结束 · 用时 %@", "en": "Turn finished · %@"]
+            tbl["i18n_1623"] = ["zh": "AI 正在工作", "en": "Working…"]
+            // 2026-11-05：外部参考目录（竞品 12 类 / 4687 条，只能参考不能直接装）
+            tbl["i18n_1624"] = ["zh": "外部目录", "en": "Shared"]
+            tbl["i18n_1625"] = ["zh": "正在读取外部目录…", "en": "Loading shared catalog…"]
+            tbl["i18n_1626"] = ["zh": "只显示前 200 条 · 再输入关键词缩小范围", "en": "Showing first 200 · type a keyword to narrow down"]
+            tbl["i18n_1627"] = ["zh": "参考", "en": "Ref"]
+            tbl["i18n_1628"] = ["zh": "为什么不能直接安装", "en": "Why not install directly"]
+            tbl["i18n_1629"] = ["zh": "这是 DeepSeek Harness 的 Node 插件，靠 node22 运行时加载；本机是 Alpine shell 环境，跑不了同一套代码。所以这里只当参考：可以让 AI 按它的思路，用本机命令重写成能用的版本。", "en": "This is a DeepSeek Harness Node plugin that needs the node22 runtime; this device runs an Alpine shell, so the same code can't run. Treat it as a reference — the AI can rewrite the idea into something that works here."]
+            tbl["i18n_1630"] = ["zh": "复制「让 AI 照做一个」的指令", "en": "Copy the \"rewrite this for me\" prompt"]
+            tbl["i18n_1631"] = ["zh": "已复制，回聊天框粘贴发送", "en": "Copied — paste it in chat"]
+            tbl["i18n_1632"] = ["zh": "复制后回聊天界面粘贴发送，AI 会用 plugin.define 现场建一个同功能的插件。", "en": "After copying, paste it in the chat. The AI will build an equivalent plugin with plugin.define."]
+            tbl["i18n_1633"] = ["zh": "外部插件", "en": "Shared plugin"]
             // v4.6.x：快捷卡片 prompt 中文化（卡片 UI 已双语，发送的指令原来硬编码英文 → AI 回复英文）
             tbl["i18n_1233"] = ["zh": "在 GitHub 上编译一个测试 tweak（HelloWorld），然后把 dylib 下载到工作区", "en": "Compile a test tweak (HelloWorld) on GitHub, then download the dylib to the workspace"]
             tbl["i18n_1234"] = ["zh": "列出已安装的应用，选一个测试 dylib 注入并验证加载状态", "en": "List installed apps, pick one to test dylib injection and verify its load state"]
@@ -1621,6 +1637,9 @@ enum L10n {
             tbl["i18n_1592"] = ["zh": "会一并撤销它的 %d 个工具和 %d 个技能，不影响 App 本体与其他插件。", "en": "Removes its %d tool(s) and %d skill(s). The app and other plugins are unaffected."]
             tbl["i18n_1593"] = ["zh": "已装 %d 个 · 提供 %d 个工具 · %d 个技能", "en": "%d installed · %d tools · %d skills"]
             tbl["i18n_1594"] = ["zh": "%d 类 · 共 %d 个插件", "en": "%d categories · %d plugins"]
+            // 外部目录页的副标题：明确写「仅供参考、不可直接安装」，
+            // 不然和上一页的「%d 个插件」长得一样，用户以为这 4687 个都能装。
+            tbl["i18n_1634"] = ["zh": "%d 类 · %d 条外部参考 · 不可直接安装", "en": "%d categories · %d shared references · not installable"]
             tbl["i18n_1595"] = ["zh": "还没有安装任何插件", "en": "No plugins installed yet"]
             tbl["i18n_1596"] = ["zh": "去发现页看看", "en": "Browse plugins"]
             tbl["i18n_1597"] = ["zh": "提供 %d 个工具", "en": "%d tools"]

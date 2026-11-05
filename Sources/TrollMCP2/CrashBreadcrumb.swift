@@ -131,19 +131,50 @@ final class CrashBreadcrumb {
     /// 系统的 DiagnosticReports 常常收不到（用户上次那几条我也确实没在本机找到）。
     /// 自己判断更可靠。
     private let cleanExitKey = "diag.lastCleanExit"
+    /// 2026-11-05：记录「上一次启动有没有跑到主界面」。
+    private let reachedUILaunchKey = "diag.lastLaunchReachedUI"
 
     func markCleanExit() {
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: cleanExitKey)
     }
 
     /// 返回 true 表示「上次是异常结束」。
+    ///
+    /// 2026-11-05 重写判据。旧实现是纯时间窗判断：
+    /// ```swift
+    /// let gap = now - lastCleanExit
+    /// return gap < 12 * 3600          // ← 只要 12h 内退出过就算"崩溃"
+    /// ```
+    /// 而 `markCleanExit()` 只在 `applicationDidEnterBackground` 里被调用。
+    /// 因此只要用户是**从 App Switcher 直接上划杀**（他的习惯动作），或者 App 在
+    /// 前台时被系统因内存压力干掉，这次退出就没有对应的时间戳 → 下次启动一律
+    /// 报「上次异常终止」。诊断日志里那一长串「App 启动（上次异常终止）」
+    /// 绝大多数就是这么来的，跟真崩溃没关系。
+    ///
+    /// 新判据看**事实**而不是时间：
+    ///   · 上次启动有没有跑到主界面（`markLaunchSucceeded` 写过没有）
+    ///   · 只有当"没跑到主界面"时才算异常 —— 那才是真的崩在启动路径上
+    /// 时间窗保留，但只用来排除"很久以前那次没跑通"的陈旧记录。
     func detectPreviousCrash() -> Bool {
+        // 2026-11-05：必须用「本次启动前算好的快照」。
+        // 原因：`registerLaunchAttempt()` 在 App 启动第 70 行就会把 reachedUILaunchKey
+        // 覆写成 false（表示"本次还没跑到主界面"），而 `detectPreviousCrash()`
+        // 要到第 123 行才被调用——那时读到的已经是被本次启动污染的值，
+        // 于是每次都判成「上次异常终止」。快照在 registerLaunchAttempt 里先存好。
+        if let snap = previousLaunchReachedUI { return !snap }
+
+        // 没快照（老版本升级上来 / 未走正常启动路径）→ 退回读盘 + 时间窗。
+        let reached = UserDefaults.standard.object(forKey: reachedUILaunchKey) as? Bool
+        if let reached = reached, reached { return false }
         let last = UserDefaults.standard.double(forKey: cleanExitKey)
         guard last > 0 else { return false }   // 首次安装，不算崩
         let gap = Date().timeIntervalSince1970 - last
-        // 超过 12 小时没写正常退出标记：可能只是很久没用，不当成崩溃，避免误报
+        // 超过 12 小时：可能只是很久没用，不当成崩溃，避免误报
         return gap < 12 * 3600
     }
+
+    /// 上一次启动是否跑到主界面的快照（本次启动最开始、覆写之前算好）。
+    private var previousLaunchReachedUI: Bool?
 
     // MARK: - 崩溃循环自救（2026-11-03，用户反馈「点桌面图标进不去，一直闪退」）
     //
@@ -163,8 +194,17 @@ final class CrashBreadcrumb {
 
     /// 启动最早期调用。返回 true 表示「前几次启动都失败了，本次进安全模式」。
     func registerLaunchAttempt() -> Bool {
+        // 2026-11-05：**先**把「上次有没有跑到主界面」捞出来存快照，再覆写成 false。
+        // 顺序反了的话，下面就再也读不到上次的真实值了。
+        previousLaunchReachedUI = UserDefaults.standard.object(forKey: reachedUILaunchKey) as? Bool
+
         let n = UserDefaults.standard.integer(forKey: launchCountKey) + 1
         UserDefaults.standard.set(n, forKey: launchCountKey)
+        // 2026-11-05：先把「本次还没跑到主界面」落盘。
+        // 如果这次真的崩在启动路径上，这个 false 会留到下次启动，
+        // 下次 detectPreviousCrash() 就能凭它准确判出「上次是异常终止」——
+        // 不用再靠时间窗猜。
+        UserDefaults.standard.set(false, forKey: reachedUILaunchKey)
         // 第 2 次及以后仍没跑通（说明上一次也失败）→ 安全模式
         return n >= 2
     }
@@ -172,6 +212,8 @@ final class CrashBreadcrumb {
     /// 成功跑到主界面后调用，清零计数。
     func markLaunchSucceeded() {
         UserDefaults.standard.set(0, forKey: launchCountKey)
+        // 2026-11-05：本次确实跑到主界面了 —— 这是「上次是否崩溃」的权威事实。
+        UserDefaults.standard.set(true, forKey: reachedUILaunchKey)
     }
 
     /// 安全模式标记：本次启动不自动打开上次会话。
