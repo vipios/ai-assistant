@@ -1420,8 +1420,22 @@ final class ConversationStore: ObservableObject {
     }
 
     /// v3.1.70：活动请求的会话 index (优先活动会话，兜底当前选中会话）
+    ///
+    /// 2026-11-05 **加一道「请求真的还在跑」的闸**：
+    /// `requestSessionId` 永不清空的设计初衷是防流式回调写错会话，
+    /// 但它同时意味着**只要不发新消息，它就永久停在旧会话**。
+    /// 于是 `activeConvId ?? requestSessionId` 这个兜底在「请求已结束」时
+    /// 依然返回旧会话 —— 用户在会话 2 里做事，写入/上下文却全落到会话 1。
+    ///
+    /// 修法：`requestSessionId` 只有在 `isLoading == true`（本轮确实在跑）时才参与兜底。
+    /// 请求已结束 → 它只是个历史值，不该再影响归属判断。
+    /// 流式回调的防错写另有 isRunning + 消息 id 精确匹配兜着，不依赖它。
     private var activeConvIndex: Int? {
-        if let id = activeConvId ?? requestSessionId, let i = conversations.firstIndex(where: { $0.id == id }) {
+        if isLoading, let id = activeConvId ?? requestSessionId,
+           let i = conversations.firstIndex(where: { $0.id == id }) {
+            return i
+        }
+        if let id = activeConvId, let i = conversations.firstIndex(where: { $0.id == id }) {
             return i
         }
         return selectedIndex
@@ -1600,6 +1614,19 @@ final class ConversationStore: ObservableObject {
         TaskNotify.shared.endBackground()
         // v3.1.70：停止——解除活动会话绑定
         activeConvId = nil
+        // 2026-11-05 **这里必须连 requestSessionId 一起清**。
+        //
+        // 它的注释写着「只在下一次 send() 时覆盖，不受停止影响」——本意是防
+        // 「停止时流式还在回调，写错会话」。但代价是：**停止之后到下一次 send 之间的
+        // 任何读取都会拿到旧会话 id**，而 `activeConvIndex` / `messagesForAPI` /
+        // `currentSessionID()` 全都是 `activeConvId ?? requestSessionId` 兜底。
+        // 用户实测「第二个会话去干第一个会话的活」正是这条路径：
+        // 会话 1 停掉 → requestSessionId 还停在会话 1 → 在会话 2 里做任何事，
+        // 兜底全部落到会话 1 上。
+        //
+        // 停止的语义是「这一轮不要了」，不是「继续绑着旧会话」。
+        // 流式回调的错写问题由 isRunning / 消息 id 精确匹配来防，不靠一个陈旧的会话 id。
+        requestSessionId = nil
     }
 
     /// 2026-11-03 新增：一轮请求「非正常收尾」时的统一复位。
@@ -1623,6 +1650,11 @@ final class ConversationStore: ObservableObject {
         thinkBuffer = ""
         thinkingStartAt = nil
         activeConvId = nil
+        // 2026-11-05：本轮正式收尾 → 会话绑定彻底解除。
+        // isLoading 已经变 false，activeConvIndex 的那道闸会拦住它；
+        // 这里再清一次，让 messagesForAPI / currentSessionID 这些直接读它的地方
+        // 也立刻回到「当前选中会话」，不留一个过期的旧值。
+        requestSessionId = nil
         TaskNotify.shared.endBackground()
     }
 
@@ -2061,7 +2093,10 @@ final class ConversationStore: ObservableObject {
         // system 序列中间、对话之前——标题/hint 一变即前缀失效。
         // fix73k-2：标注从"do not respond"改为"可引用"——实测原标注导致模型把 env 快照当
         // 背景勿扰，用户问设备/工作区时答"一半是"且不补查；现明确允许引用 + 缺细节可查 device.info。
-        history.append(ChatMessage(role: "user", content: Self.dynamicStatePrompt() + "\n(Environment snapshot — reference it to answer device/workspace/environment questions; query device.info for more detail if needed. Do not echo it unless asked.)"))
+        // 2026-11-05：传**请求所属会话**（requestSessionId ?? activeConvId），
+        // 不是 selectedIndex —— 用户切窗口期间 selectedIndex 已经飘到别的会话，
+        // 用它就会把「另一个会话的标题 + 另一个会话的上下文」塞进本次请求。
+        history.append(ChatMessage(role: "user", content: Self.dynamicStatePrompt(sessionId: requestSessionId ?? activeConvId) + "\n(Environment snapshot — reference it to answer device/workspace/environment questions; query device.info for more detail if needed. Do not echo it unless asked.)"))
         // Tool-param prevalidation correction injection: missing required params blocked last round, append likewise.
         if let pcorr = self.pendingParamCorrection, !pcorr.isEmpty {
             history.append(ChatMessage(role: "user", content: pcorr))
@@ -3584,7 +3619,13 @@ final class ConversationStore: ObservableObject {
 
     /// v2.9.138：动态会话状态块——设备/App/工作区/当前会话，injected system 最前
     ///  (位于稳定块之后，最新状态放最后）。让 AI 始终感知当前环境，不靠猜。
-    private static func dynamicStatePrompt() -> String {
+    ///
+    /// 2026-11-05 **必须传入请求所属会话 ID**：
+    /// 「当前会话标题」和「自动提取的上下文」都跟会话有关。
+    /// 原来前者读 `shared.selectedIndex`（用户切窗口期间会漂移），
+    /// 后者读全局单例（跨会话污染），两者叠加就是用户看到的
+    /// 「我在第二个会话问去广告，它去干第一个会话的活」。
+    private static func dynamicStatePrompt(sessionId: UUID?) -> String {
         var device = "iPhone"
         var os = ""
         #if canImport(UIKit)
@@ -3596,12 +3637,14 @@ final class ConversationStore: ObservableObject {
         var parts = ["[Current env] device: \(device)\(os.isEmpty ? "" : " · \(os)")"]
         if !appVer.isEmpty { parts.append("App: All-in-One AI Assistant \(appVer)") }
         parts.append("Workspace: \(Workspace.root.path)")
-        if let idx = ConversationStore.shared.selectedIndex,
-           idx < ConversationStore.shared.conversations.count {
-            parts.append("Current conversation: \(ConversationStore.shared.conversations[idx].title)")
+        // 2026-11-05：按 sessionId 找标题，不再读 selectedIndex（切会话时它会漂）
+        if let sid = sessionId,
+           let conv = ConversationStore.shared.conversations.first(where: { $0.id == sid }) {
+            parts.append("Current conversation: \(conv.title)")
         }
         // v3.1.5: 自动提取的关键信息 (App 名、bundle id、文件路径等）
-        if let hint = AutoContextExtractor.shared.contextHint() {
+        // 2026-11-05：**只取本会话的**，别的会话提到过什么都不算。
+        if let hint = AutoContextExtractor.shared.contextHint(sessionId: sessionId) {
             parts.append(hint)
         }
         return parts.joined(separator: " | ")

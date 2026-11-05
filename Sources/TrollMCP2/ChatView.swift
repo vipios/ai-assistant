@@ -1530,7 +1530,9 @@ struct ChatView: View {
         guard let cfg = modelStore.defaultConfig,
               (!inputText.isEmpty || !pendingAttachments.isEmpty || !pendingImages.isEmpty) else { return }
         // v3.1.5: 自动提取关键信息（App 名、bundle id、文件路径等）
-        AutoContextExtractor.shared.extract(from: inputText)
+        // 2026-11-05：**必须带 sessionId**——原来不分会话，全局共用一份，
+        // 于是会话 1 提到的 bundle id 会污染会话 2（用户实测「第二个会话说去弄第一个会话的任务」）。
+        AutoContextExtractor.shared.extract(from: inputText, sessionId: store.selectedId)
         // v3.1.1: 模型不支持视觉时，自动 OCR 识别图片文字，拼到消息里
         var imagesToSend = pendingImages
         if !pendingImages.isEmpty && !cfg.supportsVision {

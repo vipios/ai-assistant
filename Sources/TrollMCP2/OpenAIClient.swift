@@ -1100,6 +1100,20 @@ final class OpenAIClient {
     private func repairDanglingToolCalls(_ msgs: [ChatMessage]) -> [ChatMessage] {
         var out: [ChatMessage] = []
         var pending: [(id: String, name: String)] = []
+        /// 2026-11-05 **新增：当前这一段里声明过的 tool_call id 集合**。
+        ///
+        /// 旧实现只处理「有调用、缺结果」这一个方向，对面那个方向完全没管 ——
+        /// 于是历史里一旦出现**孤立 tool 消息**（结果还在，对应的 assistant.toolCalls
+        /// 已被裁剪/被切会话/被重新生成掉），服务端就报
+        /// `invalid_request_error: tool calls and tool results do not match`（错误码 11148）。
+        /// 用户截图里那条红字就是这个，而且它换个模型、重试都逃不掉 ——
+        /// 因为它不是偶发，是历史里真的躺着一条无主的 tool 结果。
+        ///
+        /// 修法：跟同时维护「哪些 id 有主」。一段之内，一条 tool 消息的 id
+        /// 如果从来没被任何 assistant.toolCalls 声明过，就**丢掉那条消息**。
+        /// 丢掉是安全的：它的结果内容对模型没有价值（没有对应的调用就解读不了），
+        /// 留着反而让整个请求失败。
+        var declared = Set<String>()
         func flushPending() {
             guard !pending.isEmpty else { return }
             for p in pending {
@@ -1114,15 +1128,28 @@ final class OpenAIClient {
             if m.role == "assistant", let calls = m.toolCalls, !calls.isEmpty {
                 flushPending()  // 前一轮若残留先补（防御）
                 pending = calls.map { ($0.id, $0.name) }
+                // 新的一段开始 → declared 重置为「本段声明的那些」。
+                // 不能跨段累积：上一段声明过的 id 在这一段已经没有配对关系了，
+                // 累积会让本该被丢弃的孤立结果蒙混过关。
+                declared = Set(pending.map { $0.id })
                 out.append(m)
             } else if m.role == "tool", let id = m.toolCallId {
                 // 只按 id 配对，不在此 flush——连续的 tool 消息各自配对不同的 toolCall，
                 // 此前每处理一条就 flush，会把"还没轮到的后续 toolCall"误补成 crash 占位符
                 // （多工具串行批第 2 个起结果全被顶替，正是用户实测"no result received"）。
                 pending.removeAll { $0.id == id }
+                // 2026-11-05：孤立 tool 结果（没有任何 assistant 声明过这个 id）→ 丢弃。
+                // 不丢的话服务端必报 11148，整轮请求直接失败，用户只能新建会话才能继续。
+                guard declared.contains(id) else {
+                    NetworkLog.shared.log("[seq] 丢弃孤立 tool 结果 id=\(id) name=\(m.toolName ?? "-")（无配对 tool_call）")
+                    continue
+                }
                 out.append(m)
             } else {
                 flushPending()  // user/assistant(无calls)/system 前补
+                // 非工具消息 = 上一段工具链已经结束，清空允许名单。
+                // 之后如果再出现 tool 结果却没被新的 assistant.toolCalls 声明，就该丢。
+                declared = []
                 out.append(m)
             }
         }
