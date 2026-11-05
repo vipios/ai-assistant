@@ -109,6 +109,8 @@ struct ScrollGeometryBridge: UIViewRepresentable {
         private let stickTolerance: CGFloat = 24
         /// 防 pinToBottom 重入（async 排程期间又来一次 contentSize 变更）
         private var pinning = false
+        /// 防越界修正重复排程（2026-11-05 fix-blank-2）
+        private var overshootFixScheduled = false
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
@@ -195,6 +197,14 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                     // 静止状态下的 offset 变化 = 代码设的（贴底吸附 / scrollTo）。
                     // 不触发降级，只顺手校正一次吸附判定，保证「程序性滚到底后继续跟随」。
                     //
+                    // 2026-11-05 fix-blank-2：**先判越界**。滚过真实底部时绝不能往下走
+                    // 那个「stickToBottom = isAtBottom(sv)」——那时它必然是 false，
+                    // 等于把自动跟随关掉，空白就永久留下了。这里改为夹回并保持跟随。
+                    if self.isOverscrolled(sv) {
+                        self.scheduleOvershootFix(sv)
+                        return
+                    }
+                    //
                     // 2026-11-05 fix-blank **关键**：分步贴合进行到一半时，offset 停在
                     // 「还没到底」的位置，如果这里照常把 stickToBottom 改写成 isAtBottom
                     // （= false），后面几步会被自己的闸门拦掉，永远贴不到底 —— 又变成
@@ -208,6 +218,14 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             contentSizeObs = sv.observe(\.contentSize, options: [.initial, .new]) { [weak self] sv, _ in
                 guard let self = self else { return }
                 self.onContentHeight?(sv.contentSize.height)
+                // 2026-11-05 fix-blank-2：内容**变矮**时 offset 不会变，offset 观察者不会重入，
+                // 于是「offset 停在旧内容高度」这个越界状态会一直留着 = 空白。
+                // 这是发送消息后最容易踩到的一条：新消息进 LazyVStack 会触发分组重算 /
+                // 估算高度重算，contentSize 可能先鼓后缩。所以这里必须主动判一次越界。
+                if self.isOverscrolled(sv) {
+                    self.scheduleOvershootFix(sv)
+                    return
+                }
                 // 内容变高（流式追加 / 新 cell 渲染）且用户没在操作 → 钉到底，无动画。
                 self.pinToBottom(sv)
             }
@@ -219,6 +237,12 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             frameObs = sv.observe(\.frame, options: [.initial, .new]) { [weak self] sv, _ in
                 guard let self = self else { return }
                 self.onViewportHeight?(sv.bounds.height)
+                // 视口变高（键盘收起）→ maxOffset 变小 → 原来「在底部」的 offset 现在越界。
+                // 同上，先夹回再贴底。
+                if self.isOverscrolled(sv) {
+                    self.scheduleOvershootFix(sv)
+                    return
+                }
                 self.pinToBottom(sv)
             }
 
@@ -269,11 +293,52 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             }
         }
 
+        /// 内容可滚动的最大 offset（= 停在最底部时 contentOffset.y 的值）。
+        /// 统一走这里，避免各处各写一遍公式后漏掉 adjustedContentInset。
+        private func maxOffset(_ sv: UIScrollView) -> CGFloat {
+            sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom
+        }
+
         /// 是否已在底部（含容差）
         private func isAtBottom(_ sv: UIScrollView) -> Bool {
-            let maxOffset = sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom
-            guard maxOffset > 0 else { return true }   // 内容比视口短 = 天然在底部
-            return sv.contentOffset.y >= maxOffset - stickTolerance
+            let m = maxOffset(sv)
+            guard m > 0 else { return true }   // 内容比视口短 = 天然在底部
+            return sv.contentOffset.y >= m - stickTolerance
+        }
+
+        /// 是否**滚过了真实内容底部**（视口落在内容之外的空白区）。
+        ///
+        /// 2026-11-05 fix-blank-2：这是「发完消息整屏空白」的判据。
+        /// 越界只可能来自代码（用户手指拖不过底部，松手会回弹），所以一旦判定越界，
+        /// 就直接夹回底部 —— 不用管是谁设的（SwiftUI scrollTo 的估算落位、
+        /// LazyVStack 内容变矮、键盘收起后视口变高导致 m 变小，全都覆盖）。
+        private func isOverscrolled(_ sv: UIScrollView) -> Bool {
+            let m = maxOffset(sv)
+            guard m > 0 else { return false }
+            return sv.contentOffset.y > m + 1
+        }
+
+        /// 越界修正：夹回真实底部，并恢复「跟随底部」状态。
+        ///
+        /// 为什么必须单独做这件事：越界时 `contentOffset` 本身不会再变（除非用户动手），
+        /// 于是 offset 观察者不会重入、contentSize 观察者也不一定再触发 ——
+        /// 越界状态会**一直停在那里**，正是用户说的「内容全顶没了，下滑一下才出来」。
+        /// 而且越界那一刻若不拦住，offset 观察者会把 stickToBottom 判成 false，
+        /// 等于自己把唯一的自动恢复机制关掉了。
+        private func scheduleOvershootFix(_ sv: UIScrollView) {
+            guard !overshootFixScheduled else { return }
+            overshootFixScheduled = true
+            DispatchQueue.main.async { [weak self, weak sv] in
+                guard let self = self else { return }
+                self.overshootFixScheduled = false
+                guard let sv = sv, !self.userIsScrolling(sv) else { return }
+                let m = self.maxOffset(sv)
+                guard m > 0, sv.contentOffset.y > m + 1 else { return }
+                sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: m), animated: false)
+                self.stickToBottom = true
+                // 夹回之后再请分步贴底一次：内容可能还在长（LazyVStack 陆续建 cell）。
+                self.pinToBottom(sv)
+            }
         }
 
         /// 无动画钉到底部。用 setContentOffset(animated: false) 而不是 UIView.animate，
@@ -299,9 +364,9 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             //   2) 用户正在操作（拖拽/惯性）→ 不动，否则手指会被系统判定为手势冲突
             //   3) 上一帧排的 pin 还没执行 → 不重复排
             guard stickToBottom, !userIsScrolling(sv), !pinning else { return }
-            let maxOffset = sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom
-            guard maxOffset > 0 else { return }
-            guard abs(sv.contentOffset.y - maxOffset) > 0.5 else { return }   // 已到底，不重复设
+            let m = maxOffset(sv)
+            guard m > 0 else { return }
+            guard abs(sv.contentOffset.y - m) > 0.5 else { return }   // 已到底，不重复设
             pinning = true
             stepTowardBottom(sv, remaining: 3)
         }
@@ -323,7 +388,7 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                 }
                 // 目标要重新算：这一帧里 LazyVStack 可能又建出了几个 cell，
                 // contentSize 已经变大，用上一帧的旧目标会「差一点到底」。
-                let m = sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom
+                let m = self.maxOffset(sv)
                 guard m > 0 else {
                     self.pinning = false
                     return
@@ -356,6 +421,9 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             decelObs = nil
             scrollView = nil
             pinning = false
+            // 2026-11-05 fix-blank-2：越界修正的排程标记同样要复位，
+            // 否则 detach 时正好排着一个未执行的修正，重建后会被这个标记永久挡掉。
+            overshootFixScheduled = false
             // 2026-11-05 fix-blank：切会话/离屏后要允许新一轮补贴底，
             // 否则新会话 attach 上来时 didInitialPin 还是 true → 不再补 → 又停在空白/顶部。
             didInitialPin = false

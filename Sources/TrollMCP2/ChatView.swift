@@ -822,12 +822,26 @@ struct ChatView: View {
                 // 只有用户自己发消息才会让最后一条变成 user。
                 if let last = store.currentMessages.last, last.role == "user", !last.isTool {
                     scroll.requestStickToBottom()
-                    // 用户主动发消息是低频动作，这里滚一次是合理的（且不带 withAnimation，
-                    // 避免和 UIKit 吸附互相插值）。
-                    // 丢到下一个 runloop：onChange 回调时新气泡还没进 LazyVStack，
-                    // 立刻 scrollTo 找不到锚点会静默失败。
+                    // 2026-11-05 fix-blank-2 **关键改动**：这里**不再**调 proxy.scrollTo。
+                    //
+                    // 用户现象：「我回复出去以后，界面内容全被顶没了，出现空白，
+                    //           下滑第二次才出来之前的聊天内容」。
+                    //
+                    // 病根就是这一行 scrollTo(last.id, anchor: .bottom)：
+                    //   1) 新气泡刚进 LazyVStack，cell 还没建，SwiftUI 只能按**估算高度**
+                    //      算目标位置，而 LazyVStack 对未渲染内容一律往大了估
+                    //      → 目标 offset 越过真实 contentSize 底部；
+                    //   2) setContentOffset 到内容之外不会报错也不会自动夹回，
+                    //      视口就停在一片空白上；
+                    //   3) 紧接着 offset 观察者跑起来，看到「不在底部」→ 把 stickToBottom
+                    //      判成 false（以为用户主动上滑看历史）→ 自动跟随被关掉，
+                    //      空白就永久留在那儿，只有手指下滑才回到内容里。
+                    //
+                    // 现在只发吸附请求，由桥接层按**真实 contentSize** 分步贴底；
+                    // 万一还是越界（内容先鼓后缩），桥接层的 isOverscrolled 会夹回底部。
+                    // 连排两次：第一次让状态立刻置位，第二次等新气泡真正进布局后再落位。
                     DispatchQueue.main.async {
-                        proxy.scrollTo(last.id, anchor: .bottom)
+                        scroll.requestStickToBottom()
                     }
                 }
             }
@@ -852,10 +866,12 @@ struct ChatView: View {
             // v2.9.235：键盘高度变化→自动滚到底（高度本身由外层 VStack 监听，空会话也能避让键盘）
             .onChange(of: keyboardHeight) { _ in
                 if keyboardHeight > 0 {
+                    // 2026-11-05 fix-blank-2：这里原来也是 proxy.scrollTo(last.id, anchor: .bottom)。
+                    // 键盘弹出时视口刚变矮、contentSize 还没稳定，scrollTo 的估算落位同样会
+                    // 冲到内容之外 → 整屏空白。改走吸附请求（桥接层用真实 contentSize + 越界夹回）。
+                    // 延迟 0.3s 保留：等键盘弹出动画（0.25s）结束、视口高度定下来再贴底。
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        if let last = store.currentMessages.last {
-                            proxy.scrollTo(last.id, anchor: .bottom)
-                        }
+                        scroll.requestStickToBottom()
                     }
                 }
             }
