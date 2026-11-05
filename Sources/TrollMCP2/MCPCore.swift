@@ -454,6 +454,26 @@ public final class ToolRegistry: ObservableObject {
         return true
     }
 
+    /// v1.0.34：注册「系统级工具」——给插件管理器自己用的那几个（plugin.search / install …）。
+    ///
+    /// 与 registerPluginTool 的区别：
+    ///   1. **不限制名前缀**——管理器工具叫 `plugin.xxx`，便于 AI 一眼认出这是装插件的能力，
+    ///      而不是某个插件贡献的工具。卸载插件时按 `user.plg_<id>_` 前缀清理，不会误伤。
+    ///   2. 同样跳过危险词检查：管理器工具的描述/名字里本来就会出现 remove、delete 等词。
+    ///   3. 注册后立刻置 enabled——内置白名单里没有这些名字。
+    @discardableResult
+    public func registerSystemTool(_ def: ToolDefinition,
+                                   handler: @escaping ([String: Any]) throws -> [String: Any]) -> Bool {
+        if tools[def.name] != nil {
+            print("[TA] ❌ system tool rejected: name already exists \(def.name)")
+            return false
+        }
+        register(ExternalMCPTool(definition: def, handler: handler))
+        setEnabled(name: def.name, enabled: true)
+        print("[TA] 🔧 system tool registered: \(def.name)")
+        return true
+    }
+
     public var definitions: [ToolDefinition] {
         // v3.0.90：去掉锁——只读操作
         return tools.values.map { $0.definition }.sorted { $0.name < $1.name }
@@ -518,6 +538,10 @@ public final class ToolRegistry: ObservableObject {
         // fix73k-5：apiName 归一化匹配（schema 名 shell_exec ↔ 原名 shell.exec）
         let norm = name.replacingOccurrences(of: "_", with: ".")
         if Self.coreToolNames.contains(norm) { return true }
+        // v1.0.34：插件管理器工具一律常驻。
+        // 它们走「目录 + describe 再加载」会多耗一轮，而模型往往一看到任务
+        // 就得立刻去搜/装插件，多等一轮体验差别很明显。
+        if norm.hasPrefix("plugin.") || norm.hasPrefix("policy.") { return true }
         // 叠加当前模式的额外常驻工具
         let extra = SystemPrompts.shared.currentExtraCoreTools
         return extra.contains(name) || extra.contains(norm)
@@ -1021,6 +1045,14 @@ public final class ToolRegistry: ObservableObject {
         }
         // v3.0.90：去掉 lock.unlock()，因为已经去掉了 lock.lock()
         guard let t = tool else { throw MCPError.unknownTool(name) }
+        // v1.0.35：授权票据剥离。
+        // policy.confirm 批准后模型会把 `_confirm_token` 塞进目标工具的参数里；
+        // 这里先摘掉再往下走，否则 shell.exec / app 这类工具会把它当成多余参数报错。
+        var effectiveParams = params
+        var confirmTicket: String? = nil
+        if let raw = effectiveParams.removeValue(forKey: "_confirm_token") {
+            confirmTicket = raw as? String
+        }
         // v2.9.31：去掉授权弹窗。放行 = 策略启用 (isEnabled）或会话已授权。
         // 未加载/未启用工具直接返回错误，提示 AI 换用已加载工具，而不是弹窗打扰用户。
         let originalName = t.definition.name
@@ -1034,6 +1066,11 @@ public final class ToolRegistry: ObservableObject {
             throw MCPError.invalidParams("tool '\(originalName)' is unloaded in this session — reload it via tool.describe name:\"\(originalName)\" (if you know the name) or the settings toggle; a new conversation resets automatically.")
         }
         if isEnabled(name: originalName) || isSessionApproved(originalName) || isCore(originalName) {
+            // v1.0.35：票据校验放在真正执行之前——工具没启用时抛的是"已加载，请重调"，
+            // 那种失败不该烧掉一张用户刚点过「允许」的票，所以放在这个分支里而不是函数开头。
+            if let ticket = confirmTicket, !ConfirmGate.shared.consume(ticket, tool: originalName) {
+                throw MCPError.failed("授权票据无效、已用过或已过期（每张仅限一次，有效期 5 分钟）。需要执行就重新调 policy.confirm 让用户再确认一次；不要换个工具绕过去。")
+            }
             // v2.9.36：统一审计 (老 MCP 样式：OK/failed · 权限 · 耗时 · 数据量）
             let start = CFAbsoluteTimeGetCurrent()
             let perm = Self.permissionLabel(originalName)
@@ -1042,18 +1079,18 @@ public final class ToolRegistry: ObservableObject {
                 if let gate = Self.executionGate(for: originalName) { gate.wait() }
                 defer { if let gate = Self.executionGate(for: originalName) { gate.signal() } }
                 // v3.0.90：记录调用次数，告诉 AI 它调了几次，让 AI 自己判断
-                let callCount = recordCall(name: originalName, params: params)
+                let callCount = recordCall(name: originalName, params: effectiveParams)
                 // v2.9.72：工作流可视化
                 WorkflowManager.shared.addStep(name: originalName, tool: originalName)
 
                 // v3.0.90：结果缓存——5 分钟内同样的调用直接返回缓存
                 // v4.3.26：有状态工具 (browser./control./device.fake/injection.mem）绕过缓存；
                 // 其余工具连续第 2 次命中缓存也强制重取 (命中计数归零后真实执行)。
-                let cacheKey = callKey(name: originalName, params: params)
+                let cacheKey = callKey(name: originalName, params: effectiveParams)
                 let bypassCache = cacheBypassPrefixes.contains { originalName.hasPrefix($0) }
                 var cached: [String: Any]? = nil
                 if !bypassCache {
-                    cached = getCachedResult(name: originalName, params: params)
+                    cached = getCachedResult(name: originalName, params: effectiveParams)
                     if cached != nil {
                         let hits = bumpHitCount(cacheKey)
                         if hits >= 2 {
@@ -1085,7 +1122,7 @@ public final class ToolRegistry: ObservableObject {
                 // v3.1.5: 自动重试——网络错误/超时自动重试一次
                 var result: [String: Any]
                 do {
-                    result = try t.invoke(params)
+                    result = try t.invoke(effectiveParams)
                 } catch {
                     // 异常抛出的错误：判断能不能重试
                     let errStr = "\(error)"
@@ -1093,7 +1130,7 @@ public final class ToolRegistry: ObservableObject {
                         // 自动重试一次
                         WorkflowManager.shared.updateStep(tool: originalName, detail: "🔄 auto-retrying...", success: false)
                         Thread.sleep(forTimeInterval: 1.0)  // 等 1 秒再重试
-                        result = try t.invoke(params)
+                        result = try t.invoke(effectiveParams)
                     } else {
                         throw error
                     }
@@ -1121,7 +1158,7 @@ public final class ToolRegistry: ObservableObject {
                         WorkflowManager.shared.updateStep(tool: originalName, detail: "🔄 auto-retrying...", success: false)
                         Thread.sleep(forTimeInterval: 1.0)  // 等 1 秒再重试
                         do {
-                            result = try t.invoke(params)
+                            result = try t.invoke(effectiveParams)
                         } catch {
                             // 重试还是failed，继续走failed路径
                             AuditLog.shared.logTool(originalName, status: .failure,
@@ -1165,7 +1202,7 @@ public final class ToolRegistry: ObservableObject {
                 // v3.0.90：存结果缓存 (OK才存，failed不缓存）
                 // v4.3.25: 慢结果 (超看门狗）也不缓存——避免"慢"成为被复读的常态结果
                 if !timedOut {
-                    cacheResult(name: originalName, params: params, result: result)
+                    cacheResult(name: originalName, params: effectiveParams, result: result)
                 }
 
                 // v2.9.125：CLI 式统一返回——顶层只留 ok/message，细节收进 data。

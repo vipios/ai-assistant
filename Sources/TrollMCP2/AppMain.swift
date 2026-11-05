@@ -165,6 +165,18 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
                 _ = HUDManager.shared.start()
             }
         }
+        // v1.0.34：提前拉起插件商店。
+        // PluginStore 是懒加载单例，不主动 touch 的话只有用户点开设置页才会初始化，
+        // 那 AI 在聊天里就看不到 plugin.search / install 这几个工具（不是"没权限"，是"不存在"）。
+        // 它自己的 init 里 1.5s 后会 restoreInstalled + registerManagerTools。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            _ = PluginStore.shared
+        }
+        // v1.0.35：授权确认门同样要提前 touch——它负责注册 policy.confirm，
+        // 懒加载不触发的话 AI 就永远看不到这个工具（也就没有"问一下再执行"这条路）。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            _ = ConfirmGate.shared
+        }
         // v4.3.39：启动静默检查更新——后台跑，不打扰；发现新版点亮设置页"检查更新"红点
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
             let ver = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? ""

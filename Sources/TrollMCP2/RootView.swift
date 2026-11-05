@@ -27,6 +27,8 @@ struct RootView: View {
     @State private var importResult: String?
     // v4.3.44：QuickLook 分享中间层状态（侧载环境分享面板安全路径）
     @ObservedObject private var shareCenter = ShareCenter.shared
+    // v1.0.35：AI 授权确认卡（policy.confirm 发起的请求）
+    @ObservedObject private var confirmGate = ConfirmGate.shared
 
     private static func onboardingNeeded() -> Bool {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -65,6 +67,16 @@ struct RootView: View {
         // v2.9.39：内置浏览器悬浮窗（所有界面之上，可缩小到右侧边缘，AI 操作自动浮现）
         // 注意：trailing-closure 版 overlay 仅 iOS15+，项目部署目标 iOS14，用 view 参数版
         .overlay(FloatingBrowserOverlay())
+        // v1.0.35：AI 授权确认卡——盖在聊天之上，但低于 fullScreenCover（设置页）。
+        // 用户点「允许/拒绝」才回到 AI，聊天里打「确定」两个字不算授权。
+        .overlay(
+            Group {
+                if let req = confirmGate.pending {
+                    ConfirmRequestOverlay(request: req)
+                        .transition(.opacity)
+                }
+            }
+        )
         // v2.9.76：设置改全屏（去掉 sheet 半屏 + 顶部 grabber），子页面头部对齐
         .fullScreenCover(isPresented: Binding(
             get: { ui.settingsPresented },

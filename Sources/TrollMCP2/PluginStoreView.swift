@@ -8,6 +8,8 @@ import SwiftUI
 
 struct PluginStoreView: View {
     @ObservedObject private var store = PluginStore.shared
+    // v1.0.35：授权确认门总开关
+    @ObservedObject private var gate = ConfirmGate.shared
 
     @State private var tab = 1                 // 0 = 已安装, 1 = 发现
     @State private var query = ""
@@ -44,6 +46,10 @@ struct PluginStoreView: View {
                 searchField
                 if tab == 1 { chips }
                 if tab == 0 { installedList } else { discoverList }
+                aiControlRow
+                // v1.0.35：授权确认门开关——紧跟在 AI 自主权限下面，
+                // 两个开关是同一类东西：都是「AI 能自己干到什么程度」的闸。
+                policyRow
             }
             .padding(.bottom, 28)
         }
@@ -78,6 +84,71 @@ struct PluginStoreView: View {
     }
 
     // MARK: 顶部
+
+    /// v1.0.34：AI 自主管理总开关。
+    /// 默认开着（用户要求全放开），但保留一个能一键掐断的入口——
+    /// 万一哪天它自己装了个不该装的东西，关掉这里它就不会再动插件了。
+    private var aiControlRow: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.purple)
+                .frame(width: 28, height: 28)
+                .background(Circle().fill(Color.purple.opacity(0.13)))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(L10n.t("i18n_1606"))
+                    .font(.system(size: 13, weight: .medium))
+                Text(L10n.t("i18n_1607"))
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Toggle("", isOn: Binding(
+                get: { store.aiControlEnabled },
+                set: { store.aiControlEnabled = $0 }
+            ))
+            .labelsHidden()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(Color(.secondarySystemGroupedBackground))
+        .cornerRadius(12)
+        .padding(.horizontal, 16)
+        .padding(.top, 20)
+    }
+
+    /// v1.0.35：AI 请求授权的总开关。
+    /// 关掉后 AI 调 policy.confirm 会直接报错——不是自动放行，是取消这条通道。
+    private var policyRow: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "checkmark.shield.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.teal)
+                .frame(width: 28, height: 28)
+                .background(Circle().fill(Color.teal.opacity(0.13)))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(L10n.t("i18n_1618"))
+                    .font(.system(size: 13, weight: .medium))
+                Text(L10n.t("i18n_1619"))
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Toggle("", isOn: Binding(
+                get: { gate.enabled },
+                set: { gate.enabled = $0 }
+            ))
+            .labelsHidden()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(Color(.secondarySystemGroupedBackground))
+        .cornerRadius(12)
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+    }
 
     private var subtitleRow: some View {
         HStack {

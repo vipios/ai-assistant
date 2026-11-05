@@ -125,6 +125,11 @@ struct PluginManifest: Codable, Identifiable {
     var stars: Int
     var downloads: Int
     var updatedAt: String
+    /// v1.0.34：风险等级，只用于审计日志与界面标注，不参与拦截（用户已选择全放开）。
+    /// 取值：safe（纯查询）/ shell（执行命令）/ network（联网）/ host（需要宿主钩子）。
+    /// 用可选类型 + 默认 nil：内置那 28 个构造调用不必逐个补参数，
+    /// 老的 plugin.json 没有这个字段也能正常解码。
+    var risk: String? = nil
 
     init(id: String, name: String, version: String, category: PluginCategory,
          icon: String, tint: Int, sizeKB: Int, summary: String,
@@ -182,18 +187,43 @@ final class PluginStore: ObservableObject {
         // 工具只活在内存里，App 重启后必须重新注册。
         // 延后 1.5s：避开启动瞬间的注册表初始化与首屏渲染。
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.restoreInstalled()
+            guard let self = self else { return }
+            self.restoreInstalled()
+            // v1.0.34：把 plugin.search / install / remove / toggle / define / list
+            // 注册进工具表。必须晚于 restoreInstalled —— 否则插件工具名和
+            // 管理器工具名的重名检查会互相干扰。
+            self.registerManagerTools()
         }
     }
 
     // MARK: 查询
 
     func manifest(id: String) -> PluginManifest? {
-        catalog.first { $0.id == id }
+        if let m = catalog.first(where: { $0.id == id }) { return m }
+        // v1.0.34：AI 用 plugin.define 自建的插件不在内置目录里，
+        // 重启后 catalog 会重置成 builtinCatalog，必须从磁盘补回来，
+        // 否则「已安装」列表里会出现一个查不到 manifest 的幽灵 id，
+        // 它的工具也注册不回来。
+        if let m = readManifestFromDisk(id) {
+            catalog.append(m)
+            return m
+        }
+        return nil
+    }
+
+    /// 从 Documents/Plugins/<id>/plugin.json 读回一个 manifest
+    private func readManifestFromDisk(_ id: String) -> PluginManifest? {
+        guard !id.contains("/"), !id.contains(".."), !id.isEmpty else { return nil }
+        let url = pluginsDir.appendingPathComponent(id, isDirectory: true)
+            .appendingPathComponent("plugin.json")
+        guard let d = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(PluginManifest.self, from: d)
     }
 
     var installedManifests: [PluginManifest] {
-        catalog.filter { installedIDs.contains($0.id) }
+        // 走 manifest(id:) 而不是直接 filter catalog：
+        // AI 自建的插件不在内置目录里，得靠 manifest(id:) 从磁盘补回来
+        installedIDs.compactMap { manifest(id: $0) }.sorted { $0.name < $1.name }
     }
 
     func isInstalled(_ id: String) -> Bool { installedIDs.contains(id) }
@@ -231,6 +261,8 @@ final class PluginStore: ObservableObject {
     }
 
     func uninstall(_ m: PluginManifest) {
+        // v1.0.34：卸完就没了，先备份一份到 .trash/，删错了能捞回来
+        backupManifest(m)
         // 1. 摘工具（按前缀整批）
         ToolRegistry.shared.removeTools(prefix: m.toolPrefix)
         // 2. 删技能
@@ -244,6 +276,7 @@ final class PluginStore: ObservableObject {
         installedIDs.remove(m.id)
         disabledIDs.remove(m.id)
         save()
+        audit("uninstall", "\(m.id)（界面操作，已备份 manifest）")
         print("[TA] 📦 plugin uninstalled: \(m.id)")
     }
 
@@ -257,6 +290,322 @@ final class PluginStore: ObservableObject {
             SkillStore.shared.setEnabled(s.name, on)
         }
         save()
+    }
+
+    // MARK: - AI 自主管理（v1.0.34：全放开）
+
+    /// 总开关。关掉后 AI 的 plugin.* 工具一律拒绝执行，用户仍可在界面里手动装/卸。
+    /// 刻意不用 @Published 存值——它要能被 UserDefaults 直接读写，
+    /// 界面侧用 Binding(get:set:) 包一层即可。
+    private let aiControlKey = "trollmcp2.plugins_ai_control"
+
+    var aiControlEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: aiControlKey) as? Bool ?? true }
+        set {
+            UserDefaults.standard.set(newValue, forKey: aiControlKey)
+            objectWillChange.send()
+        }
+    }
+
+    /// 审计日志：AI 每一次装/卸/启停都记一行，写到 Documents/Plugins/.audit.log。
+    /// 用户随时能翻，出了问题能回溯是哪个插件哪一步干的。
+    private func audit(_ action: String, _ detail: String) {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MM-dd HH:mm:ss"
+        let line = "[\(fmt.string(from: Date()))] \(action) \(detail)\n"
+        let url = pluginsDir.appendingPathComponent(".audit.log")
+        try? FileManager.default.createDirectory(at: pluginsDir, withIntermediateDirectories: true)
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile()
+            if let d = line.data(using: .utf8) { h.write(d) }
+            try? h.close()
+        } else {
+            try? line.data(using: .utf8)?.write(to: url)
+        }
+        // 超过 200KB 就只留最后 500 行，避免无限长
+        if let sz = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int, sz > 200_000 {
+            if let txt = try? String(contentsOf: url, encoding: .utf8) {
+                let tail = txt.components(separatedBy: "\n").suffix(500).joined(separator: "\n")
+                try? tail.write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
+        print("[TA] 📦 audit: \(action) \(detail)")
+    }
+
+    /// 卸载前把 manifest 备份一份到 .trash/，误删能捞回来
+    private func backupManifest(_ m: PluginManifest) {
+        let dir = pluginsDir.appendingPathComponent(".trash", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let ts = Int(Date().timeIntervalSince1970)
+        let url = dir.appendingPathComponent("\(m.id)-\(ts).json")
+        if let d = try? JSONEncoder().encode(m) { try? d.write(to: url) }
+    }
+
+    // MARK: 同步版（给 AI 工具用）
+
+    /// 同步安装。界面走 install()（有 0.5s 动画），AI 走这个——调完立刻能用。
+    @discardableResult
+    func installSync(_ m: PluginManifest) -> (ok: Bool, message: String, toolNames: [String]) {
+        if installedIDs.contains(m.id) {
+            return (false, "已经装过了：\(m.name)（\(m.id)）", [])
+        }
+        writeManifestToDisk(m)
+        let registered = registerTools(for: m)
+        registerSkills(for: m)
+        installedIDs.insert(m.id)
+        disabledIDs.remove(m.id)
+        save()
+        audit("install", "\(m.id) v\(m.version) tools=\(registered)/\(m.tools.count) risk=\(m.risk ?? "-")")
+        var msg = "已安装 \(m.name) v\(m.version)，注册了 \(registered) 个工具"
+        if m.tools.count > registered { msg += "（\(m.tools.count - registered) 个失败）" }
+        if m.requiresHook { msg += "。注意：它需要宿主钩子，部分能力要等 App 本体接入才生效" }
+        return (true, msg, m.tools.map { $0.name })
+    }
+
+    @discardableResult
+    func removeSync(id: String) -> (ok: Bool, message: String) {
+        guard let m = manifest(id: id) else {
+            return (false, "目录里没有这个插件：\(id)。先用 plugin.search 查正确 id")
+        }
+        guard installedIDs.contains(id) else {
+            return (false, "\(m.name) 没安装，不用卸")
+        }
+        backupManifest(m)
+        ToolRegistry.shared.removeTools(prefix: m.toolPrefix)
+        for s in m.skills { SkillStore.shared.delete(named: s.name) }
+        try? FileManager.default.removeItem(at: pluginsDir.appendingPathComponent(m.id))
+        installedIDs.remove(m.id)
+        disabledIDs.remove(m.id)
+        save()
+        audit("remove", "\(m.id)（已备份 manifest 到 .trash）")
+        return (true, "已卸载 \(m.name)，\(m.tools.count) 个工具已摘除")
+    }
+
+    @discardableResult
+    func toggleSync(id: String, enabled: Bool) -> (ok: Bool, message: String) {
+        guard let m = manifest(id: id), installedIDs.contains(id) else {
+            return (false, "\(id) 没安装")
+        }
+        setEnabled(m, enabled)
+        audit("toggle", "\(id) -> \(enabled ? "on" : "off")")
+        return (true, "\(m.name) 已\(enabled ? "启用" : "停用")")
+    }
+
+    /// AI 自己定义一个新插件并安装。
+    /// 只要求最小字段（id / name / tools），其余自动补默认值——
+    /// 让模型少写几个字段，少一处写错就少一次失败。
+    @discardableResult
+    func defineAndInstall(specJSON: String) -> (ok: Bool, message: String, toolNames: [String]) {
+        guard let raw = specJSON.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] else {
+            return (false, "spec 不是合法 JSON 对象", [])
+        }
+        let id = ((obj["id"] as? String) ?? "").trimmingCharacters(in: .whitespaces)
+        guard !id.isEmpty else { return (false, "缺 id", []) }
+        // id 要能当目录名用，别让 AI 传 ../ 把文件写到外面去
+        let safe = id.replacingOccurrences(of: "/", with: "-")
+                      .replacingOccurrences(of: "..", with: "-")
+                      .replacingOccurrences(of: " ", with: "-")
+        guard !safe.isEmpty else { return (false, "id 不合法", []) }
+        if catalog.contains(where: { $0.id == safe }) && installedIDs.contains(safe) {
+            return (false, "\(safe) 已经装过了", [])
+        }
+
+        let name = (obj["name"] as? String) ?? safe
+        let summary = (obj["summary"] as? String) ?? "AI 自建插件"
+        let cat = Self.category(from: obj["category"] as? String)
+
+        var tools: [PluginToolSpec] = []
+        for item in (obj["tools"] as? [[String: Any]]) ?? [] {
+            let keyRaw = ((item["key"] as? String) ?? (item["name"] as? String) ?? "")
+                .trimmingCharacters(in: .whitespaces)
+            // key 会拼进工具名（user.plg_<id>_<key>），带 - . 空格 都算非法字符，
+            // AI 很可能写成 my-tool / my.tool，这里统一规整掉。
+            let key = keyRaw
+                .replacingOccurrences(of: "-", with: "_")
+                .replacingOccurrences(of: ".", with: "_")
+                .replacingOccurrences(of: " ", with: "_")
+            let command = (item["command"] as? String) ?? ""
+            guard !key.isEmpty, !command.isEmpty else { continue }
+            let params = (item["params"] as? [String: String]) ?? [:]
+            let timeout = (item["timeout"] as? Double) ?? 60
+            tools.append(Self.T(safe, key,
+                                (item["summary"] as? String) ?? key,
+                                command, params, timeout: timeout))
+        }
+        guard !tools.isEmpty else { return (false, "tools 为空——至少要给一条带 command 的工具", []) }
+
+        var skills: [PluginSkillSpec] = []
+        for item in (obj["skills"] as? [[String: Any]]) ?? [] {
+            let sname = (item["name"] as? String) ?? ""
+            guard !sname.isEmpty else { continue }
+            skills.append(PluginSkillSpec(name: sname,
+                                          summary: (item["summary"] as? String) ?? sname,
+                                          instruction: (item["instruction"] as? String) ?? ""))
+        }
+
+        let m = PluginManifest(
+            id: safe, name: name, pkg: (obj["pkg"] as? String) ?? "@local/\(safe)",
+            version: (obj["version"] as? String) ?? "0.1.0",
+            author: (obj["author"] as? String) ?? "AI",
+            category: cat,
+            icon: (obj["icon"] as? String) ?? "🧩",
+            tint: (obj["tint"] as? Int) ?? 3,
+            sizeKB: 1,
+            summary: summary,
+            deps: (obj["deps"] as? [String]) ?? [],
+            requiresHook: (obj["requiresHook"] as? Bool) ?? false,
+            tools: tools,
+            skills: skills,
+            changelog: ["AI 自建"],
+            stars: 0, downloads: 0,
+            updatedAt: Self.today(),
+            risk: (obj["risk"] as? String) ?? "shell"
+        )
+        // 自建插件也要进目录，否则重启后 manifest(id:) 找不到、工具注册不回来
+        if !catalog.contains(where: { $0.id == safe }) {
+            catalog.append(m)
+        }
+        let r = installSync(m)
+        audit("define", "\(safe) tools=\(tools.count)")
+        return r
+    }
+
+    private static func category(from s: String?) -> PluginCategory {
+        guard let s = s?.trimmingCharacters(in: .whitespaces), !s.isEmpty else { return .tools }
+        for c in PluginCategory.allCases where c.rawValue == s.lowercased() { return c }
+        for c in PluginCategory.allCases where c.displayName == s || c.shortName == s { return c }
+        return .tools
+    }
+
+    private static func today() -> String {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: Date())
+    }
+
+    // MARK: 注册给 AI 的 5 个管理工具
+
+    /// 这些是「装插件的插件」——必须是内置的，否则会有「要装插件才能装插件」的死锁。
+    func registerManagerTools() {
+        let reg = ToolRegistry.shared
+
+        let searchDef = ToolDefinition(
+            name: "plugin.search",
+            summary: "在插件市场里搜索插件。用户说「想要 XX 功能」但当前工具做不到时，先搜这里，看有没有现成的插件。",
+            parameters: ["query": "关键词，可空；空则返回全部",
+                         "category": "分类，可空。tools/session/model/memory/skill/vision/docs/usage/remote/security/browser/git，也可写中文如「工具与能力」"],
+            returns: ["count": "Int", "plugins": "数组，每项含 id/name/summary/category/tools/installed/risk"],
+            verified: false, category: "plugin", uiSummary: "搜索插件市场")
+        reg.registerSystemTool(searchDef) { params in
+            let st = PluginStore.shared
+            let q = ((params["query"] as? String) ?? "").lowercased()
+            let c = (params["category"] as? String) ?? ""
+            let cat: PluginCategory? = c.isEmpty ? nil : PluginStore.category(from: c)
+            var hits = st.catalog
+            if let cat = cat { hits = hits.filter { $0.category == cat } }
+            if !q.isEmpty {
+                hits = hits.filter {
+                    $0.id.lowercased().contains(q) || $0.name.lowercased().contains(q)
+                    || $0.summary.lowercased().contains(q) || $0.pkg.lowercased().contains(q)
+                }
+            }
+            let list: [[String: Any]] = hits.map { m in
+                ["id": m.id, "name": m.name, "summary": m.summary,
+                 "category": m.category.displayName,
+                 "tools": m.tools.count, "skills": m.skills.count,
+                 "installed": st.isInstalled(m.id),
+                 "requires_hook": m.requiresHook,
+                 "risk": m.risk ?? "shell"]
+            }
+            return ["ok": true, "count": list.count,
+                    "plugins": list,
+                    "hint": list.isEmpty ? "没搜到。可以自己用 plugin.define 造一个。" : "用 plugin.install 传 id 安装"]
+        }
+
+        let listDef = ToolDefinition(
+            name: "plugin.list",
+            summary: "列出已安装的插件和它们贡献的工具。想知道自己现在有哪些插件能力时调用。",
+            parameters: [:],
+            returns: ["installed": "数组", "total_tools": "Int"],
+            verified: false, category: "plugin", uiSummary: "列出已装插件")
+        reg.registerSystemTool(listDef) { _ in
+            let st = PluginStore.shared
+            let list: [[String: Any]] = st.installedManifests.map { m in
+                ["id": m.id, "name": m.name, "enabled": st.isEnabled(m.id),
+                 "tools": m.tools.map { $0.name },
+                 "risk": m.risk ?? "shell"]
+            }
+            return ["ok": true, "installed": list, "total_tools": st.installedToolCount]
+        }
+
+        let installDef = ToolDefinition(
+            name: "plugin.install",
+            summary: "安装一个插件，装完它贡献的工具立刻可用。用户让你装插件、或你自己判断需要某个插件时调用。",
+            parameters: ["id": "插件 id（plugin.search 返回的那个 id）"],
+            returns: ["ok": "Bool", "message": "String", "tools": "新注册的工具名数组"],
+            verified: false, category: "plugin", uiSummary: "安装插件")
+        reg.registerSystemTool(installDef) { params in
+            let st = PluginStore.shared
+            guard st.aiControlEnabled else {
+                throw MCPError.failed("用户已关闭 AI 自主装插件。请在设置里打开，或让用户手动安装")
+            }
+            let id = ((params["id"] as? String) ?? "").trimmingCharacters(in: .whitespaces)
+            guard !id.isEmpty else { throw MCPError.invalidParams("缺 id") }
+            guard let m = st.manifest(id: id) else {
+                throw MCPError.failed("目录里没有 \(id)。先用 plugin.search 查，或用 plugin.define 自建")
+            }
+            let r = st.installSync(m)
+            // 每次工具调用返回后都会重新发起一次模型请求，届时工具清单已重建，
+            // 所以刚装的工具在**下一次请求**里就能用。这句 hint 是提醒模型别停手。
+            return ["ok": r.ok, "message": r.message, "tools": r.toolNames,
+                    "hint": r.ok ? "新工具已注册，下一次请求即可调用，直接继续干活不用再问用户" : ""]
+        }
+
+        let removeDef = ToolDefinition(
+            name: "plugin.remove",
+            summary: "卸载一个已安装的插件，它贡献的工具会从你的工具清单里消失。卸载前会自动备份。",
+            parameters: ["id": "插件 id"],
+            returns: ["ok": "Bool", "message": "String"],
+            verified: false, category: "plugin", uiSummary: "卸载插件")
+        reg.registerSystemTool(removeDef) { params in
+            let st = PluginStore.shared
+            guard st.aiControlEnabled else { throw MCPError.failed("用户已关闭 AI 自主管理插件") }
+            let id = ((params["id"] as? String) ?? "").trimmingCharacters(in: .whitespaces)
+            guard !id.isEmpty else { throw MCPError.invalidParams("缺 id") }
+            let r = st.removeSync(id: id)
+            return ["ok": r.ok, "message": r.message]
+        }
+
+        let toggleDef = ToolDefinition(
+            name: "plugin.toggle",
+            summary: "启用或停用一个已安装插件。停用后它的工具不再出现在你的清单里，但不会被卸载。",
+            parameters: ["id": "插件 id", "enabled": "true 或 false"],
+            returns: ["ok": "Bool", "message": "String"],
+            verified: false, category: "plugin", uiSummary: "启停插件")
+        reg.registerSystemTool(toggleDef) { params in
+            let st = PluginStore.shared
+            guard st.aiControlEnabled else { throw MCPError.failed("用户已关闭 AI 自主管理插件") }
+            let id = ((params["id"] as? String) ?? "").trimmingCharacters(in: .whitespaces)
+            guard !id.isEmpty else { throw MCPError.invalidParams("缺 id") }
+            let on: Bool = (params["enabled"] as? Bool) ?? ((params["enabled"] as? String)?.lowercased() == "true")
+            let r = st.toggleSync(id: id, enabled: on)
+            return ["ok": r.ok, "message": r.message]
+        }
+
+        let defineDef = ToolDefinition(
+            name: "plugin.define",
+            summary: "现场造一个新插件并立刻安装。市场里没有的能力，你直接写一个——给几条命令模板就行，参数会自动做 shell 转义。",
+            parameters: ["spec": "JSON 字符串。最小格式：{\"id\":\"my-tool\",\"name\":\"我的工具\",\"summary\":\"干什么\",\"tools\":[{\"key\":\"run\",\"summary\":\"用途\",\"command\":\"命令模板，用 {参数名} 占位\",\"params\":{\"参数名\":\"说明\"}}]}"],
+            returns: ["ok": "Bool", "message": "String", "tools": "新工具名数组"],
+            verified: false, category: "plugin", uiSummary: "自建并安装插件")
+        reg.registerSystemTool(defineDef) { params in
+            let st = PluginStore.shared
+            guard st.aiControlEnabled else { throw MCPError.failed("用户已关闭 AI 自主管理插件") }
+            let spec = ((params["spec"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !spec.isEmpty else { throw MCPError.invalidParams("缺 spec") }
+            let r = st.defineAndInstall(specJSON: spec)
+            return ["ok": r.ok, "message": r.message, "tools": r.toolNames]
+        }
     }
 
     // MARK: 内部

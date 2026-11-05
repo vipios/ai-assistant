@@ -1632,6 +1632,20 @@ enum L10n {
             tbl["i18n_1603"] = ["zh": "否，装完立即生效", "en": "No, effective immediately"]
             tbl["i18n_1604"] = ["zh": "这个插件需要宿主钩子才能完全生效：当前版本只提供技能/说明，自动召回与界面挂载要等 App 本体接入钩子点。装它不会报错，但别期待全自动。", "en": "This plugin needs a host hook to fully work: for now it only provides skills/instructions. Automatic recall and UI mounting require host hooks in a future build."]
             tbl["i18n_1605"] = ["zh": "无", "en": "none"]
+            // v1.0.34：AI 自主管理插件总开关
+            tbl["i18n_1606"] = ["zh": "AI 可自主装插件", "en": "Let AI install plugins"]
+            tbl["i18n_1607"] = ["zh": "开启后 AI 能自己搜索、安装、卸载，甚至现场写一个新插件。每次操作都记进 .audit.log，卸载前自动备份。关掉它就只能你自己手动装。", "en": "When on, AI can search, install, uninstall, and even write a new plugin on the spot. Every action is logged to .audit.log and manifests are backed up before removal. Turn it off to keep installs manual."]
+            tbl["i18n_1608"] = ["zh": "AI 自建", "en": "AI-built"]
+            // v1.0.35：AI 授权确认门
+            tbl["i18n_1609"] = ["zh": "需要你确认", "en": "Confirm to continue"]
+            tbl["i18n_1611"] = ["zh": "允许执行一次", "en": "Allow once"]
+            tbl["i18n_1612"] = ["zh": "拒绝", "en": "Deny"]
+            tbl["i18n_1613"] = ["zh": "AI 自己发起的请求 · 只有你点了才会执行 · 仅本次有效", "en": "Requested by the assistant · nothing runs until you tap · this time only"]
+            tbl["i18n_1615"] = ["zh": "中风险", "en": "Medium"]
+            tbl["i18n_1616"] = ["zh": "低风险", "en": "Low"]
+            tbl["i18n_1617"] = ["zh": "高风险", "en": "High"]
+            tbl["i18n_1618"] = ["zh": "AI 可请求授权", "en": "Let AI ask for permission"]
+            tbl["i18n_1619"] = ["zh": "开启后 AI 遇到需要你点头的操作（删文件、改系统配置、注入），会在界面上弹卡问你一次，而不是直接拒绝你说「这不行」。你点允许它才继续，每次授权只能用一次、五分钟过期；点拒绝它就不再纠缠。记录写在 Documents/Policy/decisions.log。", "en": "When on, the assistant pops a card for actions that need your nod (deleting files, changing system config, injecting) instead of refusing outright. It continues only after you tap Allow; each grant is single-use and expires in five minutes. Deny and it drops the request. Every decision is logged to Documents/Policy/decisions.log."]
         _table = tbl
         return tbl
     }

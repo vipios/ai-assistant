@@ -186,7 +186,26 @@ final class RelayAdminCredential {
 
     /// 是否已保存过密码（只判断存在性，不解密）
     var hasSavedKey: Bool {
-        !(UserDefaults.standard.string(forKey: keyCipher) ?? "").isEmpty
+        // 2026-11-05 **白屏转圈真因**：原来只判断「密文非空」。
+        //
+        // 但这把钥匙是用 IDFV 派生的（见下面 derivedKey），而 TrollStore 覆盖安装 /
+        // 换签名重装之后 identifierForVendor 会变 —— 密文还在，AES-GCM 却解不开。
+        // 旧判断于是返回 true → 跳过输密码的表单直接进 WebView →
+        // accessKey 传进去的是空串 → 注入 localStorage['relayKey'] 的脚本压根不执行 →
+        // 后台前端每次 fetch 都 401 → 页面停在初始加载态：白屏 + 一直转圈。
+        //
+        // 这也解释了为什么「WiFi 和流量都一样」——根本不是网络的问题。
+        // 现在要求「真的能解出明文」才算已保存；解不开就老老实实回表单重输一次。
+        loadAccessKey() != nil
+    }
+
+    /// 密文存在但解不开（换了签名导致 IDFV 变化）→ 清掉，别让它一直冒充「已保存」。
+    func purgeUnreadableKey() {
+        let stored = UserDefaults.standard.string(forKey: keyCipher) ?? ""
+        guard !stored.isEmpty else { return }
+        if Self.decrypt(stored) == nil {
+            UserDefaults.standard.removeObject(forKey: keyCipher)
+        }
     }
 
     /// 保存密码（加密后落盘）
@@ -355,7 +374,12 @@ struct RelayAdminView: View {
         .navigationViewStyle(.stack)
         .onAppear {
             // 已存过密码 → 直接进（免密）；没存过 → 留在解锁表单
-            isUnlocked = RelayAdminCredential.shared.hasSavedKey
+            let cred = RelayAdminCredential.shared
+            // 2026-11-05：先清掉「解不开的旧密文」——覆盖安装后 IDFV 变了，
+            // 密文还在但解不出明文，它会让 hasSavedKey 假装为真，实际注入空 key，
+            // 结果就是白屏 + 一直转圈（用户截图）。清掉之后会正常回到输密码。
+            cred.purgeUnreadableKey()
+            isUnlocked = cred.hasSavedKey
             refreshRoute()
             startNetworkWatch()
         }
@@ -821,6 +845,24 @@ struct RelayAdminWebView: UIViewRepresentable {
         var lastReloadToken = -1
         /// 2026-11-05：上一次加载的地址（换地址也要重载）
         var lastURL: String?
+        /// 2026-11-05：慢加载兜底计时器。
+        /// 连接被黑洞掉（地址不通、本地网络权限被拒）时，WKWebView 会一直等系统超时，
+        /// 可能几十秒都不回调 didFail——用户看到的就是「白屏一直转圈」。
+        /// 20 秒还没起来就主动报一次失败，让外层翻到另一个地址。
+        private var slowHintItem: DispatchWorkItem?
+
+        private func armSlowHint(_ wv: WKWebView) {
+            slowHintItem?.cancel()
+            let item = DispatchWorkItem { [weak self, weak wv] in
+                guard let self = self, let wv = wv else { return }
+                guard wv.isLoading else { return }
+                wv.stopLoading()
+                self.parent.isLoading = false
+                self.parent.onLoadFailed?("20 秒没加载出来（地址不通或本地网络权限被拒）")
+            }
+            slowHintItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: item)
+        }
 
         init(_ parent: RelayAdminWebView) {
             self.parent = parent
@@ -829,9 +871,11 @@ struct RelayAdminWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             parent.isLoading = true
+            armSlowHint(webView)
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            slowHintItem?.cancel()
             parent.isLoading = false
             if let t = webView.title, !t.isEmpty {
                 parent.titleText = t
@@ -845,10 +889,12 @@ struct RelayAdminWebView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            slowHintItem?.cancel()
             parent.isLoading = false
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            slowHintItem?.cancel()
             parent.isLoading = false
             // 2026-11-05：把失败报给外层，由外层决定「翻到另一个地址重试」还是「提示用户」。
             // 用户取消/被中断不算失败，别误报。
