@@ -917,10 +917,14 @@ struct ChatView: View {
         // 落位交给桥接层分步完成（无动画、不与手势打架、不会落到未渲染区）。
         scroll.requestStickToBottom()
         // 兜底：内容多时第一次 scrollTo 可能因锚点尚未创建而落空，下一帧再要一次。
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self, let last = self.store.currentMessages.last else { return }
+        // 注意这里**不能写 [weak self]**：ChatView 是 struct（值类型），
+        // 'weak' 只能用于类/类约束协议 —— 编译期直接报错。
+        // 也不需要：闭包按值捕获这个 struct（含 @ObservedObject 包装器与 ScrollViewProxy），
+        // 一次性执行完即释放，不会形成引用环。
+        DispatchQueue.main.async {
+            guard let last = store.currentMessages.last else { return }
             proxy.scrollTo(last.id, anchor: .bottom)
-            self.scroll.requestStickToBottom()
+            scroll.requestStickToBottom()
         }
     }
 

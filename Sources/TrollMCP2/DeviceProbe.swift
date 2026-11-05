@@ -455,9 +455,9 @@ final class DeviceProbe: ObservableObject {
         guard let fh = FileHandle(forReadingAtPath: path) else { return false }
         defer { try? fh.close() }
         // read(upToCount:) 而非已弃用的 readData(ofLength:)——与项目内其它读取保持一致。
-        // 注意它返回 Data?（文件尾返回 nil），外面套 try? 得到 Data??，所以要双层解包。
-        guard let maybe = try? fh.read(upToCount: 4),
-              let data = maybe, data.count == 4 else { return false }
+        // 它返回 Data?（读不到返回 nil）。SE-0230 起 `try?` 会**扁平化**可选值，
+        // 所以 `try? fh.read(...)` 的类型是 Data? 而不是 Data?? —— 只解一层。
+        guard let data = try? fh.read(upToCount: 4), data.count == 4 else { return false }
         // 逐字节拼 big-endian 值——不能用 withUnsafeBytes + load(as: UInt32.self)：
         // Data 的底层缓冲不保证 4 字节对齐，load 未对齐地址是 UB（真机上可能直接崩）。
         let magic = data.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
