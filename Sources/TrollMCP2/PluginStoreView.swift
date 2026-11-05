@@ -824,3 +824,209 @@ private struct ExternalPluginSheet: View {
         full.components(separatedBy: "_").last ?? full
     }
 }
+
+// 2026-11-05: v1.0.36 构建修复 —— 重写本文件时把 PluginDetailSheet 整段删掉了，
+// 但页面顶部 `.sheet(item: $detail)` 仍在引用它（编译错 cannot find in scope）。
+// 现在原样放回：内置插件详情页（图标/包名/工具列表/技能/信息/更新日志）。
+// 注意它依赖本文件里的 `private struct PluginIcon`，所以必须留在同一个文件。
+struct PluginDetailSheet: View {
+    let manifest: PluginManifest
+    let onInstall: () -> Void
+    let onUninstall: () -> Void
+    let onToggle: (Bool) -> Void
+
+    @ObservedObject private var store = PluginStore.shared
+    @Environment(\.presentationMode) private var presentationMode
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    header
+                    actionButton
+                    if !manifest.tools.isEmpty { toolsSection }
+                    if !manifest.skills.isEmpty { skillsSection }
+                    infoSection
+                    if manifest.requiresHook { hookWarning }
+                    if !manifest.changelog.isEmpty { changelogSection }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 30)
+            }
+            .background(Color(.systemGroupedBackground).ignoresSafeArea())
+            .navigationTitle(L10n.t("i18n_1578"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(L10n.t("i18n_1599")) { presentationMode.wrappedValue.dismiss() }
+                }
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 13) {
+            PluginIcon(emoji: manifest.icon, tint: .blue, size: 56)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(manifest.name).font(.system(size: 17, weight: .semibold))
+                Text(manifest.pkg)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.secondary)
+                Text("\(manifest.author) · v\(manifest.version) · \(manifest.sizeKB) KB")
+                    .font(.system(size: 11.5))
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.bottom, 4)
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        if store.isInstalled(manifest.id) {
+            HStack(spacing: 10) {
+                Toggle(L10n.t("i18n_1600"), isOn: Binding(
+                    get: { store.isEnabled(manifest.id) },
+                    set: { onToggle($0) }))
+                    .font(.system(size: 13))
+                Spacer()
+                Button(role: .destructive) { onUninstall() } label: {
+                    Text(L10n.t("i18n_1577")).font(.system(size: 13, weight: .medium))
+                }
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+        } else {
+            Button {
+                onInstall()
+            } label: {
+                Group {
+                    if store.isInstalling(manifest.id) {
+                        HStack(spacing: 6) {
+                            ProgressView().scaleEffect(0.8)
+                            Text(L10n.t("i18n_1575"))
+                        }
+                    } else {
+                        Text(L10n.t("i18n_1574"))
+                    }
+                }
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 44)
+                .background(RoundedRectangle(cornerRadius: 11).fill(Color.accentColor))
+            }
+            .buttonStyle(.plain)
+            .disabled(store.isInstalling(manifest.id))
+        }
+    }
+
+    private var toolsSection: some View {
+        sectionCard(title: L10n.t("i18n_1579")) {
+            ForEach(manifest.tools.indices, id: \.self) { i in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(manifest.tools[i].name.replacingOccurrences(of: "user.", with: ""))
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(.accentColor)
+                    Text(manifest.tools[i].summary)
+                        .font(.system(size: 12))
+                        .foregroundColor(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(Color(.separator)).frame(height: 0.5)
+                }
+            }
+        }
+    }
+
+    private var skillsSection: some View {
+        sectionCard(title: L10n.t("i18n_1601")) {
+            ForEach(manifest.skills.indices, id: \.self) { i in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(manifest.skills[i].name).font(.system(size: 12.5, weight: .medium))
+                    Text(manifest.skills[i].summary)
+                        .font(.system(size: 11.5))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(Color(.separator)).frame(height: 0.5)
+                }
+            }
+        }
+    }
+
+    private var infoSection: some View {
+        sectionCard(title: L10n.t("i18n_1580")) {
+            infoRow(L10n.t("i18n_1587"), manifest.category.displayName)
+            if !manifest.deps.isEmpty {
+                infoRow(L10n.t("i18n_1581"), manifest.deps.joined(separator: " · "))
+            }
+            infoRow(L10n.t("i18n_1582"), "\(manifest.tools.count)")
+            if !manifest.skills.isEmpty { infoRow(L10n.t("i18n_1601"), "\(manifest.skills.count)") }
+            infoRow(L10n.t("i18n_1602"), L10n.t("i18n_1603"))
+        }
+    }
+
+    private var hookWarning: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 12))
+                .foregroundColor(.orange)
+                .padding(.top, 1)
+            Text(L10n.t("i18n_1604"))
+                .font(.system(size: 11.5))
+                .foregroundColor(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.orange.opacity(0.10)))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.orange.opacity(0.22), lineWidth: 1))
+    }
+
+    private var changelogSection: some View {
+        sectionCard(title: L10n.t("i18n_1584")) {
+            ForEach(manifest.changelog.indices, id: \.self) { i in
+                Text(manifest.changelog[i])
+                    .font(.system(size: 12))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .overlay(alignment: .bottom) {
+                        Rectangle().fill(Color(.separator)).frame(height: 0.5)
+                    }
+            }
+        }
+    }
+
+    private func infoRow(_ k: String, _ v: String) -> some View {
+        HStack(alignment: .top) {
+            Text(k).foregroundColor(.secondary)
+            Spacer()
+            Text(v).multilineTextAlignment(.trailing)
+        }
+        .font(.system(size: 12.5))
+        .padding(.horizontal, 14).padding(.vertical, 9)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color(.separator)).frame(height: 0.5)
+        }
+    }
+
+    private func sectionCard<C: View>(title: String, @ViewBuilder content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 14).padding(.top, 11).padding(.bottom, 5)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+    }
+}
