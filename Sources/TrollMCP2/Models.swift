@@ -1209,6 +1209,10 @@ final class ConversationStore: ObservableObject {
     @Published var conversations: [ChatConversation] = []
     @Published var selectedId: UUID?
     @Published var isLoading = false
+    /// 2026-11-05：本轮结束时是否出过错——底部状态条据此决定收尾播报的语气
+    /// （「✓ 完成」还是「⚠️ 已停止」）。由完成回调写入，新一轮开始时复位。
+    /// 加 @Published 没问题：它只在一轮结束那一瞬翻一次，不是高频值。
+    @Published var lastTurnHadError = false
     /// v2.8.5：当前请求的实时状态文案 (等待响应/降级重试中），展示在输入指示器旁
     @Published var statusText: String?
     /// v2.9.34：请求过程可视化——当前第几轮 (v4.3.71 起无轮次上限)
@@ -1697,7 +1701,7 @@ final class ConversationStore: ObservableObject {
                 NotificationCenter.default.removeObserver(o)
                 self.retryObserver = nil
             }
-            self.statusText = "Network restored, auto-retrying…"
+            self.statusText = L10n.t("status_network_restored")
             self.isLoading = true
             self.runLoop(config: config, tools: tools, disclosed: disclosed, depth: depth, reasoningLevel: reasoningLevel, personaPrompt: personaPrompt)
         }
@@ -1736,7 +1740,7 @@ final class ConversationStore: ObservableObject {
                 guard let self = self else { return }
                 // fix73b-audit：排队期间用户已发新请求/停止 → 放弃本次自动重试，防双 runLoop 竞态
                 if self.isLoading { return }
-                self.statusText = "Foreground restored, auto-retrying…"
+                self.statusText = L10n.t("status_foreground_restored")
                 self.isLoading = true
                 self.runLoop(config: config, tools: tools, disclosed: disclosed, depth: depth, reasoningLevel: reasoningLevel, personaPrompt: personaPrompt)
             }
@@ -1752,7 +1756,7 @@ final class ConversationStore: ObservableObject {
                 NotificationCenter.default.removeObserver(o)
                 self.foregroundRetryObserver = nil
             }
-            self.statusText = "Foreground restored, auto-retrying…"
+            self.statusText = L10n.t("status_foreground_restored")
             self.isLoading = true
             self.runLoop(config: config, tools: tools, disclosed: disclosed, depth: depth, reasoningLevel: reasoningLevel, personaPrompt: personaPrompt)
         }
@@ -1782,7 +1786,7 @@ final class ConversationStore: ObservableObject {
         handoffConvId = requestSessionId ?? activeConvId
         currentClient?.cancel()
         currentClient = nil
-        statusText = "切后台：请求已转后台代传，回前台自动收结果"
+        statusText = L10n.t("status_handoff")
     }
     /// 回前台：收取后台代传结果并展示/继续执行。
     func consumeBackgroundResult() {
@@ -1917,7 +1921,7 @@ final class ConversationStore: ObservableObject {
         DispatchQueue.main.async {
             self.requestRound = depth + 1
             self.requestRounds = 0   // v4.3.71：无轮次上限
-            self.statusText = "Request ready (organizing conversation and available tools)"
+            self.statusText = L10n.t("status_preparing")
             self.liveTrail = []   // v2.9.127：新一轮清空实时轨迹
         }
 
@@ -2095,6 +2099,8 @@ final class ConversationStore: ObservableObject {
                     // 2026-11-03：崩溃现场留痕——用户反馈「回复完直接卡闪退」，
                     // 崩点就在这段收尾渲染里。记下正文长度，崩了能对上。
                     CrashBreadcrumb.shared.mark("收尾 正文:\(text.count)字 流式ID:\(self.streamingMessageId == nil ? "无" : "有")")
+                    // 2026-11-05：本轮干净结束 → 底部状态条播「✓ 完成」
+                    self.lastTurnHadError = false
                     self.isLoading = false
                     self.currentClient = nil
                     self.requestRound = 0
@@ -2340,6 +2346,20 @@ final class ConversationStore: ObservableObject {
                     // v3.5.3：文本工具调用兜底——模型把 shell.exec("...")/shell_exec(...) 写成文本
                     // (而非结构化 tool_call) 时，系统本不执行、任务卡死。这里检测最终文本里的文本式
                     // shell 调用，提取命令并真正执行，继续 agent 循环（提示词兜底不住，代码兜底保证）。
+                    //
+                    // 2026-11-05 **「未执行」卡片的兜底清洗**：
+                    // 走到这里说明 textualCalls 是空的（解析不出可执行的调用），
+                    // 但 containsTextualToolCall(text) 可能仍是 true —— 也就是正文里
+                    // 确实有 XML 残留，但解析器认不出来（标签残缺、名字不规范等）。
+                    // 这段残留在渲染侧会被 ContentBlocks 画成工具卡，卡片上写死「未执行」，
+                    // 而且**永远不会变成「已执行」**——因为执行侧确实没执行它，
+                    // 之后也没有任何事件会重绘它。用户看到的就是「总是这样提示」。
+                    //
+                    // 既然它解析不出可执行调用，那它对用户就只剩噪音。这里直接清掉，
+                    // 至少不留一张骗人的卡片。
+                    if Self.containsTextualToolCall(text) {
+                        self.cleanupResidualToolXml()
+                    }
                     self.runTextualShellIfNeeded(text: text, config: config, tools: tools, disclosed: disclosed, depth: depth, reasoningLevel: reasoningLevel, personaPrompt: personaPrompt)
                     // v3.1.70：整条请求链 (含工具递归）结束——解除活动会话绑定
                     self.activeConvId = nil
@@ -2394,6 +2414,21 @@ final class ConversationStore: ObservableObject {
                        let nc = narrationContent, !nc.isEmpty {
                         visibleText = nc
                     }
+                    // 2026-11-05 **「未执行」卡片反复出现的第三个根因（结构性调用分支完全没清洗）**：
+                    //
+                    // 上文那条文本兜底路径（第 2285 行）确实调了 stripTextualToolCalls，
+                    // 但**只在那条路径上调**。而模型最常见的实际行为是「结构化 tool_calls
+                    // ＋ 正文里还顺手抄一遍 XML」——走的正是本分支，从头到尾一次都没清洗过。
+                    //
+                    // 用户截图就是这个组合：底部「运行了 1 个工具 0.1s」= 结构化调用真的跑了，
+                    // 气泡里两张 `shell.exec` 「未执行」卡 = 同一段输出里被抄进正文的 XML 残片。
+                    // 渲染侧把它画成卡（ContentBlocks 认得），执行侧没解析它（本来也不需要，
+                    // 结构化那条已经执行了），于是卡片永远停在「未执行」。
+                    //
+                    // 这里补上清洗。注意用 `stripTextualToolCallBlocks`（不塞占位文案）——
+                    // 本轮是真的执行了工具，不需要再补一句「已自动执行上面的工具调用」，
+                    // 那句话在这个场景里反而会误导。
+                    visibleText = Self.stripTextualToolCallBlocks(visibleText)
                     // v4.5.x：去掉"解说纠正"硬门槛（对齐大厂事件流方案）——
                     // 旧实现(v3.5.5/v3.5.10)：模型发 tool_calls 但没写正文解说时，不执行工具，
                     // 注入纠正消息重跑一轮，上限 4 次。实测模型(L0 chat/completions)工具轮
@@ -2450,6 +2485,10 @@ final class ConversationStore: ObservableObject {
                     // 无条件清 isLoading，而 consumeBackgroundResult 的 guard isLoading 依赖它
                     // → 后台代传结果被静默丢弃（破坏性读取/长分析结果丢失）。修复：handoff
                     // 在途（有 pending 结果待消费）时保留 isLoading，回前台正常消费。
+                    // 2026-11-05：本轮以错误结束 → 底部状态条播「⚠️ 已停止」。
+                    // 用户主动点停止（-999）也走这条：他知道自己按了停止，
+                    // 显示"已停止"比静默消失更符合直觉。
+                    self.lastTurnHadError = true
                     if !BackgroundLLM.shared.hasPendingHandoff() {
                         self.isLoading = false
                     }
@@ -2481,14 +2520,14 @@ final class ConversationStore: ObservableObject {
                     }
                     // v2.9.87：网络类错误 + 当前确认断网 → 等网络恢复自动重试一次
                     if self.shouldRetryOnNetworkRestore(nsErr) {
-                        self.statusText = "Network unavailable, auto-retrying after recovery…"
+                        self.statusText = L10n.t("status_network_unavailable")
                         self.scheduleRetryAfterNetworkRestore(config: config, tools: tools, disclosed: disclosed, depth: depth, reasoningLevel: reasoningLevel, personaPrompt: personaPrompt)
                         return
                     }
                     // v7.4.0-fix72：后台挂起失败（非真断网）——不弹"网络连接已中断"，
                     // 回前台自动重试（仅一次防死循环；cancelNetworkRetry 一并清理）
                     if self.isBackgroundSuspensionFailure() {
-                        self.statusText = "Background suspension, auto-retrying on foreground…"
+                        self.statusText = L10n.t("status_background_suspended")
                         self.scheduleRetryOnForeground(config: config, tools: tools, disclosed: disclosed, depth: depth, reasoningLevel: reasoningLevel, personaPrompt: personaPrompt)
                         return
                     }
@@ -2592,7 +2631,34 @@ final class ConversationStore: ObservableObject {
         return t
     }
 
-    /// 是否包含文本形态的工具调用（DSML / antml / invoke）
+    /// 2026-11-05 **「未执行」卡片反复出现的第二个根因**：
+    ///
+    /// 渲染侧（`ContentBlocks.matchStartTag` 第 ④ 条）认的是
+    /// `tool.xxx` **或者** `任意小写名.xxx`——所以 `shell.exec` 这种
+    /// **不带 tool. 前缀**的自闭合标签会被画成一张工具卡。
+    ///
+    /// 而执行侧（本文件 `containsTextualToolCall` / `parseTextualToolCalls` /
+    /// `firstSelfClosingRange` / `stripTextualToolCalls`）全部只认
+    /// `tool[.:]…` 或 `call`——`shell.exec` 一条都不命中。
+    ///
+    /// 于是同一段文本在两侧得到完全相反的结论：
+    ///   · 渲染侧：是个调用 → 画卡 → 卡上写死「未执行」
+    ///   · 执行侧：不是调用 → return [] → 真的没执行 → strip 也不清
+    /// 用户截图里那两张叠在一起的 `shell.exec`「未执行」卡就是这么来的：
+    /// 底部同时写着「运行了 1 个工具 0.1s」——真执行的那个是结构化 tool_call，
+    /// 气泡里这两张是同一次输出里被当成正文的 XML 残片。
+    ///
+    /// 根治办法是**只留一份正则**：两侧都从这里取。改一处两边同时生效，
+    /// 不会再出现「补一个漏一个」。
+    ///
+    /// 形态覆盖：`<tool.describe name="app" />`（带 tool. 前缀）、
+    /// `<shell.exec command="ls" />`（工具名自带点号，本 App 的真实工具名就是这个形状）、
+    /// `<call name="app" />`。
+    /// 不误伤 HTML：`<br />`、`<div />` 这类纯单词标签不含点号/冒号，匹配不上。
+    static let selfClosingTagPattern =
+        #"<\s*(tool[.:][A-Za-z0-9_.\-]+|[a-z][a-z0-9_\-]*[.:][A-Za-z0-9_.\-]+|call)\b([^>]*?)/\s*>"#
+
+    /// 是否包含文本形态的工具调用（DSML / antml / invoke / 自闭合短标签）
     static func containsTextualToolCall(_ text: String) -> Bool {
         let t = normalizeDSML(text)
         if t.contains("<|DSML|") || t.contains("<antml:invoke") || t.contains("<invoke") {
@@ -2601,8 +2667,8 @@ final class ConversationStore: ObservableObject {
         // 2026-11-03：自闭合短标签也算（`<tool.describe name="app" />`）。
         // 少这一条的话，stripTextualToolCalls 会直接原样返回，
         // 屏幕上那行 XML 永远清不掉——用户截图里就横在正文中间。
-        return t.range(of: #"<\s*(tool[.:][A-Za-z0-9_.\-]+|call)\b[^>]*?/\s*>"#,
-                       options: .regularExpression) != nil
+        // 2026-11-05：改取共享常量，`shell.exec` 这类不带 tool. 前缀的形态也认了。
+        return t.range(of: Self.selfClosingTagPattern, options: .regularExpression) != nil
     }
 
     /// 2026-11-03 核心修复：把正文里的**文本形态工具调用**解析成真正的 ToolCall 数组。
@@ -2625,7 +2691,7 @@ final class ConversationStore: ObservableObject {
         //
         // 判断条件补上自闭合形态的两种写法。
         let hasSelfClosing = t.range(
-            of: #"<\s*(?:tool[.:]|call\s)[A-Za-z0-9_.\-]*"#,
+            of: Self.selfClosingTagPattern,
             options: .regularExpression) != nil
         guard t.contains("<|DSML|") || t.contains("<antml:invoke")
                 || t.contains("<invoke") || hasSelfClosing else {
@@ -2746,7 +2812,9 @@ final class ConversationStore: ObservableObject {
     /// 返回：完整匹配范围 + 工具名 + 属性串（给 makeSelfClosingCall 抠参数）
     private static func firstSelfClosingRange(_ s: String)
         -> (full: Range<String.Index>, name: String, attrs: String)? {
-        let pat = #"<\s*(tool[.:][A-Za-z0-9_.\-]+|call)\b([^>]*?)/\s*>"#
+        // 2026-11-05：改用共享常量——渲染侧（ContentBlocks）和执行侧必须是同一套
+        // 判定，否则会出现「画成卡、但不执行」的假象（见 selfClosingTagPattern 注释）。
+        let pat = Self.selfClosingTagPattern
         guard let re = try? NSRegularExpression(pattern: pat, options: [.caseInsensitive]) else {
             return nil
         }
@@ -2811,7 +2879,22 @@ final class ConversationStore: ObservableObject {
     /// 刷屏把中文顶走。执行完必须把这段从气泡内容里删干净。
     ///
     /// 不改变正常正文：只有真的匹配到 invoke/DSML token 才动手。
+    ///
+    /// ⚠️ 这个带占位文案的版本只给「文本兜底执行」那条路径用——那里工具是靠解析
+    /// 这段 XML 才跑起来的，削光后补一句说明是必要的。**结构化 tool_calls 分支
+    /// 必须用下面那个不带占位文案的 `stripTextualToolCallBlocks`**，
+    /// 否则会冒出一句「已自动执行上面的工具调用」，而那句话是多余的。
     static func stripTextualToolCalls(_ text: String) -> String {
+        let t = stripTextualToolCallBlocks(text)
+        // 全被削光就留一句提示，别让气泡空白（看起来像 Bug）
+        return t.isEmpty ? "（已自动执行上面的工具调用）" : t
+    }
+
+    /// 纯清洗：只把 XML 残片删掉，**不塞任何占位文案**。
+    ///
+    /// 返回空字符串 = 整段都是 XML、没有任何自然语言。
+    /// 调用方自己决定空的时候要不要补话（结构化调用分支就不补）。
+    static func stripTextualToolCallBlocks(_ text: String) -> String {
         guard containsTextualToolCall(text) else { return text }
         var t = normalizeDSML(text)
 
@@ -2851,7 +2934,8 @@ final class ConversationStore: ObservableObject {
             // 用户截图中 `<|DSML|calls>` 和 `</|DSML|calls>` 之间横着一个
             // `<tool.describe name="app" />`，外壳被剥了、中间那行还留着，
             // 于是正文里孤零零一行 XML —— 这条正则把它一起清掉。
-            #"<\s*(tool[.:][A-Za-z0-9_.\-]+|call)\b[^>]*?/\s*>"#,
+            // 2026-11-05：改取共享常量，`<shell.exec … />` 这种形态一并覆盖。
+            Self.selfClosingTagPattern,
         ]
         for p in strayPats {
             if let re = try? NSRegularExpression(pattern: p, options: [.dotMatchesLineSeparators]) {
@@ -2865,9 +2949,7 @@ final class ConversationStore: ObservableObject {
         while t.contains("\n\n\n") {
             t = t.replacingOccurrences(of: "\n\n\n", with: "\n\n")
         }
-        t = t.trimmingCharacters(in: .whitespacesAndNewlines)
-        // ⑤ 全被削光就留一句提示，别让气泡空白（看起来像 Bug）
-        return t.isEmpty ? "（已自动执行上面的工具调用）" : t
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// v2.9.31：递归处理一批工具调用。工具在后台线程执行 (避免耗时操作阻塞主线程），
@@ -2917,6 +2999,33 @@ final class ConversationStore: ObservableObject {
             }
         }
         return nil
+    }
+
+    /// 2026-11-05 新增：清掉「解析不出调用、却会画成卡片」的 XML 残留。
+    ///
+    /// 场景：模型把工具调用写成正文，但标签残缺/名字不规范，`parseTextualToolCalls`
+    /// 反解出 0 个可执行调用（于是 `!textualCalls.isEmpty` 那条分支进不去）。
+    /// 可渲染侧 `ContentBlocks` 认得这类标签，照样画一张工具卡，
+    /// 卡上写死「未执行」——而且它永远不会变，因为压根没东西去执行它。
+    ///
+    /// 用户的感受就是「总是这样提示」。既然解析不出调用，这段对它就只剩噪音，
+    /// 直接清掉，不留骗人的卡。
+    ///
+    /// 只动当前流式消息里**确实含 XML** 的那条，纯自然语言正文一个字不碰。
+    private func cleanupResidualToolXml() {
+        guard let sid = self.streamingMessageId, let ci = self.activeConvIndex else { return }
+        let cur = self.conversations[ci].messages.first(where: { $0.id == sid })?.content ?? ""
+        guard Self.containsTextualToolCall(cur) else { return }
+        let cleaned = Self.stripTextualToolCallBlocks(cur)
+        // 削光后如果什么都不剩，就别把气泡留成空白（会让人以为渲染坏了）。
+        // 这里补一句中性说明，而不是「已自动执行」——那是假话，工具真没跑。
+        let finalText = cleaned.isEmpty
+            ? "（模型这次没给出可执行的操作，也没有正文内容）"
+            : cleaned
+        _ = self.updateMessage(in: self.conversations[ci].id, msgId: sid) { m in
+            m.content = finalText
+        }
+        CrashBreadcrumb.shared.mark("清掉无法执行的工具 XML 残留 原长:\(cur.count) 新长:\(finalText.count)")
     }
 
     /// v3.5.3：执行文本兜底提取出的 shell 命令，把结果作为 tool 消息上屏并继续 agent 循环，

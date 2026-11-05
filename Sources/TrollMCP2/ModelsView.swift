@@ -383,7 +383,9 @@ struct ModelRow: View {
         link += "&auth=\(enc(config.authMethod))&group=\(enc(config.group))&protocol=\(enc(config.apiProtocol))"
         if config.temperature != 0.2 { link += "&temperature=\(config.temperature)" }
         if config.maxTokens != 16384 { link += "&maxTokens=\(config.maxTokens)" }
-        if config.contextTokens != 16000 { link += "&contextTokens=\(config.contextTokens)" }
+        // 2026-11-05：判定基准从 16000 改成 128000（ModelConfig 的默认值）——
+        // 只有和"未配置"的判定基准一致，导出的链接才和实际生效值一致。
+        if config.contextTokens != 128_000 { link += "&contextTokens=\(config.contextTokens)" }
         return link
     }
 
@@ -549,7 +551,12 @@ struct ModelEditorView: View {
         _isDefault = State(initialValue: config?.isDefault ?? false)
         _temperature = State(initialValue: config?.temperature ?? 0.2)
         _maxTokens = State(initialValue: config?.maxTokens ?? 16384)
-        _contextTokens = State(initialValue: config?.contextTokens ?? 16000)
+        // 2026-11-05：新建模型时**不要**写 16000。
+        // 16000 是历史遗留的"显式上限"，会被 effectiveContextTokens 当成用户设过上限，
+        // 于是新加的模型永远只能用 16K，明明上游给 128K/256K 也用不上。
+        // 用 ModelConfig 的默认值 128000 —— 这个值在 effectiveContextTokens 里
+        // 被当作"未配置"，会自动走模型真实窗口（用户要的"按选中的模型调节"）。
+        _contextTokens = State(initialValue: config?.contextTokens ?? 128_000)
         _group = State(initialValue: config?.group ?? L10n.t("ui_144"))
         _paramAliasesText = State(initialValue: ModelEditorView.aliasesString(config?.paramAliases))
         _fallbackIDs = State(initialValue: config?.fallbackIDs ?? [])

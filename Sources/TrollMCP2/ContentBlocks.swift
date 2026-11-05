@@ -161,13 +161,26 @@ enum ContentBlocks {
             #"^<\|DSML\|\s*invoke\s+name=["']([^"']+)["'][^>]*>"#,
             #"^<antml:invoke\s+name=["']([^"']+)["'][^>]*>"#,
             #"^<invoke\s+name=["']([^"']+)["'][^>]*>"#,
-            // ② 自闭合短标签：<tool.describe name="app" />
-            //    工具名允许点号、下划线、短横、冒号（tool.describe / tool:describe /
-            //    shell_exec / shell-exec 都合法），要求**至少含一个分隔符**才当工具调用，
-            //    避免把 `<div>`、`<p>` 这类纯单词标签误判。
-            #"^<\s*(tool[.:][A-Za-z0-9_.\-]+|[a-z][a-z0-9_\-]*[.:][A-Za-z0-9_.\-]+)\b([^>]*?)/\s*>"#,
-            // ③ <call name="app" /> 这种只有 call 前缀的
+            // ② <call name="app" /> 这种只有 call 前缀的。
+            //    **必须排在共享自闭合正则之前**：共享正则里也含 `call` 这个分支，
+            //    但它的捕获组取的是标签名本身 → 会得到 "call" 这个假工具名，
+            //    而这里的语义是「工具名在 name 属性上」。先到先得，所以放前面。
             #"^<\s*call\s+name=["']([^"']+)["'][^>]*?/?>"#,
+            // ③ 自闭合短标签：<tool.describe name="app" /> / <shell.exec command="ls" />
+            //    工具名允许点号、下划线、短横、冒号（tool.describe / tool:describe /
+            //    shell_exec / shell.exec 都合法），要求**至少含一个分隔符**才当工具调用，
+            //    避免把 `<div>`、`<p>` 这类纯单词标签误判。
+            //
+            // 2026-11-05：改从 `ConversationStore.selfClosingTagPattern` 取。
+            // 原来这里和 Models.swift 里各写一份、内容还不一样——
+            // 渲染侧认 `shell.exec`，执行侧只认 `tool.` 前缀，
+            // 于是这类标签被画成工具卡却永远不会执行，卡上写着「未执行」。
+            // **只留一份正则，两边共享**，从根上断掉这类不一致。
+            //
+            // 注意必须补 `^`：共享常量是给「整段文本里搜」用的（不带锚），
+            // 而这里 s 是从 `<` 开始的尾巴，只认「当前位置就是标签开头」。
+            // 少了锚点会把正文中间某处的标签也当成开头，切出来的段落位置全错。
+            "^" + ConversationStore.selfClosingTagPattern,
         ]
         for (idx, p) in patterns.enumerated() {
             guard let re = try? NSRegularExpression(pattern: p, options: [.caseInsensitive]) else { continue }

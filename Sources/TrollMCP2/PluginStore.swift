@@ -118,7 +118,16 @@ struct PluginManifest: Codable, Identifiable {
     var sizeKB: Int
     var summary: String
     var deps: [String]         // 需要 apk 的包名，仅提示用
-    var requiresHook: Bool     // true = 需要宿主钩子，光装插件不生效
+    /// 2026-11-05 **语义更正**：这个字段历史名叫 requiresHook（"需要宿主钩子"），
+    /// 但它标记的 8 个插件其实是**纯技能型**——装完往 SkillStore 里写一段
+    /// instruction，AI 干活时通过 skills.list / skills.read 按需读取并照着做。
+    /// 那是真能用，只是**不含 shell 工具**（所以"提供工具"显示 0，这是对的）。
+    ///
+    /// 旧注释把它写成"光装插件不生效"，旧文案又说"别期待全自动"，
+    /// 结果用户看到就是"这东西装了没用"——完全误导。
+    /// 字段名为了不动 59 条定义先保留，但判定与文案都按"技能型"来。
+    /// true = 技能型（只有 instruction，无工具）；false = 工具型（有 shell 工具）
+    var requiresHook: Bool
     var tools: [PluginToolSpec]
     var skills: [PluginSkillSpec]
     var changelog: [String]
@@ -259,7 +268,11 @@ final class PluginStore: ObservableObject {
     /// 返回的 manifest id 用的是**能力包 id**（不是外部插件 id），
     /// 这样 PluginStore 原有的「同 id 只装一次」逻辑天然去重。
     func resolvedManifest(for ext: ExternalPlugin) -> PluginManifest? {
-        guard let base = CapabilityPacks.pack(ext.capKey) ?? CapabilityPacks.pack("cap-misc") else {
+        // 2026-11-05：统一走 resolvePack —— 内部先按裸 key 查、再补 cap- 前缀、
+        // 最后兜底 cap-misc。原来这里是 `pack(ext.capKey) ?? pack("cap-misc")`，
+        // 两个参数一个是裸 key 一个是带前缀的 id，同一个函数两种约定，
+        // 就是「4687 条全装不上」的来源。
+        guard let base = CapabilityPacks.resolvePack(forCapKey: ext.capKey) else {
             return nil
         }
         var pack = base
@@ -276,8 +289,8 @@ final class PluginStore: ObservableObject {
 
     /// 某条外部插件当前是否「已经能用」（= 它指向的能力包已装）
     func isExternalReady(_ ext: ExternalPlugin) -> Bool {
-        let key = CapabilityPacks.pack(ext.capKey) != nil ? ext.capKey : "cap-misc"
-        return installedIDs.contains(key)
+        guard let pack = CapabilityPacks.resolvePack(forCapKey: ext.capKey) else { return false }
+        return installedIDs.contains(pack.id)
     }
 
     /// 装一条外部插件。
@@ -287,9 +300,10 @@ final class PluginStore: ObservableObject {
     ///      显示的是「压缩归档」这种能力名，而不是某条外部插件的长名字；
     ///   ② 这条外部插件的 id 记进 externalInstalledIDs —— 下次打开列表能显示「已安装」。
     func installExternal(_ ext: ExternalPlugin) {
-        let key = CapabilityPacks.pack(ext.capKey) != nil ? ext.capKey : "cap-misc"
-        guard let pack = CapabilityPacks.pack(key) else {
-            lastError = "这条没有可用的能力包"
+        // 2026-11-05：resolvePack 内部已含 cap-misc 兜底，这里不可能再拿到 nil
+        // （唯一的 nil 情况是 builtin 表本身为空，那是编译期就坏了的极端事故）。
+        guard let pack = CapabilityPacks.resolvePack(forCapKey: ext.capKey) else {
+            lastError = L10n.t("i18n_1646")
             return
         }
         externalInstalledIDs.insert(ext.id)
@@ -639,7 +653,8 @@ final class PluginStore: ObservableObject {
             if src == "shared" || src == "all" {
                 let ext = ExternalCatalog.search(q, category: cat)
                 list += ext.prefix(40).map { e -> [String: Any] in
-                    let pack = CapabilityPacks.pack(e.capKey)
+                    // 2026-11-05：resolvePack 修裸 key 查不到的问题（详见 CapabilityPacks.pack 注释）
+                    let pack = CapabilityPacks.resolvePack(forCapKey: e.capKey)
                     return ["id": e.id, "name": e.name, "summary": e.summary,
                             "category": e.category.displayName,
                             "tools": pack?.tools.count ?? 0, "skills": 0,
@@ -704,8 +719,9 @@ final class PluginStore: ObservableObject {
                         "hint": r.ok ? "新工具已注册，下一次请求即可调用，直接继续干活不用再问用户" : ""]
             }
             if let ext = ExternalCatalog.all.first(where: { $0.id == id }) {
+                // 2026-11-05：先解析出包再装，装完回报的包名/工具名要和实际装的一致
+                let pack = CapabilityPacks.resolvePack(forCapKey: ext.capKey)
                 st.installExternal(ext)
-                let pack = CapabilityPacks.pack(ext.capKey)
                 let names = pack?.tools.map { $0.name } ?? []
                 return ["ok": true,
                         "message": "已装上能力包「\(pack?.name ?? "通用小工具")」",

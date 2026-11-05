@@ -19,9 +19,41 @@ import Foundation
 
 enum CapabilityPacks {
 
-    /// 按 key 取包；取不到返回 nil（调用方回退到 misc）
+    /// 按 key 取包；取不到返回 nil（调用方回退到 misc）。
+    ///
+    /// 2026-11-05 **修 4687 条全装不上的根因**：
+    ///   `all` 的 key 是 manifest 的 id，形如 `cap-session`；
+    ///   而 ExternalCatalog 里每条插件存的 capKey 是**裸 key**，形如 `session`。
+    ///   原实现直接 `all[key]`，裸 key 一律查不到 → 返回 nil
+    ///   → 点安装落到 `lastError = "这条没有可用的能力包"`，
+    ///     详情页落到 `Text("这条暂时没有可用的能力包")`。
+    ///   实测 18 个 capKey 全部未命中（命中 0 / 未命中 18），
+    ///   也就是说**4687 条一条都装不了**，不是个别条目问题。
+    ///
+    /// 修法：先按原样查（兼容已经写成 cap-xxx 的调用点，比如 `pack("cap-misc")`），
+    /// 查不到再补前缀查一次。两种写法都吃，不用改 4687 条数据。
     static func pack(_ key: String) -> PluginManifest? {
-        all[key]
+        let k = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        if k.isEmpty { return nil }
+        if let m = all[k] { return m }
+        // 裸 key → 补 cap- 前缀
+        if !k.hasPrefix("cap-"), let m = all["cap-" + k] { return m }
+        // 反向：传进来是 cap-xxx 但表里没有，去掉前缀再试一次
+        if k.hasPrefix("cap-") {
+            let bare = String(k.dropFirst(4))
+            if let m = all[bare] { return m }
+        }
+        return nil
+    }
+
+    /// 某条外部插件的 capKey 实际会落到哪个包。
+    ///
+    /// 存在的意义：ExternalCatalog 里有 `mail` 这种**没有对应能力包**的 key
+    /// （17 个能力包里没有 mail）。它们必须显式落到 cap-misc，
+    /// 否则又会退化成「装不上」——虽然 pack() 已经能容错，
+    /// 但真正的兜底要在调用点写死，别指望数据永远干净。
+    static func resolvePack(forCapKey key: String) -> PluginManifest? {
+        pack(key) ?? all["cap-misc"]
     }
 
     /// 全部能力包

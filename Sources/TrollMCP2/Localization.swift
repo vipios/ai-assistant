@@ -1012,6 +1012,11 @@ enum L10n {
             tbl["i18n_1257"] = ["zh": "已参考 %d 篇资料", "en": "Referenced %d sources"]
             tbl["i18n_1258"] = ["zh": "已联网搜索 %d 次", "en": "Web search ×%d"]
             tbl["i18n_1259"] = ["zh": "未执行", "en": "Not executed"]
+            // 2026-11-05：内联胶囊的备用文案。用户反复看到「未执行」以为是状态提示，
+            // 其实是模型把工具调用写成了正文、执行侧没能解析出来。
+            // 现在这类残留会在收尾时被清掉，胶囊只在极少数中间态短暂出现——
+            // 文案改成中性的「未运行」，不再像一句警报。
+            tbl["i18n_1648"] = ["zh": "未运行", "en": "Not run"]
             tbl["i18n_1260"] = ["zh": "运行了 %d 个工具", "en": "Ran %d tools"]
             tbl["i18n_1261"] = ["zh": "控制进度实时推送系统通知（成功✓ / 失败✗），前台可见", "en": "Each control step pushes a system notification (✓/✗), visible even in the foreground app"]
             tbl["i18n_973"] = ["zh": "用户", "en": "User"]
@@ -1552,6 +1557,22 @@ enum L10n {
             tbl["i18n_1196"] = ["zh": "\\n…[输出过长已截断]", "en": "⏎…[output too long, truncated]"]
             tbl["i18n_1197"] = ["zh": "已复制", "en": "Copied"]
             // status texts (runtime status bar; zh kept short)
+            // 2026-11-05：这一整组状态文案必须是**中文**。用户截图里左下角出现过
+            // 一行英文 "Request ready (organizing conversation and available tools)"，
+            // 就写在底部常驻条上——因为原代码直接写死了英文字面量，没走 L10n。
+            // 以后新增状态一律加在这里，不要在调用点写死字符串。
+            tbl["status_preparing"] = ["zh": "正在整理上下文和可用工具…", "en": "Preparing context and tools…"]
+            tbl["status_network_restored"] = ["zh": "网络已恢复，正在自动重试…", "en": "Network restored, auto-retrying…"]
+            tbl["status_foreground_restored"] = ["zh": "已回到前台，正在自动重试…", "en": "Foreground restored, auto-retrying…"]
+            tbl["status_network_unavailable"] = ["zh": "网络不可用，恢复后自动重试…", "en": "Network unavailable, auto-retrying after recovery…"]
+            tbl["status_background_suspended"] = ["zh": "后台被挂起，回前台自动重试…", "en": "Background suspension, auto-retrying on foreground…"]
+            tbl["status_handoff"] = ["zh": "切后台：请求已转后台代传，回前台自动收结果", "en": "Backgrounded: request handed off, result collected when you return"]
+            tbl["status_backup_model"] = ["zh": "⚠️ %@ 不可用，切到备用模型 %@…", "en": "⚠️ %@ failed, switching to backup model %@…"]
+            tbl["status_ctx_overflow"] = ["zh": "⚠️ 上下文超了，已压缩到最近 %d 条并重试…", "en": "⚠️ Context overflow, compacted to last %d messages and retrying…"]
+            // 2026-11-05：底部状态条的两条收尾播报（用户要求「完成了就不提示了，
+            // 没完成就一直提示着我」——进行中常驻，结束后只闪 2 秒）
+            tbl["status_turn_done"] = ["zh": "完成 · 用时 %@", "en": "Done · %@"]
+            tbl["status_turn_stopped"] = ["zh": "已停止 · 用时 %@", "en": "Stopped · %@"]
             tbl["status_requesting_model_rounds"] = ["zh": "请求中（第 %d/%d 轮）", "en": "Requesting model (round %d/%d)"]
             tbl["status_requesting_model_round"] = ["zh": "请求中（第 %d 轮）", "en": "Requesting model (round %d)"]
             tbl["status_waiting_model"] = ["zh": "等待响应…", "en": "Waiting for model response…"]
@@ -1627,7 +1648,7 @@ enum L10n {
             tbl["i18n_1580"] = ["zh": "安装信息", "en": "Install Info"]
             tbl["i18n_1581"] = ["zh": "依赖", "en": "Requires"]
             tbl["i18n_1582"] = ["zh": "提供工具", "en": "Tools"]
-            tbl["i18n_1583"] = ["zh": "需宿主钩子", "en": "Needs hook"]
+            tbl["i18n_1583"] = ["zh": "按需调用", "en": "On demand"]
             tbl["i18n_1584"] = ["zh": "版本记录", "en": "Version history"]
             tbl["i18n_1585"] = ["zh": "全部", "en": "All"]
             tbl["i18n_1587"] = ["zh": "分类", "en": "Category"]
@@ -1658,7 +1679,12 @@ enum L10n {
             tbl["i18n_1601"] = ["zh": "技能", "en": "Skills"]
             tbl["i18n_1602"] = ["zh": "需要重启", "en": "Restart"]
             tbl["i18n_1603"] = ["zh": "否，装完立即生效", "en": "No, effective immediately"]
-            tbl["i18n_1604"] = ["zh": "这个插件需要宿主钩子才能完全生效：当前版本只提供技能/说明，自动召回与界面挂载要等 App 本体接入钩子点。装它不会报错，但别期待全自动。", "en": "This plugin needs a host hook to fully work: for now it only provides skills/instructions. Automatic recall and UI mounting require host hooks in a future build."]
+            // 2026-11-05：原文案说"只提供技能/说明，别期待全自动"，把用户吓住了 ——
+            // 实际上技能是真能用的：App 里有两个工具 skills.list（按关键词搜）和
+            // skills.read（读完整指令），模型需要时会自己调用，拿到的就是这段 instruction。
+            // 这叫"按需加载"（省 token），不是"不生效"。文案改成说清这一点。
+            tbl["i18n_1604"] = ["zh": "这是「技能」型插件：装完会把操作步骤存成一段可复用的指令。AI 干活时会自动查（skills.list）并读取（skills.read）它，照着做——不需要你手动开启。这类插件不含命令行工具，所以「提供工具」是 0，正常。",
+                                "en": "Skill-type plugin: it saves a reusable step-by-step instruction. The AI looks it up (skills.list) and reads it (skills.read) automatically when relevant — no manual activation. It ships no shell tools, so \"Tools: 0\" is expected."]
             tbl["i18n_1605"] = ["zh": "无", "en": "none"]
             // v1.0.34：AI 自主管理插件总开关
             tbl["i18n_1606"] = ["zh": "AI 可自主装插件", "en": "Let AI install plugins"]
@@ -1676,9 +1702,15 @@ enum L10n {
             tbl["i18n_1619"] = ["zh": "开启后 AI 遇到需要你点头的操作（删文件、改系统配置、注入），会在界面上弹卡问你一次，而不是直接拒绝你说「这不行」。你点允许它才继续，每次授权只能用一次、五分钟过期；点拒绝它就不再纠缠。记录写在 Documents/Policy/decisions.log。", "en": "When on, the assistant pops a card for actions that need your nod (deleting files, changing system config, injecting) instead of refusing outright. It continues only after you tap Allow; each grant is single-use and expires in five minutes. Deny and it drops the request. Every decision is logged to Documents/Policy/decisions.log."]
             // v1.0.35：本轮结束语的「过程中出错」清单
             tbl["i18n_1642"] = ["zh": "…另有 %d 处", "en": "…and %d more"]
-            tbl["i18n_1643"] = ["zh": "%d 处没成", "en": "%d failed"]
+            tbl["i18n_1643"] = ["zh": "有 %d 处没成", "en": "%d failed"]
             tbl["i18n_1644"] = ["zh": "正在处理 %d 个步骤", "en": "Working on %d steps"]
             tbl["i18n_1645"] = ["zh": "某一步", "en": "a step"]
+            // 2026-11-05：外部插件装不上时的兜底错误（正常情况走不到，
+            // resolvePack 内部已兜 cap-misc；留着是为了不吞掉这个分支）
+            tbl["i18n_1646"] = ["zh": "这条对应的能力包缺失，重启 App 后重试",
+                                "en": "Its capability pack is missing — restart and retry"]
+            // 2026-11-05：从微信/QQ「共享」进来的文件已落进输入框
+            tbl["i18n_1647"] = ["zh": "已添加 %d 个文件到输入框", "en": "%d file(s) added to the input"]
         _table = tbl
         return tbl
     }

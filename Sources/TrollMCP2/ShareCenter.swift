@@ -1,27 +1,29 @@
 import SwiftUI
 import UIKit
 
-/// v4.3.46：分享中转站——TrollStore 侧载环境"分享面板闪退"的最终方案。
+/// v4.3.46：分享中转站。
 ///
-/// 崩溃铁证（两次真机崩溃栈地址逐字节相同，sig_1790791863 / sig_1790797823）：
-/// ShareSheet → SharingUI → UIKitCore → **MobileIcons(LICreateIconForImages/LICreateIconForImage)
-/// → CoreImage → Segmentation fault: 11**。
+/// 2026-11-05 **重大更正**：这个文件过去一直宣称「侧载环境任何系统分享面板都不可用」，
+/// 于是所有分享入口都被改成自建 UIAlertController（只有"存储到文件/用 TrollStore 安装"）。
+/// 用户实测反馈：那两个按钮远不如系统面板好用 —— 他要的是面板里直接有微信、QQ。
 ///
-/// **最终根因（v4.3.47 确认）**：TrollAgent 的 Info.plist 曾声明 `CFBundleDocumentTypes =
-/// All Files（public.item，支持所有文件类型）`。系统分享面板枚举"支持当前内容类型的所有
-/// App/扩展"时，**把 TrollAgent 自己列入**并让 MobileIcons 为它生成图标 —— 侧载环境下
-/// TrollAgent 的图标注册异常 → MobileIcons/CoreImage SIGSEGV。
-/// 对照：TrollFools 只声明 mach-o/zip/deb 三种类型，分享 ipa/txt 时面板里**没有它自己** → 不崩。
-/// **修复**：删除 All Files 声明（v4.3.47），分享面板不再为 TrollAgent 生成图标。
+/// 现在查明，当年那次崩溃的根因是**图标资源缺失**，不是"分享面板本身不可用"：
+///   · 崩溃栈：ShareSheet → SharingUI → UIKitCore
+///             → MobileIcons(LICreateIconForImages) → CoreImage → SIGSEGV
+///   · 真正的触发条件：包里**没有 Assets.car**，图标只有散装 PNG，
+///     而 Info.plist 声明了 `CFBundleIconName = AppIcon` ——
+///     系统按 name 去 Assets 里查图标查不到，生成扩展图标时崩。
+///   · 当年注释归因到 `CFBundleDocumentTypes = All Files`，但 `git log -S` 查证：
+///     这条声明**从未被提交过**，最早的上游快照 8c9eea0 里就是 0 次 ——
+///     那个"修复"什么都没改，隐患一直留着。
 ///
-/// 兜底：自建分享菜单（拷贝 / 存储到文件 / 用其他 App 打开）绕开 ShareSheet，
-/// 任何情况下都可用。
-/// 根治方案：**自建分享菜单，彻底绕开 ShareSheet**：
-///   1. **拷贝**（UIPasteboard，文字/路径）
-///   2. **存储到文件**（UIDocumentPickerViewController(forExporting:) —— Files 保存界面，
-///      不枚举分享扩展，安全）
-///   3. **用其他 App 打开**（UIDocumentInteractionController.presentOpenInMenu —— 打开方式
-///      菜单，Launch Services 列表，不经过 ShareSheet）
+/// 修复（两处，缺一不可）：
+///   1. `Support/Info.plist` 删掉 `CFBundleIconName`，只留 `CFBundleIconFiles`；
+///   2. 本文件恢复真正的 `UIActivityViewController`。
+///
+/// 保底：**已不设第二套菜单**（2026-11-05 用户选择"只留系统面板"）。
+/// 系统面板能不能用，全靠 Info.plist 删掉 CFBundleIconName 这一处修复 ——
+/// 两套菜单并存会让"到底点了哪个"难以解释，也会让崩溃问题更难定位。
 final class ShareCenter: ObservableObject {
     static let shared = ShareCenter()
 
@@ -30,40 +32,61 @@ final class ShareCenter: ObservableObject {
 
     private init() {}
 
-    // MARK: - 文件分享：自建菜单（UIKit ActionSheet，绕开 ShareSheet）
+    // MARK: - 文件分享：系统共享面板（2026-11-05 恢复）
 
-    /// 文件分享菜单：存储到文件 / 用其他 App 打开 / 取消
+    /// 文件分享菜单 —— 2026-11-05 **用户明确要求改回系统共享面板**。
+    ///
+    /// 用户原话：「直接共享文件，这个按钮，然后我点击共享文件这个按钮里面
+    ///           微信 qq 所有的都在里面，你懂吗」
+    ///
+    /// 之前这里是自建的 UIAlertController（只有"存储到文件"和"用 TrollStore 安装"），
+    /// 原因是历史上有两次真机 SIGSEGV，栈是：
+    ///   ShareSheet → SharingUI → UIKitCore → MobileIcons(LICreateIconForImages)
+    ///   → CoreImage → Segmentation fault: 11
+    ///
+    /// **2026-11-05 查明真正的根因**（不是当年注释里写的 CFBundleDocumentTypes ——
+    /// 那条声明 git 历史里从未提交过，上游快照就是 0 次，所以那个"修复"是空转）：
+    ///   包里**没有 Assets.car**，图标是散装 PNG，而 Info.plist 声明了
+    ///   `CFBundleIconName = AppIcon` —— 系统分享面板枚举扩展、让 MobileIcons
+    ///   按 name 去 Assets 里查图标时查不到，走异常路径崩溃。
+    ///   已在 Support/Info.plist 删掉 CFBundleIconName，只留 CFBundleIconFiles。
+    ///
+    /// 所以这里恢复成真正的 UIActivityViewController：微信/QQ/AirDrop/存储到文件
+    /// 全部由系统列出，用户要的就是这个。
+    ///
+    /// 保底：系统面板万一仍然崩，回退办法是 `git revert` 本文件的分享函数，
+    /// 改回 UIAlertController 版本（历史版本里有）。这里不保留第二套 UI，
+    /// 因为两套菜单并存会让"点了哪个"难以解释。
     func presentShareMenuFile(_ url: URL) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
             guard FileManager.default.fileExists(atPath: url.path) else {
                 self.showNotice(L10n.t("i18n_867"))
                 return
             }
-            let alert = UIAlertController(title: L10n.t("i18n_868", url.lastPathComponent),
-                                          message: nil, preferredStyle: .actionSheet)
-            alert.addAction(UIAlertAction(title: L10n.t("i18n_869"), style: .default) { _ in
-                self.saveToFiles(url)
-            })
-            // v4.5.x：tipa/ipa 加"用 TrollStore 安装"——apple-magnifier:// URL scheme 直调
-            // TrollStore 安装，不渲染 App 图标列表（v4.3.51 移除的 presentOpenInMenu 在
-            // 侧载环境 MobileIcons/CoreImage SIGSEGV，与 ShareSheet 同一崩溃点；此路安全）。
-            // 修复：更新静默安装失败降级到此菜单时只能"存储到文件"，用户无法直达安装。
-            let ext = url.pathExtension.lowercased()
-            if ext == "tipa" || ext == "ipa" {
-                alert.addAction(UIAlertAction(title: L10n.t("i18n_1079"), style: .default) { _ in
-                    self.openInTrollStore(url)
-                })
+            guard let top = Self.topViewController() else { return }
+            // 放行所有活动：微信/QQ/AirDrop/存储到文件/拷贝 都会出现在面板里。
+            // 不传 excludedActivityTypes —— 用户要的就是"所有的都在里面"。
+            let activity = UIActivityViewController(activityItems: [url],
+                                                   applicationActivities: nil)
+            // iPad / 大屏兼容：popover 需要锚点，否则 present 会崩
+            if let pop = activity.popoverPresentationController {
+                pop.sourceView = top.view
+                pop.sourceRect = CGRect(x: top.view.bounds.midX,
+                                        y: top.view.bounds.maxY,
+                                        width: 1, height: 1)
+                pop.permittedArrowDirections = []
             }
-            // v4.3.51：移除"用其他 App 打开"——UIDocumentInteractionController.presentOpenInMenu
-            // 内部渲染"能打开此文件的全部 App 图标列表"，本设备侧载环境 MobileIcons 渲染
-            // 列表图标时 CoreImage SIGSEGV（实测崩溃，与 ShareSheet 同一崩溃点）。
-            alert.addAction(UIAlertAction(title: L10n.t("ui_40"), style: .cancel))
-            Self.anchor(alert)
-            Self.topViewController()?.present(alert, animated: true)
+            top.present(activity, animated: true)
+            AuditLog.shared.log("share.system_sheet_file", detail: url.lastPathComponent)
         }
     }
 
-    /// 文字分享菜单：拷贝 / 存储到文件（写临时 txt）/ 取消
+    /// 保底菜单已删除（2026-11-05 用户选择：只留系统面板）。
+    /// 系统面板崩不崩，靠 Info.plist 那个 CFBundleIconName 的修复来保证。
+
+    /// 文字分享 —— 2026-11-05 同样改成系统共享面板（与文件分享同一原因，见上）。
+    /// 文字分享不会触发 MobileIcons（面板里没有扩展图标要生成），历史上没崩过，
+    /// 但保持一致：用户要的是"微信 QQ 都在里面"。
     func presentShareMenuText(_ text: String) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -71,22 +94,22 @@ final class ShareCenter: ObservableObject {
                 self.showNotice(L10n.t("i18n_1058"))
                 return
             }
-            let alert = UIAlertController(title: L10n.t("i18n_871"), message: nil, preferredStyle: .actionSheet)
-            alert.addAction(UIAlertAction(title: L10n.t("i18n_872"), style: .default) { _ in
-                self.fallbackClipboard(trimmed)
-            })
-            alert.addAction(UIAlertAction(title: L10n.t("i18n_869"), style: .default) { _ in
-                if let url = Self.writeTextToTemp(trimmed) {
-                    self.saveToFiles(url)
-                } else {
-                    self.fallbackClipboard(trimmed)
-                }
-            })
-            alert.addAction(UIAlertAction(title: L10n.t("ui_40"), style: .cancel))
-            Self.anchor(alert)
-            Self.topViewController()?.present(alert, animated: true)
+            guard let top = Self.topViewController() else { return }
+            let activity = UIActivityViewController(activityItems: [trimmed],
+                                                   applicationActivities: nil)
+            if let pop = activity.popoverPresentationController {
+                pop.sourceView = top.view
+                pop.sourceRect = CGRect(x: top.view.bounds.midX,
+                                        y: top.view.bounds.maxY,
+                                        width: 1, height: 1)
+                pop.permittedArrowDirections = []
+            }
+            top.present(activity, animated: true)
+            AuditLog.shared.log("share.system_sheet_text", detail: "len=\(trimmed.count)")
         }
     }
+
+    /// 保底文字菜单已删除（2026-11-05 用户选择：只留系统面板）。
 
     // MARK: - 存储到文件（UIDocumentPicker，安全路径）
 
@@ -107,52 +130,40 @@ final class ShareCenter: ObservableObject {
         }
     }
 
-    // MARK: - 用其他 App 打开（UIDocumentInteractionController，安全路径）
+    // MARK: - 用 TrollStore 安装
 
-    /// v4.3.51：用 TrollStore 安装（不渲染任何 App 图标列表，侧载环境安全）。
-    /// 2026-11-05 修正：**直接把文件 URL 交给系统**。
-    ///   查 TrollStore 源码（TSSceneDelegate.m，1.x 起未变）确认：
-    ///   · apple-magnifier://install?url= 走的是 URLSessionDownloadTask，**只认 http/https**，
-    ///     给 file:// 必报 "unsupported URL" —— 以前这里一直都是这么传的，所以点了没反应；
-    ///   · 本地包唯一有效入口是「文件 URL 本身」（isFileURL 分支：读包 → 弹安装 → 装）。
-    ///   这条路径不渲染图标列表，不会碰到 MobileIcons 崩溃那个坑。
+    /// 用 TrollStore 安装 —— 2026-11-05 **修「点了完全没反应」**。
+    ///
+    /// 原来的实现是 `UIApplication.shared.open(file://...)`。这条路**必然失败**：
+    /// `open()` 对 file URL 走的是 Launch Services 的 **UTI 类型匹配**
+    /// （谁能打开这个类型），而本包 Info.plist 里 `CFBundleDocumentTypes` 是空的
+    /// （`git log -S` 查过，从未声明），于是没有 App 认领 → `ok=false` → 什么都不发生。
+    /// 失败提示又走 `shareCenter.clipboardNotice`，那个绑定只在 RootView 上，
+    /// 用户在更新页点时根本弹不出来 —— 表现就是"点了没反应"。
+    ///
+    /// TrollStore 确实支持本地文件安装，但那是**它自己去读**文件
+    /// （TSSceneDelegate 的 isFileURL 分支），不是由我们 open() 出来的。
+    ///
+    /// 现在：直接弹**系统共享面板**。面板里 TrollStore 会作为能接收 .tipa 的 App
+    /// 出现（UTI 匹配，走分享扩展机制，和失败的 open() 完全不是同一套），
+    /// 点它即可安装。同时也满足用户「里面微信 QQ 所有的都在」的要求。
+    ///
+    /// ⚠️ 曾经的 apple-magnifier://install?url= 也不要再用：它走
+    /// URLSessionDownloadTask，只认 http/https，给 file:// 必报 unsupported URL。
     func openInTrollStore(_ url: URL) {
-        guard url.pathExtension.lowercased() == "tipa" || url.pathExtension.lowercased() == "ipa" else {
+        let ext = url.pathExtension.lowercased()
+        guard ext == "tipa" || ext == "ipa" else {
             self.showNotice(L10n.t("i18n_874"))
             return
         }
-        UIApplication.shared.open(url) { ok in
-            if !ok {
-                UIPasteboard.general.string = url.path
-                self.showNotice(L10n.t("i18n_876"))
-            }
-        }
-        AuditLog.shared.log("share.open_in_trollstore", detail: url.lastPathComponent)
+        presentShareMenuFile(url)
+        AuditLog.shared.log("share.trollstore_via_sheet", detail: url.lastPathComponent)
     }
 
-    /// v4.3.51 弃用：打开方式列表会渲染 App 图标 → 侧载环境 MobileIcons SIGSEGV。
-    /// 保留代码仅供追溯。
-    func openIn(_ url: URL) {
-        // 延迟 0.45s：contextMenu 按钮点击后 dismiss 动画约 0.5s，立即 present 会被吞
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-            guard FileManager.default.fileExists(atPath: url.path) else {
-                self.showNotice(L10n.t("i18n_1009"))
-                return
-            }
-            guard let top = Self.topViewController() else { return }
-            let doc = UIDocumentInteractionController(url: url)
-            objc_setAssociatedObject(top, &Self.docControllerKey, doc, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            doc.delegate = DocInteractionDelegate.shared
-            guard let view = top.view else { return }
-            let rect = view.bounds
-            let ok = doc.presentOpenInMenu(from: rect, in: view, animated: true)
-            if !ok {
-                self.showNotice(L10n.t("i18n_878"))
-            }
-            AuditLog.shared.log("share.open_in", detail: url.lastPathComponent)
-        }
-    }
-    private static var docControllerKey = "ShareCenterDocControllerKey"
+    // 2026-11-05：`openIn(_:)`（UIDocumentInteractionController.presentOpenInMenu）
+    // 连同 docControllerKey / DocInteractionDelegate 一并删除。
+    // 它本来就是"打开方式列表"，同样要渲染 App 图标（与旧分享面板同一崩溃点），
+    // 且当前**没有任何调用方**（grep 确认）。留着只是给以后埋雷。
 
     // MARK: - 文字 → 临时 txt
 
@@ -212,13 +223,5 @@ final class ShareCenter: ObservableObject {
             vc = presented
         }
         return vc
-    }
-}
-
-/// UIDocumentInteractionController 代理（分享菜单点开后需要保留 delegate 存活）
-private final class DocInteractionDelegate: NSObject, UIDocumentInteractionControllerDelegate {
-    static let shared = DocInteractionDelegate()
-    func documentInteractionControllerViewControllerForPreview(_ controller: UIDocumentInteractionController) -> UIViewController {
-        ShareCenter.topViewController() ?? UIViewController()
     }
 }

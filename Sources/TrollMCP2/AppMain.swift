@@ -74,6 +74,21 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         }
         CrashBreadcrumb.shared.mark("—— App 启动 v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") ——")
 
+        // 2026-11-05：**冷启动**时从别的 App 分享进来的文件。
+        //
+        // App 没在运行时，系统不走 `application(_:open:options:)`，而是把文件塞进
+        // launchOptions[.url]（单个）。不在这里接住的话，用户从微信「用其他应用打开」
+        // 会看到 App 被拉起来、但输入框里空空的 —— 文件在系统那一侧被丢掉了。
+        //
+        // 热启动（App 已在后台）走的是 open url 那条，两条路径都要接，缺一个就会
+        // "有时能用有时不能用"。
+        if let launchURL = launchOptions?[.url] as? URL, launchURL.isFileURL {
+            Self.handleIncomingFileURLs([launchURL])
+        }
+
+        // 顺手清理 7 天前分享进来但没发送的文件（不再需要了）
+        IncomingFiles.shared.cleanupOld()
+
         // v2.9.368：全局 UITextView 零内边距——TextEditor 默认有 8pt 上下内边距，
         // 导致输入框高度过大；全局清零后 TextEditor 高度紧贴文字。
         UITextView.appearance().textContainerInset = .zero
@@ -355,7 +370,36 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         BackgroundLLM.shared.onAllTasksFinished = completionHandler
     }
 
-    func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {        guard url.scheme?.lowercased() == "trollagent" else { return false }
+    /// 2026-11-05：把外部 App 分享进来的文件转交输入框。
+    ///
+    /// 只做一件事：交给 `IncomingFiles` 复制进沙盒并发通知。
+    /// 真正的"塞进输入框"在 ChatView 里（它才是 @State 的持有者）。
+    static func handleIncomingFileURLs(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        fputs("[appmain] incoming files: \(urls.map { $0.lastPathComponent })\n", stderr)
+        IncomingFiles.shared.receive(urls)
+    }
+
+    func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+        // 2026-11-05：从微信/QQ/文件 App「共享」或「用其他应用打开」进来的**文件**。
+        //
+        // 用户原话：「我在 QQ 或者微信下载的文件，我要共享到这个 ipa 的聊天输入框上
+        //           进行直接发送给 AI，分享的时候为什么看不到咱们的 IPa 呢」
+        //
+        // 一、为什么列表里看不到我们：Info.plist 从来没有 CFBundleDocumentTypes，
+        //     系统分享面板按 UTI 声明筛收件人，没声明就等于"什么都不收"。
+        //     → 已在 Support/Info.plist 补上。
+        // 二、为什么点了也没反应：就是这个方法原来的第一行
+        //     `guard url.scheme == "trollagent"`，file:// 直接 false 被丢掉。
+        //     → 现在先分流处理 file URL。
+        //
+        // 注意 `LSSupportsOpeningDocumentsInPlace` + `UIFileSharingEnabled`
+        // 会让"在文件中打开"直接把文件放进 Documents/Inbox 并调这里。
+        if url.isFileURL {
+            Self.handleIncomingFileURLs([url])
+            return true
+        }
+        guard url.scheme?.lowercased() == "trollagent" else { return false }
         guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let items = comps.queryItems else { return false }
 
@@ -398,7 +442,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
             let group = value("group") ?? "default"
             let temp = value("temperature").flatMap(Double.init) ?? 0.7
             let maxTokens = value("maxTokens").flatMap(Int.init) ?? 2048
-            let context = value("contextTokens").flatMap(Int.init) ?? 16000
+            // 2026-11-05：未指定时用 128000（= ModelConfig 默认值 = "未配置"），
+            // 让导入的模型自动走真实窗口。原来写 16000 会把导入的模型锁死在 16K。
+            let context = value("contextTokens").flatMap(Int.init) ?? 128_000
             let protocolName = value("protocol") ?? "OpenAI Chat Completions"
 
             let config = ModelConfig(

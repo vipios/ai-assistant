@@ -10,19 +10,94 @@
 	<string>zh_CN</string>
 	<key>CFBundleDisplayName</key>
 	<string>ai全能助手</string>
+	<!-- 2026-11-05：**声明本 App 能接收哪些类型的文件**。
+	     用户原话：「我在 QQ 或者微信下载的文件，我要共享到这个 ipa 的聊天输入框上
+	                进行直接发送给 AI，分享的时候为什么看不到咱们的 IPa 呢」
+
+	     原因就是这一段从来没写过（git log -S "CFBundleDocumentTypes" 查证：0 次提交）。
+	     微信/QQ 的「用其他应用打开」、系统分享面板里的 App 图标列表，
+	     都是系统按各 App 声明的 UTI 筛选出来的收件人。没声明 = 我什么都不收
+	     = 列表里永远看不到我们，跟权限、签名、TrollStore 都无关。
+
+	     这里刻意用**最宽的范围**：Public.Data + Content（再加下面几层）。
+	     理由：用户分享的是"从聊天里下载的文件"，什么格式都有（zip/ipa/txt/pdf/dylib…），
+	     逐个枚举既写不全也会漏。而本 App 本来就是文件管理/分析类工具，
+	     收下任意文件是合理行为。真实读取时会再按扩展名分类。
+	     副作用提醒：public.item 是根类型，public.folder 也属于它，
+	     所以声明 public.item 后**文件夹也会被投递进来**。这不是靠 UTI 能排除的
+	     （LSItemContentTypes 没有"排除"语法），只能在收件时判断并丢弃：
+	     IncomingFiles.importIntoSanbox 第一件事就是 isDir 检查、是目录直接 return nil。 -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>任意文件</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<!-- LSHandlerRank：Alternate = 我们不抢默认打开方式，
+			     只在"分享/用其他应用打开"里出现。写 Owner 会抢掉别人 -->
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.data</string>
+				<string>public.content</string>
+				<!-- public.item 是根类型，某些分享面板（微信/QQ 的"用其他应用打开"）
+				     按 item 这一层查询收件人。缺了它会出现"文件 App 里能看到我们、
+				     微信里看不到"的不一致。代价是文件夹也会被投递进来，
+				     已在 IncomingFiles 里按目录判断丢弃。 -->
+				<string>public.item</string>
+				<!-- 常见文档/压缩/图片类型显式列出：部分系统版本对"太泛的声明"在
+				     UIDocumentInteractionController 的 open-in 列表里仍会过滤掉，
+				     显式列出可以稳定出现在微信/QQ 的打开方式里。 -->
+				<string>public.archive</string>
+				<string>public.image</string>
+				<string>public.movie</string>
+				<string>public.audio</string>
+				<string>public.text</string>
+				<string>com.adobe.pdf</string>
+				<string>com.pkware.zip-archive</string>
+				<string>public.executable</string>
+			</array>
+		</dict>
+	</array>
+	<!-- 允许"就地打开"外部文档：系统会把文件放进 Documents/Inbox 再调 application(_:open:)，
+	     不经中间拷贝，大文件（ipa/iSH 镜像）也不会先复制一遍。 -->
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<!-- 2026-11-05：**故意不开 UIFileSharingEnabled**。
+	     它会把整个 Documents 目录暴露到「文件」App 的"我的 iPhone"里，
+	     而本 App 的 Documents 下放着会话记录、审计日志、技能包、incoming 暂存等内部数据。
+	     用户想要的是"能分享进来"，那只需上面的 CFBundleDocumentTypes，
+	     跟把整个沙盒摊开给文件 App 浏览是两件事。
+	     如果将来要做"导出文件到文件 App"，用 UIActivityViewController 定向导出即可，
+	     不要为了一个功能把整个目录开出去。 -->
 	<key>CFBundleExecutable</key>
 	<string>TrollAgent</string>
 	<key>CFBundleIcons</key>
 	<dict>
 		<key>CFBundlePrimaryIcon</key>
 		<dict>
+			<!-- 2026-11-05 **系统共享面板崩溃的真正修复**（不是当年注释里说的那个原因）。
+			     实测：本 App 包里**没有 Assets.car**，图标只有散装 PNG
+			     （AppIcon60x60@2x/@3x、AppIcon1024x1024、AppIcon）。
+			     原来的 CFBundleIconName=AppIcon 要求系统去 Assets.car 里按名字查图标，
+			     查不到就走异常路径 —— 系统分享面板枚举分享扩展、让 MobileIcons
+			     生成扩展图标时正好触发这条路径：
+			       ShareSheet → SharingUI → UIKitCore
+			       → MobileIcons(LICreateIconForImages) → CoreImage → SIGSEGV
+			     这就是历史上两次真机崩溃（sig_1790791863 / sig_1790797823）的来源。
+			     当年注释里写的根因是「CFBundleDocumentTypes=All Files」，但
+			     git log -S 查证：那条声明从未被提交过、上游快照就是 0 次，
+			     所以那个"修复"是无效的，崩溃隐患一直在。
+
+			     正确做法：**删掉 CFBundleIconName，只保留 CFBundleIconFiles**。
+			     这样系统只按文件名找 PNG，不去 Assets 里查，不经过 LICreateIconForImages。 -->
 			<key>CFBundleIconFiles</key>
 			<array>
 				<string>AppIcon60x60</string>
 				<string>AppIcon1024x1024</string>
 			</array>
-			<key>CFBundleIconName</key>
-			<string>AppIcon</string>
 		</dict>
 	</dict>
 	<key>CFBundleIdentifier</key>

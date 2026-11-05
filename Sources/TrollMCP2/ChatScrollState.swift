@@ -165,6 +165,23 @@ final class ChatScrollState: ObservableObject {
         return offset > -50
     }
 
+    /// 2026-11-05：是否仍处于「跟随底部」状态。
+    ///
+    /// 用途：`ChatView.attemptScrollToBottom` 的阶梯重试要在用户自己上滑之后**立刻停手**。
+    /// 权威状态在桥接层（`ScrollGeometryBridge.BridgeView.stickToBottom`，由
+    /// UIScrollView.isTracking / isDragging / isDecelerating 驱动），SwiftUI 这侧拿不到，
+    /// 所以桥接层每次翻转时发通知，这里只留一个镜像。
+    ///
+    /// ⚠️ 刻意**不是 @Published**：它只在重试闭包里被读（不走 SwiftUI 依赖跟踪），
+    /// 写成 @Published 会让每次上下滑动都触发 ChatView.body 全量重算 ——
+    /// 那正是 fix-freeze 系列花了好几轮才修掉的卡死根源。这里只是普通属性。
+    private(set) var isSticking: Bool = true
+
+    /// 桥接层状态翻转时回调（由 ChatView 的 onAppear 装一次）。
+    func setSticking(_ v: Bool) {
+        isSticking = v
+    }
+
     /// 2026-11-05：请求桥接层「重新吸附到底部」。
     ///
     /// 用在两个地方：用户自己发消息（必须看到自己的话）、切换会话（必须停在最新处）。
@@ -186,6 +203,18 @@ final class ChatScrollState: ObservableObject {
     func releaseStick() {
         NotificationCenter.default.post(name: Notification.Name("TrollAgent.scroll.releaseStick"),
                                         object: nil)
+    }
+
+    /// 2026-11-05：切换会话时重置桥接层状态。
+    ///
+    /// 切会话时 SwiftUI 复用同一个 BridgeView，`didInitialPin` / `lastOffsetY`
+    /// 还是上一会话的值 → 新会话不会重新贴底，视口停在上一会话的位置，
+    /// 相对新内容就是空白/顶部。这里发一次复位通知，紧接着的 requestStickToBottom
+    /// 才能在新会话上正常生效。
+    func resetForNewConversation() {
+        NotificationCenter.default.post(
+            name: Notification.Name("TrollAgent.scroll.resetForNewConversation"),
+            object: nil)
     }
 }
 

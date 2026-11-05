@@ -723,17 +723,28 @@ final class UpdateManager: ObservableObject {
         }
     }
 
-    /// 把下载好的包放到 Documents 下，交给分享菜单去处理（tmp 目录不可靠）。
-    /// 后缀统一成 .ipa：TrollStore 的文件分支只认 ipa / tipa，而 .ipa 是系统已知类型，
-    /// 交给系统时被正确识别的概率最高。
+    /// 把下载好的包放到 Documents 下，交给系统共享面板去处理（tmp 目录不可靠）。
+    ///
+    /// 2026-11-05 **后缀从 .ipa 改成 .tipa**：
+    ///   用户现在的流程是「点共享 → 面板里选微信/QQ/存储到文件」，
+    ///   面板是按 UTI 去匹配接收者的。`.tipa` 是 TrollStore 注册的类型，
+    ///   TrollStore 会作为接收者出现在面板里（用户要的"用白巨魔安装"就是这条路）；
+    ///   `.ipa` 虽然系统认识，但侧载环境下没有 App 认领它，
+    ///   面板里反而可能一个接收者都没有。
+    ///   两种后缀 TrollStore 都接受（它的文件分支认 ipa / tipa），所以取更精准的那个。
     private static func stageIPAForInstall(_ url: URL) -> URL {
         guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
             return url
         }
-        let dest = docs.appendingPathComponent("TrollAgent-update.ipa")
+        let dest = docs.appendingPathComponent("TrollAgent-update.tipa")
         do {
             if FileManager.default.fileExists(atPath: dest.path) {
                 try FileManager.default.removeItem(at: dest)
+            }
+            // 顺手清掉旧版本遗留的 .ipa（后缀改名前留下的），免得 Documents 里两份包
+            let legacy = docs.appendingPathComponent("TrollAgent-update.ipa")
+            if FileManager.default.fileExists(atPath: legacy.path) {
+                try? FileManager.default.removeItem(at: legacy)
             }
             try FileManager.default.copyItem(at: url, to: dest)
             return dest

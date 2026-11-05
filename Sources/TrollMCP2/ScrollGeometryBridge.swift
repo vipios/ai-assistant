@@ -54,6 +54,20 @@ struct ScrollGeometryBridge: UIViewRepresentable {
     static let stickToBottomNote = Notification.Name("TrollAgent.scroll.stickToBottom")
     /// 2026-11-05：外部请求「解除吸附」的通知名（点 ↑ 回顶部时用）。
     static let releaseStickNote = Notification.Name("TrollAgent.scroll.releaseStick")
+    /// 2026-11-05：外部请求「换会话，重新初始化」的通知名。
+    ///
+    /// 切会话时 SwiftUI 会复用同一个 BridgeView（视图身份没变），于是
+    /// `didInitialPin` 还是上一会话留下的 true → 不再补贴底；
+    /// `lastOffsetY` 也还是上一会话的位置 → 第一次 offset 上报可能被误判成
+    /// 「掉回顶部」而强行贴底或反之。两者叠加就是「切回来一片空白 / 位置乱」。
+    /// 这里让 BridgeView 把这两项复位，由紧跟着的 stickToBottom 重新貼一次。
+    static let resetForNewConversationNote = Notification.Name("TrollAgent.scroll.resetForNewConversation")
+    /// 2026-11-05：「跟随底部」状态翻转。
+    ///
+    /// `userInfo["sticking"]` 是布尔值（NSNumber）。由 `stickToBottom` 的 didSet 发出，
+    /// 只在**真的翻转**时发一次（不是每次赋值）。SwiftUI 侧镜像到
+    /// `ChatScrollState.isSticking`，供阶梯重试判断「用户是不是已经自己上滑了」。
+    static let stickStateChangedNote = Notification.Name("TrollAgent.scroll.stickStateChanged")
 
     /// 滚动偏移（对齐原 marker 语义：顶部=0，向下滚为负）
     var onOffset: (CGFloat) -> Void
@@ -104,7 +118,24 @@ struct ScrollGeometryBridge: UIViewRepresentable {
 
         /// 是否处于「跟随底部」状态。只有 true 时才在内容变高时把 offset 钉到底。
         /// 初值 true —— 打开会话默认就要停在最新消息处。
-        private var stickToBottom = true
+        ///
+        /// 2026-11-05：加了 **didSet 转发**。本文件里有 9 处给这个属性赋值，
+        /// 每处都手写一遍通知必然漏；用属性观察器一处覆盖，且只在**真的翻转**时发。
+        ///
+        /// 为什么要往 SwiftUI 那侧同步：`ChatView.attemptScrollToBottom` 的阶梯重试
+        /// 最长往后延 320ms，用户完全可能在这期间上滑看历史 —— 那时必须立刻停手，
+        /// 否则延时到点就把他硬拽回底部（「滑上去又弹回去」）。
+        /// 权威判据在 UIKit 这侧（isTracking/isDragging/isDecelerating），SwiftUI 拿不到，
+        /// 所以翻转时通知出去，`ChatScrollState.isSticking` 只做镜像。
+        private var stickToBottom = true {
+            didSet {
+                guard stickToBottom != oldValue else { return }
+                NotificationCenter.default.post(
+                    name: ScrollGeometryBridge.stickStateChangedNote,
+                    object: nil,
+                    userInfo: ["sticking": stickToBottom])
+            }
+        }
         /// 贴底判定的容差：距底部 24pt 内都算「在底部」。
         private let stickTolerance: CGFloat = 24
         /// 防 pinToBottom 重入（async 排程期间又来一次 contentSize 变更）
@@ -149,6 +180,24 @@ struct ScrollGeometryBridge: UIViewRepresentable {
 
         /// 是否已在 attach 后补过首次贴底（避免每帧 layoutSubviews 都重来）
         private var didInitialPin = false
+
+        /// `pinning` 置位的时刻，用于超时兜底（见 pinToBottom 的说明）。
+        private var pinningSince: CFAbsoluteTime = 0
+
+        /// 防重入标志是否卡死。
+        ///
+        /// 2026-11-05：`pinning` 原本只在分步流程正常走完时复位。而分步是递归
+        /// asyncAfter 串起来的，中间任何一个 guard 提前 return（视图被移出窗口、
+        /// 用户开始拖动、contentSize 突变）都可能让它停在 true —— 之后
+        /// `pinToBottom` 的闸门 `!pinning` 会**永久**拦住贴底，
+        /// 表现就是内容不停追加、视口却一直停在某处空白，只能手动滑。
+        ///
+        /// 修法：给标志加时间戳，超过 1.5 秒（正常分步最多 3 帧 ≈ 50ms）就强制复位。
+        /// 只是兜底，正常路径完全不受影响。
+        private func pinningStuck() -> Bool {
+            guard pinning else { return false }
+            return CFAbsoluteTimeGetCurrent() - pinningSince > 1.5
+        }
 
         /// 从自身沿 superview 链向上找最近的 UIScrollView（SwiftUI ScrollView 底层即 UIScrollView）
         private func findScrollView() -> UIScrollView? {
@@ -306,6 +355,8 @@ struct ScrollGeometryBridge: UIViewRepresentable {
         /// 这些是低频动作，所以走通知没有性能顾虑；高频的流式追加完全靠自动吸附，不发通知。
         private var stickObserver: NSObjectProtocol?
         private var releaseObserver: NSObjectProtocol?
+        /// 2026-11-05：切会话复位观察者
+        private var resetObserver: NSObjectProtocol?
 
         private func observeStickRequest() {
             guard stickObserver == nil else { return }
@@ -315,6 +366,27 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                 queue: .main
             ) { [weak self] _ in
                 guard let self = self, let sv = self.scrollView else { return }
+                // 2026-11-05 send-blank：**用户手上正在拖/惯性滚时，这条请求直接作废。**
+                //
+                // 背景：ChatView 的阶梯重试会在 0/50/150/320ms 各发一次这个通知。
+                // 若用户在这期间上滑看历史，原来这里会**无条件**把 stickToBottom 置 true
+                // —— 等于程序把「用户明确要走开」的意图覆盖掉，紧接着 pinToBottom
+                // 一路把他拽回底部。用户看到的就是「滑上去又弹回来」。
+                //
+                // 注意与下面 pinToBottom 内层 guard 的区别：那个 guard 只在**本次**挡掉，
+                // stickToBottom 已经被改成 true 了，下一帧 contentSize 一变照样拽回来。
+                // 所以必须在**改状态之前**拦住。
+                guard !self.userIsScrolling(sv) else {
+                    // 丢掉这条请求时要把真实状态回推给 SwiftUI 侧：
+                    // ChatView.scrollToBottom 在发通知前已经乐观地把 isSticking 置了 true，
+                    // 若这里只 return 不回推，两边就永久不一致 —— 后续几次阶梯重试
+                    // 会以为「还在吸附」继续拉，等于防线失效。
+                    NotificationCenter.default.post(
+                        name: ScrollGeometryBridge.stickStateChangedNote,
+                        object: nil,
+                        userInfo: ["sticking": false])
+                    return
+                }
                 self.stickToBottom = true
                 // 立刻钉一次，不用等 contentSize 下一次变化。
                 // 2026-11-05 fix-blank：改走 pinToBottom（分步靠近）—— 这里原来是
@@ -334,6 +406,21 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             ) { [weak self] _ in
                 self?.stickToBottom = false
             }
+            // 2026-11-05：切会话 → 复位「已补过贴底」和「上次位置」，
+            // 让新会话能重新走一次完整贴底（否则短暂停在空白/顶部）。
+            resetObserver = NotificationCenter.default.addObserver(
+                forName: ScrollGeometryBridge.resetForNewConversationNote,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self = self else { return }
+                self.didInitialPin = false
+                self.lastOffsetY = 0
+                // 上一会话可能整在分步贴底，标志一并清掉，别拖累新会话。
+                self.pinning = false
+                self.overshootFixScheduled = false
+                self.stickToBottom = true
+            }
         }
 
         /// 内容可滚动的最大 offset（= 停在最底部时 contentOffset.y 的值）。
@@ -349,39 +436,65 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             return sv.contentOffset.y >= m - stickTolerance
         }
 
-        /// 是否**滚过了真实内容底部**（视口落在内容之外的空白区）。
-        ///
-        /// 2026-11-05 fix-blank-2：这是「发完消息整屏空白」的判据。
-        /// 越界只可能来自代码（用户手指拖不过底部，松手会回弹），所以一旦判定越界，
-        /// 就直接夹回底部 —— 不用管是谁设的（SwiftUI scrollTo 的估算落位、
-        /// LazyVStack 内容变矮、键盘收起后视口变高导致 m 变小，全都覆盖）。
-        private func isOverscrolled(_ sv: UIScrollView) -> Bool {
-            let m = maxOffset(sv)
-            guard m > 0 else { return false }
-            return sv.contentOffset.y > m + 1
+        /// 视口落在内容区域的哪一侧之外（nil = 落在内容里，正常）
+        private enum OvershootSide {
+            /// 视口在内容**上方**（整屏落在内容之前）
+            case above
+            /// 视口在内容**下方**（整屏落在内容之后）
+            case below
         }
 
-        /// 是否**该做**越界修正（v1.0.35：修「上滑看历史，松手抖两下 + 被拽回底部」）。
+        /// 吸附态下的越界容差。真实越界（发完消息那种）至少几百上千 pt，
+        /// 48pt 足够把 LazyVStack 的估算抖动区分开。
+        private let overshootToleranceSticking: CGFloat = 48
+
+        /// 判定是否**整屏**落在内容之外。
         ///
-        /// 上一版直接用 `isOverscrolled`（容差 1pt）就修，踩了两个坑：
+        /// 2026-11-05 **修「有的时候空白」的真正根因**，别再改回 `guard stickToBottom`。
         ///
-        /// ① LazyVStack 的 contentSize 是**估算值**。滚动中陆续建 cell，估算高度频繁
-        ///    被替换成真实高度，contentOffset 于是会短暂越过当时的估算底部几十 pt。
-        ///    1pt 的容差等于把这当成「越界」，立刻夹回底部并分步贴底 ——
-        ///    用户看到的就是「松开手抖两下，历史全被顶没」。
-        ///    真实越界（发完消息那种）至少是几百上千 pt，48pt 足够区分。
+        /// 上一版这里第一行是 `guard stickToBottom else { return false }`，于是：
+        ///   用户上滑看了几屏历史（stickToBottom 被置 false）
+        ///   → 新一轮请求开始 / 结束语消失 / 工具卡折叠重排 → contentSize 变矮
+        ///   → offset 落在内容之外（= 整屏空白）
+        ///   → 但「用户在看历史」这个状态让修正直接 return
+        ///   → **空白永久留着**，只有手指下滑才回到内容里。
+        /// 这正是用户截图里「有的时候就空白」的来源：只要之前上滑过历史就会中。
         ///
-        /// ② 用户主动上滑去看历史时 stickToBottom 已经是 false，这时候越界是
-        ///    估算误差造成的假象，夹回 = 硬把用户拽回最新消息。只有处于
-        ///    「跟随底部」状态才需要防空白；用户在看历史时，越界交给系统回弹。
+        /// 判据用「视口区间与内容区间的交集是否为空」，而不是「偏移量超过某个容差」：
+        ///   · 前者精确等于「屏幕上什么都没有」——这时无论谁造成的都必须修；
+        ///   · 后者会把 LazyVStack 的估算抖动也算进来，那种情况只在吸附态才该管，
+        ///     用户翻历史时一并夹回就是「松开手抖两下、被拽回底部」的老毛病。
         ///
-        /// ③ 手指还在拖 / 惯性还在滑时也不修 —— 那是系统在管，插手只会打架。
+        /// 手指还在拖/惯性滚动时不判 —— 那是系统在管，插手只会打架。
+        private func overshootSide(_ sv: UIScrollView) -> OvershootSide? {
+            guard !userIsScrolling(sv) else { return nil }
+            let top = -sv.adjustedContentInset.top
+            let bottom = top + sv.contentSize.height
+            let viewTop = sv.contentOffset.y
+            let viewBottom = viewTop + sv.bounds.height
+            // 视口整屏在内容上方（留 1pt 抗浮点误差）
+            if viewBottom <= top + 1 { return .above }
+            // 视口整屏在内容下方：视口顶端已经在内容底部之下。
+            //
+            // 不用 max(bottom, top) 兜「内容比视口短」——那样写会把正常停在顶部的
+            // 状态也判成越界（内容短时 top == max），每帧都夹一次，白做功。
+            // 内容短时 bottom = top + h（h 很小），正常位置的 viewTop = top 远小于
+            // bottom，这条自然不成立；只有 offset 真停在旧的大值时才会命中。
+            if viewTop >= bottom - 1 { return .below }
+            return nil
+        }
+
+        /// 是否**该做**越界修正（保留这个别名，三处 KVO 回调都用它）。
+        ///
+        /// 除了「整屏空白」这条硬判据，还额外保留吸附态下的「超过 48pt 的部分越界」：
+        /// 那种情况是程序自己滚过头（估算落位），夹回底部是恢复正确的跟随，
+        /// 用户看不到任何跳变（本来就在底部附近）。
         private func shouldFixOvershoot(_ sv: UIScrollView) -> Bool {
-            guard stickToBottom else { return false }
-            guard !userIsScrolling(sv) else { return false }
+            if overshootSide(sv) != nil { return true }
+            guard stickToBottom, !userIsScrolling(sv) else { return false }
             let m = maxOffset(sv)
             guard m > 0 else { return false }
-            return sv.contentOffset.y > m + 48
+            return sv.contentOffset.y > m + overshootToleranceSticking
         }
 
         /// 越界修正：夹回真实底部，并恢复「跟随底部」状态。
@@ -397,14 +510,53 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             DispatchQueue.main.async { [weak self, weak sv] in
                 guard let self = self else { return }
                 self.overshootFixScheduled = false
-                // v1.0.35：排程期间用户可能已经开始上滑看历史了 —— 那就绝不能夹回。
-                guard let sv = sv, self.stickToBottom, !self.userIsScrolling(sv) else { return }
+                // 排程期间用户可能已经动手拖屏了 —— 那就绝不能夹回（会跟手势打架）。
+                guard let sv = sv, !self.userIsScrolling(sv) else { return }
+                // 重新判一次方向：这一帧布局可能又变了，上一帧的判断不作数。
+                //
+                // 2026-11-05 send-blank：**这里以前是 `guard let side = ... else { return }`，
+                // 那是个死胡同。** 被调度进来是因为 `shouldFixOvershoot` 返回 true，
+                // 而它的成立条件有两条（整屏越界 / 吸附态下超 48pt）。等到这一帧执行时，
+                // 布局可能又动过一次 → `overshootSide` 返回 nil → 直接 return，
+                // **什么都不做、也不再贴底**。offset 就停在那个人们看到空白的位置上，
+                // 因为没有新的 contentSize/offset 变化来重新触发一遍。
+                //
+                // 现在：判不出方向时不放弃，退回「吸附态就贴底」。这是安全的兜底——
+                // 若本来不是吸附态（用户在看历史），pinToBottom 自己的
+                // `guard stickToBottom` 会挡掉，不会把人拽走。
+                guard let side = self.overshootSide(sv) else {
+                    if self.stickToBottom { self.pinToBottom(sv) }
+                    return
+                }
+                let top = -sv.adjustedContentInset.top
                 let m = self.maxOffset(sv)
-                guard m > 0, sv.contentOffset.y > m + 1 else { return }
-                sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: m), animated: false)
-                self.stickToBottom = true
+                switch side {
+                case .below:
+                    // ⚠️ 内容比视口还短时 maxOffset 是负的。以前这里 `guard m > 0` 直接
+                    // return —— 那正是「内容塌陷后整屏空白永不恢复」的最后一道漏洞。
+                    // 这种情况正确的落点就是顶部。
+                    let dest = m > 0 ? m : top
+                    sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: dest), animated: false)
+                    // 落到真实底部 = 语义上就是「跟随底部」，恢复吸附没有副作用。
+                    self.stickToBottom = true
+                case .above:
+                    // 2026-11-05：**上越界同样要修**。以前只修下越界，于是内容整体
+                    // 变矮/重建后 offset 停在顶部之上时，屏幕上半是空白，用户得往下
+                    // 拖一下才看到内容。夹回顶部即可，不要去动 stickToBottom
+                    // —— 用户可能正是在看历史，把他拽到底部才是打扰。
+                    let wasSticking = self.stickToBottom
+                    sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: top), animated: false)
+                    // 但如果本来就是吸附态，夹回顶部只是"先落回内容里"，
+                    // 语义上应该继续贴到底部——否则 offset 观察者会把 stickToBottom
+                    // 判成 false（顶部当然不在底部），自动跟随就此关掉，下一轮
+                    // 流式追加又停在上方导致空白。
+                    //
+                    // pinning 正在跑时不要插一脚（会和它的分步落位互相打断），
+                    // 让它自己把位置走完即可。
+                    if wasSticking, !self.pinning { self.pinToBottom(sv) }
+                }
                 // v1.0.35：这里**不再**调 pinToBottom。
-                // 夹回本身已经精确落到 m；后面内容若继续长（流式追加 / cell 陆续渲染），
+                // 夹回本身已经精确落位；后面内容若继续长（流式追加 / cell 陆续渲染），
                 // contentSize 观察者会自己再贴一次。多调一次分步贴底只会让画面抖。
             }
         }
@@ -431,12 +583,21 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             //   1) 不是吸附态（用户明确在看历史）→ 不动
             //   2) 用户正在操作（拖拽/惯性）→ 不动，否则手指会被系统判定为手势冲突
             //   3) 上一帧排的 pin 还没执行 → 不重复排
-            guard stickToBottom, !userIsScrolling(sv), !pinning else { return }
-            let m = maxOffset(sv)
-            guard m > 0 else { return }
+            guard stickToBottom, !userIsScrolling(sv) else { return }
+            // pinning 卡死兜底：超过 1.5 秒说明那次分步流程中途被丢弃了，
+            // 强制放行，否则贴底会永久失效（见 pinningStuck 的说明）。
+            if pinningStuck() { pinning = false }
+            guard !pinning else { return }
+            // 2026-11-05：内容比视口短时 maxOffset 是负的（甚至 contentSize 塌陷到 0），
+            // 上一版 `guard m > 0 else { return }` 在这里直接放弃 —— 而「文本变短导致
+            // 视口落在空白上」正是这时候发生的。目标位置此时就是顶部。
+            let top = -sv.adjustedContentInset.top
+            let rawM = maxOffset(sv)
+            let m = rawM > 0 ? rawM : top
             let distance = abs(sv.contentOffset.y - m)
             guard distance > 0.5 else { return }   // 已到底，不重复设
             pinning = true
+            pinningSince = CFAbsoluteTimeGetCurrent()
             // v1.0.35：近距离（< 160pt）一步到位。
             //
             // 分步的唯一理由是「离得太远，一次性跳过去 LazyVStack 来不及建 cell，
@@ -450,8 +611,9 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                         self.pinning = false
                         return
                     }
-                    let mm = self.maxOffset(sv)
-                    if mm > 0, abs(sv.contentOffset.y - mm) > 0.5 {
+                    let rawMM = self.maxOffset(sv)
+                    let mm = rawMM > 0 ? rawMM : -sv.adjustedContentInset.top
+                    if abs(sv.contentOffset.y - mm) > 0.5 {
                         sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: mm), animated: false)
                     }
                     self.pinning = false
@@ -478,11 +640,10 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                 }
                 // 目标要重新算：这一帧里 LazyVStack 可能又建出了几个 cell，
                 // contentSize 已经变大，用上一帧的旧目标会「差一点到底」。
-                let m = self.maxOffset(sv)
-                guard m > 0 else {
-                    self.pinning = false
-                    return
-                }
+                let rawM = self.maxOffset(sv)
+                // 内容比视口短（或正塌陷）时目标就是顶部 —— 不能直接 return，
+                // 否则这一帧就停在空白上再也回不来。
+                let m = rawM > 0 ? rawM : -sv.adjustedContentInset.top
                 let cur = sv.contentOffset.y
                 let dest = remaining <= 1 ? m : cur + (m - cur) / CGFloat(remaining)
                 if abs(dest - cur) > 0.5 {
@@ -492,6 +653,24 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                     self.stepTowardBottom(sv, remaining: remaining - 1)
                 } else {
                     self.pinning = false
+                    // 2026-11-05 send-blank：**收尾补一帧**。
+                    //
+                    // 上面这一步落下后，LazyVStack 往往又因为新 cell 建出来而把
+                    // contentSize 改大 —— 于是「刚落到底」立刻又不算到底了。
+                    // 以前这里就结束了（pinning = false），指望 contentSize 观察者
+                    // 再触发一次；但那个观察者只在 contentSize **真的变化**时才来，
+                    // 而有时它的变化发生在本次 layout 之外、并且会被
+                    // `shouldFixOvershoot` 抢先拿走（那个分支只修越界、不贴底）。
+                    // 结果就是停在「离底部差几十 pt」的位置 —— 从用户视角看，
+                    // 那个位置可能正好是一片未渲染的空白。
+                    //
+                    // 再排一帧重新量一次：若还差就继续贴（pinToBottom 自带节流与
+                    // 三道闸门，不会失控），若已到底则 `distance > 0.5` 直接返回。
+                    DispatchQueue.main.async { [weak self, weak sv] in
+                        guard let self = self, let sv = sv else { return }
+                        guard self.stickToBottom, !self.userIsScrolling(sv) else { return }
+                        self.pinToBottom(sv)
+                    }
                 }
             }
         }
@@ -504,6 +683,10 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             if let o = releaseObserver {
                 NotificationCenter.default.removeObserver(o)
                 releaseObserver = nil
+            }
+            if let o = resetObserver {
+                NotificationCenter.default.removeObserver(o)
+                resetObserver = nil
             }
             offsetObs = nil
             contentSizeObs = nil

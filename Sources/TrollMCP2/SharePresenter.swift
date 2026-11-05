@@ -1,22 +1,19 @@
 import SwiftUI
 import UIKit
 
-/// v4.3.46：统一分享器——TrollStore 侧载环境"分享面板闪退"最终方案。
+/// 统一分享器 —— **2026-11-05 恢复系统共享面板**。
 ///
-/// 崩溃铁证（sig_1790791863 与 sig_1790797823，两次真机崩溃栈地址逐字节相同）：
-/// ShareSheet → SharingUI → UIKitCore → **MobileIcons(LICreateIconForImages) → CoreImage →
-/// Segmentation fault: 11**。崩溃发生在系统分享框架内部——枚举"支持当前内容类型的所有
-/// 分享扩展"并生成扩展图标时。任何触达系统分享面板的路径（手写 UIActivityViewController /
-/// SwiftUI ShareLink / QLPreviewController 系统分享按钮 / .quickLookPreview 预览页分享按钮）
-/// 都在同一地址崩溃，与呈现方式无关。
+/// 历史上这里写着「侧载环境任何系统分享面板都不可用」，
+/// 但那个结论是建立在错误归因上的（详见 ShareCenter.swift 文件头的更正）：
+/// 真实根因是包内缺 `Assets.car` 而 Info.plist 又声明了 `CFBundleIconName`，
+/// 系统生成扩展图标时 MobileIcons/CoreImage SIGSEGV。
+/// `Support/Info.plist` 删掉 CFBundleIconName 后，系统面板即可正常使用。
 ///
-/// 对照：TrollFools 分享 .dylib（第三方扩展均不支持）→ 面板只枚举系统扩展 → 不崩；
-/// 我们分享 .txt/普通文件 → ShareSheet 枚举全部第三方扩展图标 → 必崩。
-/// → 结论：本设备侧载环境下**任何系统分享面板都不可用**。
-///
-/// 最终方案：**自建分享菜单**（ShareCenter.presentShareMenuFile/Text），
-/// 选项：拷贝 / 存储到文件（UIDocumentPicker）/ 用其他 App 打开（UIDocumentInteractionController），
-/// 全部绕开 ShareSheet，侧载环境安全。
+/// 现在的行为：
+///   · 文件 → 系统 UIActivityViewController（微信/QQ/AirDrop/存储到文件全在里面）
+///   · 文字 → 同上
+/// 用户原话：「直接共享文件，这个按钮，然后我点击共享文件这个按钮里面
+///           微信 qq 所有的都在里面」
 enum SharePresenter {
 
     /// 命令式分享入口（兼容 UpdateManager / MoreViews Alert 等非 View 上下文调用点）。
@@ -63,13 +60,10 @@ enum SharePresenter {
     }
 }
 
-// MARK: - SwiftUI 分享入口（v4.3.46 最终方案：自建菜单，绕开 ShareSheet）
+// MARK: - SwiftUI 分享入口
 //
-// 崩溃铁证：任何触达系统分享面板的路径（ShareLink / UIActivityViewController /
-// QLPreviewController 分享按钮）在本设备侧载环境都在 MobileIcons/CoreImage 同一地址
-// SIGSEGV（sig_1790791863 与 sig_1790797823 栈帧地址逐字节相同）。
-// 因此全部分享入口改为触发 ShareCenter 自建菜单（拷贝 / 存储到文件 / 用其他 App 打开），
-// 彻底不经过 ShareSheet。
+// 2026-11-05：全部入口统一走 ShareCenter 的系统共享面板
+// （Info.plist 删掉 CFBundleIconName 之后，面板不再崩，见 ShareCenter 文件头）。
 extension SharePresenter {
 
     /// 上下文菜单里的"分享"项（文件 URL）→ 自建分享菜单

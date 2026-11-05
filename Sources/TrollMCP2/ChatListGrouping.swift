@@ -99,10 +99,23 @@ enum ChatListGrouping {
             if m.isError { errorCount += 1 }
             toolBytes += m.content.utf8.count
         }
+        // 2026-11-05：正在流式/正在产出的消息 id 要参与缓存判定。
+        //
+        // 为什么必须先读再判缓存：`liveIDs` 决定某条空壳 assistant 吞不吞（见下方
+        // isInvisibleAssistant 的 ⚠️）。流式刚开始时 content 还是空的、id 在 liveIDs 里
+        // → 不吞；流式结束后 id 移出 liveIDs → 同一份 messages 会算出不同分组。
+        // 若这俩 id 不进缓存键，第二次会命中第一次的结果，表现为"流式结束后气泡布局错位"。
+        //
+        // 读的是两个可选 UUID，O(1)，不影响这个函数原本的性能目标。
+        var liveIDs = Set<UUID>()
+        // 类名是 ConversationStore（不是 ChatStore）——属性是 internal，同模块可读。
+        if let sid = ConversationStore.shared.streamingMessageId { liveIDs.insert(sid) }
+        if let pid = ConversationStore.shared.liveProducedID { liveIDs.insert(pid) }
         if let c = _cache,
            c.count == count, c.firstId == firstId, c.lastId == lastId,
            c.lastLen == lastLen, c.running == runningCount,
-           c.errors == errorCount, c.toolBytes == toolBytes {
+           c.errors == errorCount, c.toolBytes == toolBytes,
+           c.liveIDs == liveIDs {
             return c.items
         }
 
@@ -117,21 +130,66 @@ enum ChatListGrouping {
             }
             run = []
         }
+        // 2026-11-05 **用户报「4 张『运行了 N 个工具』卡拆成 4 个」的直接修复**：
+        //
+        // 现象：模型每调一次工具，往往在两次调用之间吐一小段 assistant 文本
+        //      （有时是空串，有时只有空白，有时是一句解说）。
+        //      原来的逻辑「非 tool 就地 flush()」导致工具流被这些消息**切断**，
+        //      4 次工具调用 → 4 个独立折叠组。
+        // 用户原话：「运用了什么工具，能不能整体都折叠到一起，
+        //           不要单独显示这么多，我不需要看它运行了什么，我只要结果」
+        //
+        // 修法：**空壳 assistant 消息不打断工具流**（判定见 isInvisibleAssistant）。
+        //      有正文的消息仍照常 flush 单独成气泡——那段话用户是要看的。
+        //      liveIDs 已在上面算好（参与缓存判定），这里直接用。
         for m in messages {
             if m.isTool {
                 run.append(m)
+            } else if Self.isInvisibleAssistant(m, liveIDs: liveIDs) {
+                // 空壳 assistant：不打断工具串，直接跳过（不占屏）
+                continue
             } else {
                 flush()
                 out.append(.msg(m))
             }
         }
         flush()
-        _cache = (count, firstId, lastId, lastLen, runningCount, errorCount, toolBytes, out)
+        _cache = (count, firstId, lastId, lastLen, runningCount, errorCount, toolBytes, liveIDs, out)
         return out
+    }
+
+    /// 这条消息是不是「用户看不见的空壳」。
+    ///
+    /// 只有 assistant 角色才可能被吞：user / system 消息即使短也要显示（用户自己发的、
+    /// 系统提示），tool 消息走 isTool 分支，根本到不了这里。
+    ///
+    /// 2026-11-05 **为什么会走到这里**（不是猜的，对着 Models.swift 写入点看出来的）：
+    ///   `onThinking` 收到思考增量时，若当前没有流式消息，会新建一条
+    ///     `ChatMessage(role: "assistant", content: "")` + `thinking = delta`（2074 行）。
+    ///   所以**每个"思考阶段"都可能留下一条正文为空的 assistant 消息**。
+    ///   它夹在两次工具调用之间就会切断工具流 —— 用户看到的 4 张
+    ///   「运行了 2/1/1/1 个工具」就是这么来的。
+    ///
+    /// 判定**不看 thinking**：思考是过程信息（用户明确说不看过程）。
+    /// 而且工具卡内部本来就会渲染同一份 thinking（ChatView.toolBubble 3778 行），
+    /// 所以吞掉这条空壳不会丢失思考内容。
+    ///
+    /// ⚠️ 但**正在流式的那条绝不能吞**：
+    ///   那条消息是流式载体（`streamingMessageId` 指向它），正文到达时会被原地填入。
+    ///   刚开始 content 就是空的，若此刻吞掉，会出现"正文一到达才突然冒出一个气泡"的闪烁。
+    ///   所以这里显式排除流式/正在产出的消息 id。
+    static func isInvisibleAssistant(_ m: ChatMessage, liveIDs: Set<UUID> = []) -> Bool {
+        guard m.role == "assistant", !m.isTool else { return false }
+        // 正在流式/正在产出的，一律不吞（见上 ⚠️）
+        if liveIDs.contains(m.id) { return false }
+        if !m.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+        if let imgs = m.imageDataURLs, !imgs.isEmpty { return false }
+        // 注意：**不检查 thinking**。理由见上。
+        return true
     }
 
     /// 最近一次分组结果 + 判定用的特征量
     private static var _cache: (count: Int, firstId: UUID?, lastId: UUID?,
                                 lastLen: Int, running: Int, errors: Int,
-                                toolBytes: Int, items: [Item])?
+                                toolBytes: Int, liveIDs: Set<UUID>, items: [Item])?
 }

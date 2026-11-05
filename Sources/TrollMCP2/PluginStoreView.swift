@@ -25,10 +25,18 @@ struct PluginStoreView: View {
     /// 2026-11-05：外部插件详情（并入发现页后仍然单独一个 sheet，
     /// 因为它讲的是「这条外部插件会给你什么能力」，和内置包详情不完全一样）
     @State private var extDetail: ExternalPlugin? = nil
-    /// 发现页是否把外部那 4687 条也列出来。
-    /// 默认列（用户要求「都放在发现里面」），但给一个开关能一键只看内置的 17 个，
-    /// 免得每次都要在 4704 条里翻。
-    @State private var includeExternal = true
+    /// 2026-11-05 **用户要求删除「只看内置」开关**，原因有两条：
+    ///
+    /// ① 那个按钮长在外部区块的标题行里（「更多能力 4687 [只看内置]」），
+    ///    一点就把整个外部区块连同按钮自己一起隐藏 ——
+    ///    而它**从来没有被设回 true 的代码路径**（全文件只有 1 处赋值，就是设 false）。
+    ///    结果就是单向陷阱：点一次，4687 条永久消失，界面上再也找不到入口切回来，
+    ///    只能杀进程重进。用户原话：「我点击了只看内置，结果这个那些全没了」。
+    ///
+    /// ② 用户真正要的是「4000 多条都在发现里、随时能装」，
+    ///    收窄成一个只读子集跟这个目标正好相反。
+    ///
+    /// 所以整个开关删掉，发现页永远内置 + 外部全显示。
 
     /// 同一个视图只能挂一个 .alert——安装确认与卸载确认合并成同一入口
     enum PluginAlert: Identifiable {
@@ -80,7 +88,7 @@ struct PluginStoreView: View {
         .sheet(item: $extDetail) { e in
             ExternalPluginSheet(
                 ext: e,
-                pack: CapabilityPacks.pack(e.capKey),
+                pack: CapabilityPacks.resolvePack(forCapKey: e.capKey),
                 installed: store.isExternalMarkedInstalled(e),
                 onInstall: { alertItem = .installExternal(e); extDetail = nil }
             )
@@ -102,7 +110,7 @@ struct PluginStoreView: View {
                     secondaryButton: .cancel(Text(L10n.t("i18n_1591"))))
             case .installExternal(let e):
                 // 关键：要说清楚「装它实际给你哪些工具」，不能只说一句"安装"
-                let pack = CapabilityPacks.pack(e.capKey)
+                let pack = CapabilityPacks.resolvePack(forCapKey: e.capKey)
                 let n = pack?.tools.count ?? 0
                 let names = pack?.tools.prefix(3).map { $0.name.components(separatedBy: "_").last ?? "" }.joined(separator: "、") ?? ""
                 return Alert(
@@ -205,9 +213,9 @@ struct PluginStoreView: View {
         .padding(.bottom, 12)
     }
 
-    /// 发现页总条数（内置 + 外部）
+    /// 发现页总条数（内置 + 外部）—— 开关已删除，恒含外部
     private var totalDiscoverCount: Int {
-        store.catalog.count + (includeExternal ? ExternalCatalog.all.count : 0)
+        store.catalog.count + ExternalCatalog.all.count
     }
 
     private var segmented: some View {
@@ -307,7 +315,6 @@ struct PluginStoreView: View {
         // 2026-11-05：外部并进来后计数要合并（内置 + 外部同分类）。
         // 之前外部单独一屏时是分开算的，合并后必须一起算，否则数字对不上列表。
         let builtin = store.catalog.filter { $0.category == c }.count
-        guard includeExternal else { return builtin }
         return builtin + ExternalCatalog.count(in: c)
     }
 
@@ -339,8 +346,7 @@ struct PluginStoreView: View {
     /// 而且用户真实使用是「搜」而不是「翻到第 3000 条」。
     /// 限制条数时给一句提示，别让人以为只有这么多。
     private var filteredExternal: [ExternalPlugin] {
-        guard includeExternal else { return [] }
-        return ExternalCatalog.search(query, category: category)
+        ExternalCatalog.search(query, category: category)
     }
 
     /// 外部列表一次最多渲染多少条
@@ -392,24 +398,32 @@ struct PluginStoreView: View {
                             .padding(.horizontal, 5).padding(.vertical, 1)
                             .background(Capsule().fill(Color(.tertiarySystemFill)))
                         Spacer()
-                        // 一键只留内置的：4704 条里翻太累，给个收窄开关
-                        Button {
-                            withAnimation(.easeOut(duration: 0.15)) { includeExternal = false }
-                        } label: {
-                            Text("只看内置")
-                                .font(.system(size: 11))
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundColor(.accentColor)
+                        // 2026-11-05：原来的「只看内置」按钮已删除（单向陷阱，见文件头说明）。
+                        // 这里换成一句用法提示 —— 4687 条靠搜比靠翻靠谱。
+                        Text("搜关键词更快")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
                     }
                     .padding(.horizontal, 4)
                     .padding(.top, 12)
                     .padding(.bottom, 2)
 
+                    // 2026-11-05 **用户疑虑的正面回答**（原话：「咱们制作的插件市场，里面的插件
+                    // 你安装了 dsh 核心了吗，是不是需要这个核心咱们安装的插件才能生效啊」）。
+                    //
+                    // 这里必须写清楚，否则列表里那 4687 条名字看着像「一堆待下载的外部插件」，
+                    // 用户会以为自己还得装个什么运行时才能用，装完发现「好像没生效」又来问。
+                    //
+                    // 事实是：这些**不是外部下载的东西**，每一条都映射到本 App 已经内置的
+                    // 18 个本地能力包（CapabilityPacks.resolvePack(forCapKey:)）。
+                    // 点「安装」真正做的是「把对应的那个本地能力包启用」，工具立刻可用，
+                    // 没有任何额外运行时、不需要联网下载、也不依赖任何外部核心。
+                    ExternalMappingNotice()
+
                     ForEach(extShown) { e in
                         ExternalPluginRow(
                             ext: e,
-                            packName: CapabilityPacks.pack(e.capKey)?.name ?? "通用小工具",
+                            packName: CapabilityPacks.resolvePack(forCapKey: e.capKey)?.name ?? "通用小工具",
                             tint: tints[(e.stars % tints.count)],
                             ready: store.isExternalMarkedInstalled(e)
                         )
@@ -640,6 +654,61 @@ private struct PluginIcon: View {
 // 原来那版写的是「参考 · 需改写」，因为那时外部条目没接任何可执行的东西；
 // 现在每条都带 capKey 指向 CapabilityPacks 里的真实能力包，装完就有工具可用。
 
+/// 2026-11-05：外部区块顶部的说明条——正面回答「要不要装 dsh 核心」。
+///
+/// 为什么值得占一块地方：4687 条外部名字摆在那，天然会被读成「一堆需要另外
+/// 下载/依赖某个运行时的插件」。用户实际就是这么理解的，原话：
+/// 「你安装了 dsh 核心了吗，是不是需要这个核心咱们安装的插件才能生效啊」。
+///
+/// 讲清楚三件事就够了：
+///   ① 装的是本 App 自带的本地能力包，不是从外面下东西
+///   ② 不需要任何额外运行时/核心，装完立刻能在工具列表里看到
+///   ③ 很多条共用同一个能力包，所以装几条不会把工具表撑大
+///
+/// 措辞上不要出现 "dsh" 这种内部词——用户不知道该不该装的东西，越解释越慌。
+private struct ExternalMappingNotice: View {
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 5) {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 11.5))
+                    .foregroundColor(.secondary)
+                Text("下面这些直接对应 App 内置的本地能力，不用另外装任何核心")
+                    .font(.system(size: 11.5))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+            }
+            if expanded {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("· 点「安装」就是把对应的那个本地能力包启用，工具立刻出现在工具列表里")
+                    Text("· 不需要联网下载，也不依赖任何外部运行时")
+                    Text("· 很多条其实共用同一个能力包——装了 A 再装同类的 B，不会多出一套工具")
+                }
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.leading, 17)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(.tertiarySystemFill))
+        )
+        .padding(.horizontal, 4)
+        .padding(.bottom, 4)
+        .contentShape(Rectangle())
+        .onTapGesture { withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() } }
+    }
+}
+
 /// 外部插件的一行。视觉上和 PluginRow 保持一致，多一个「→ 能力包名」的小标注，
 /// 让用户点安装前就知道「装它实际会得到什么」。
 private struct ExternalPluginRow: View {
@@ -781,6 +850,13 @@ private struct ExternalPluginSheet: View {
 
                         // 同一能力包被多条外部插件共用这件事，说清楚免得用户反复装
                         Text("提示：这个能力包被多条同类插件共用，装一次就够了。")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        // 2026-11-05：再补一句，堵掉「是不是还得装个核心」这个疑问。
+                        // 能力包就在 App 里，装 = 启用，不牵扯任何下载或运行时。
+                        Text("它是 App 自带的本地能力，装完立刻可用，不用另外下载或安装任何核心。")
                             .font(.system(size: 11))
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -974,21 +1050,25 @@ struct PluginDetailSheet: View {
         }
     }
 
+    /// 2026-11-05：这里原来是橙色三角警告「需要宿主钩子才能完全生效」，
+    /// 把用户吓住了。其实这 8 个是**技能型**插件，装完真能用（AI 通过
+    /// skills.list / skills.read 按需读取），只是不含 shell 工具。
+    /// 所以从"警告"降级成"说明"，图标换成 info，配色换成蓝。
     private var hookWarning: some View {
         HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
+            Image(systemName: "info.circle.fill")
                 .font(.system(size: 12))
-                .foregroundColor(.orange)
+                .foregroundColor(.blue)
                 .padding(.top, 1)
             Text(L10n.t("i18n_1604"))
                 .font(.system(size: 11.5))
-                .foregroundColor(.orange)
+                .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color.orange.opacity(0.10)))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.orange.opacity(0.22), lineWidth: 1))
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.blue.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.blue.opacity(0.18), lineWidth: 1))
     }
 
     private var changelogSection: some View {

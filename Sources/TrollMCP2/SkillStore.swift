@@ -224,7 +224,15 @@ final class SkillsListTool: MCPTool {
         let q = (params["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let items: [SkillItem]
         if q.isEmpty {
-            items = Array(all.prefix(20))
+            // 2026-11-05 **修「装了插件但 AI 用不上」**：
+            // 原来这里硬截 prefix(20)，而现有技能已经是 18 个内置 + 插件技能，
+            // 一旦超过 20 条，排在后面的就会**永久不可见** —— 模型连名字都看不到，
+            // 自然不会去 skills.read 读它。表现就是用户说的"装了没用"。
+            //
+            // 改成不截断：每条只返回 name + summary（十几个字），
+            // 几十条也就一两千 token，比"技能装了白装"划算得多。
+            // 真要省 token，让模型用 query 搜——但前提是它得先知道有什么。
+            items = all
         } else {
             items = all.filter {
                 $0.name.localizedCaseInsensitiveContains(q) || $0.summary.localizedCaseInsensitiveContains(q)
@@ -236,7 +244,7 @@ final class SkillsListTool: MCPTool {
             "query": q,
             "skills": items.map { ["name": $0.name, "summary": $0.summary] },
             "hint": q.isEmpty
-                ? "total \(all.count) 个技能，只返回前 20 条；请用 query 按名称/摘要搜索 (如 query=\"注入\")，需要执行时用 skills.read 读完整指令"
+                ? "共 \(all.count) 个技能（已全部列出）。需要执行某个时，用 skills.read 读它的完整指令再照着做"
                 : "matched \(items.count) 个；需要执行时用 skills.read 读取该技能完整指令"
         ]
     }

@@ -56,9 +56,9 @@ struct ChatView: View {
 
     // 2026-11-05：本轮「真的跑完了没有」——用户反馈分不清 AI 是停了还是在干活。
     //   只在 isLoading 翻转时写，不参与流式输出的高频更新，所以不会牵动 body 重算。
-    //   turnStartedAt 给顶部状态条走秒表；lastTurnSeconds 给列表末尾那行「本轮结束」。
+    //   turnStartedAt 给列表末尾「本轮结束了没」判据；用时播报改由 RunStatusStrip 自己记
+    //   （它挂在界面里不会消失，@State 生命周期更长，不会再出现"取不到起点"的问题）。
     @State private var turnStartedAt: Date?
-    @State private var lastTurnSeconds: Double?
     @State private var turnEnded = false
     /// 2026-11-05：本轮过程中失败过的步骤（人话标题 + 一句原因）。
     ///
@@ -105,9 +105,15 @@ struct ChatView: View {
                 // 用户原话「我都不知道他是停止工作了还是正在工作」——列表里的
                 // ThinkingPanel 一往上翻就看不见，而「运行了 N 个工具 12.7s」那行是
                 // **已完成工具的汇总**，长得像结论。所以把实时状态钉在输入框上方。
-                RunStatusStrip(startedAt: turnStartedAt)
-                // v2.9.72：工作流可视化步骤条
-                WorkflowProgressView()
+                //
+                // 2026-11-05 **再改（去重）**：下面原本还挂了一条 WorkflowProgressView，
+                // 它会画一排「处理请求 · app · app · app」的胶囊。那排胶囊和本条状态条
+                // 说的是同一件事（都在说"正在跑"），而且它的 app 胶囊又与折叠后的工具卡
+                // 重复。用户原话：「是不是这一行英文和他这个处理请求是一样的效果，
+                // 如果一样，那就没必要留着那一行英文的……让他的处理请求始终让我看见
+                // 在操作就行了，完成了就不提示了，没完成就一直提示着我」。
+                // 所以只留这一条：进行中就一直在（带秒表），完成后自动消失。
+                RunStatusStrip()
             }
             // v2.9.244：输入框改用 safeAreaInset 挂底部——标准键盘避让，不再手动 padding 双重压缩内容区
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -456,6 +462,33 @@ struct ChatView: View {
             }
             conn.refreshNow()
         }
+        // 2026-11-05：从微信/QQ/文件 App「共享」过来的文件 → 直接落进输入框。
+        //
+        // 用户原话：「我在 QQ 或者微信下载的文件，要共享到这个 ipa 的聊天输入框上
+        //           进行直接发送给 AI，分享的时候为什么看不到咱们的 IPa 呢」
+        //
+        // 两个缺口都补了：Info.plist 声明 CFBundleDocumentTypes（让图标出现在分享列表）、
+        // AppDelegate 接住 file:// URL（让文件真的有去处）。这里是最后一段：
+        // 把它变成输入框上方的附件缩略图，用户直接点发送即可。
+        .onReceive(NotificationCenter.default.publisher(for: IncomingFiles.didReceiveNotification)) { _ in
+            attachIncomingFiles()
+        }
+        // 2026-11-05 send-blank：镜像桥接层的「跟随底部」状态。
+        //
+        // 用途只有一个：`attemptScrollToBottom` 的阶梯重试最长延到 320ms，
+        // 期间用户若自己上滑看历史，必须立刻停手（见该方法里的 guard）。
+        // 这里只写一个普通属性，不写 @Published —— 否则每次上下滑都牵动
+        // ChatView.body 全量重算，又回到那个「点哪都没反应」的老坑。
+        .onReceive(NotificationCenter.default.publisher(for: ScrollGeometryBridge.stickStateChangedNote)) { note in
+            if let v = note.userInfo?["sticking"] as? Bool {
+                scroll.setSticking(v)
+            }
+        }
+        .onAppear {
+            // 冷启动场景：App 被杀掉后被分享拉起，AppDelegate 在 didFinishLaunching 里
+            // 就把文件收了（那时本视图还没建），通知发出去没人接 —— 所以这里补捞一次。
+            attachIncomingFiles()
+        }
         .onAppear {
             // 只在聊天页可见时跑周期探活，离开就停——省电、也省一次往返
             conn.startAutoProbe()
@@ -800,11 +833,13 @@ struct ChatView: View {
                         if store.isLoading {
                             ThinkingPanel()
                         }
-                        // 2026-11-05：本轮结束标记（用户要求「需要加结束话语」）。
-                        // 判据只有一条：isLoading 真的变回 false。所以不会提前冒出来
-                        // 骗人说跑完了——模型还在跑下一轮时这里什么都没有。
-                        if turnEnded, !store.isLoading, let secs = lastTurnSeconds {
-                            TurnEndedNote(seconds: secs, issues: turnIssues)
+                        // 2026-11-05：这里原来是「本轮结束 · 用时 X」的结束语。
+                        // 它和底部状态条的「完成 · 用时 X」是同一件事的两次播报，
+                        // 用户明确要求「一条就够，完成了就不提示了」。
+                        // 现在结束语统一由 RunStatusStrip 播（2 秒后自动消失），
+                        // 这里只保留**出错清单**——那是列表里唯一还需要的补充信息。
+                        if turnEnded, !store.isLoading, !turnIssues.isEmpty {
+                            TurnIssuesNote(issues: turnIssues)
                         }
                     }
                     // v3.4.0：去掉整行水平 padding —— AI 气泡改为真正占满左右屏边缘；
@@ -859,28 +894,43 @@ struct ChatView: View {
                 // 判断「刚发的」用最后一条是不是 user：AI 的流式追加永远是 assistant/tool，
                 // 只有用户自己发消息才会让最后一条变成 user。
                 if let last = store.currentMessages.last, last.role == "user", !last.isTool {
-                    scroll.requestStickToBottom()
-                    // 2026-11-05 fix-blank-2 **关键改动**：这里**不再**调 proxy.scrollTo。
+                    // 2026-11-05 **再修（send-blank）：这里必须调 scrollToBottom(proxy)，
+                    // 不能只发 requestStickToBottom。**
                     //
-                    // 用户现象：「我回复出去以后，界面内容全被顶没了，出现空白，
-                    //           下滑第二次才出来之前的聊天内容」。
+                    // 用户现象（这是第二次报同一个症状）：
+                    //   「我给他发送新的消息时候，直接空白，但是他确实在工作，
+                    //     我还要上滑几下才能出来消息」
+                    // 截图特征：滚动条停在中间、↑↓ 两个按钮同时可见（= 既不在顶也不在底）、
+                    // 屏幕整片白。这是「视口落在 LazyVStack 没渲染的区域」的铁证。
                     //
-                    // 病根就是这一行 scrollTo(last.id, anchor: .bottom)：
-                    //   1) 新气泡刚进 LazyVStack，cell 还没建，SwiftUI 只能按**估算高度**
-                    //      算目标位置，而 LazyVStack 对未渲染内容一律往大了估
-                    //      → 目标 offset 越过真实 contentSize 底部；
-                    //   2) setContentOffset 到内容之外不会报错也不会自动夹回，
-                    //      视口就停在一片空白上；
-                    //   3) 紧接着 offset 观察者跑起来，看到「不在底部」→ 把 stickToBottom
-                    //      判成 false（以为用户主动上滑看历史）→ 自动跟随被关掉，
-                    //      空白就永久留在那儿，只有手指下滑才回到内容里。
+                    // 病根（上一版 fix-blank-2 把 scrollTo 整个删掉，删过头了）：
+                    //   `LazyVStack` 的 contentSize 对**尚未渲染**的内容一律**往大了估**。
+                    //   于是：
+                    //     ① maxOffset 按膨胀的 contentSize 算出一个偏大的目标；
+                    //     ② 桥接层 setContentOffset 跳过去 —— 那一片一个 cell 都没有；
+                    //     ③ overshootSide 拿**同一个膨胀的 contentSize** 判断，
+                    //        自然会认为「还在内容范围内」，于是**不修**；
+                    //     ④ 视口永久停在空白区。只有手指一动，SwiftUI 才重算可见范围
+                    //        把 cell 建出来 —— 正是「上滑几下才出来」。
                     //
-                    // 现在只发吸附请求，由桥接层按**真实 contentSize** 分步贴底；
-                    // 万一还是越界（内容先鼓后缩），桥接层的 isOverscrolled 会夹回底部。
-                    // 连排两次：第一次让状态立刻置位，第二次等新气泡真正进布局后再落位。
-                    DispatchQueue.main.async {
-                        scroll.requestStickToBottom()
-                    }
+                    //   上一版删 scrollTo 的理由是「scrollTo 按估算高度一步跳到底会跳过头」。
+                    //   那个判断本身没错，但它漏了另一半：**scrollTo 同时是唯一能让
+                    //   LazyVStack 立刻为末尾建 cell 的手段**。删掉它等于把唯一的重建
+                    //   触发器拿走了，只剩一个基于假数据的目标位置 —— 比原来更糟。
+                    //
+                    // 现在的组合（两件事缺一不可，顺序也重要）：
+                    //   · `scrollTo(渲染后的锚点, .bottom)` —— 逼 LazyVStack 把末尾 cell
+                    //     建出来，contentSize 由「估算」变成「真实」；
+                    //   · 再由桥接层按**真实** contentSize 精确落位 / 越界夹回。
+                    //   这正是 scrollToBottom() 里已经写好并验证过的流程（打开会话走同一条），
+                    //   所以这里直接复用，不再另写一套。
+                    //
+                    // 注意锚点：scrollToBottom 内部走 renderedAnchorIDs()，拿到的 id 和
+                    // ForEach 的 `.id()` 一致（`m-<uuid>` / `t-<uuid>`）。
+                    // 早期那版传的是消息原始 uuid，工具消息永远找不到锚点 → scrollTo 静默失败
+                    // → 只剩桥接层那次基于估算的跳转 → 空白。这才是当初「加了 scrollTo 反而
+                    // 更空白」的真实原因，不是 scrollTo 本身有问题。
+                    scrollToBottom(proxy)
                 }
             }
             // v2.9.12：打开/切换会话时自动滚到底（老会话不再停在顶部）
@@ -891,21 +941,22 @@ struct ChatView: View {
             }
             .onChange(of: store.selectedId) { _ in
                 // 2026-11-05：换会话就清掉上一轮的「本轮结束」标记——否则切到别的会话
-                // 底部还挂着上一条会话的结束语，看着像这轮已经跑完了。
+                // 底部还挂着上一条会话的出错清单，看着像这轮出过错。
                 turnEnded = false
-                lastTurnSeconds = nil
+                turnIssues = []
+                turnStartedAt = nil
+                // 2026-11-05：桥接层是复用的，必须先复位它内部的「已补过贴底 / 上次位置」，
+                // 否则新会话不会重新贴底，视口留在上一会话的位置 = 一片空白。
+                scroll.resetForNewConversation()
                 scrollToBottom(proxy)
             }
             // v2.9.72：AI 回复完成时结束工作流
             .onChange(of: store.isLoading) { loading in
                 if !loading {
                     WorkflowManager.shared.finishRun(success: true)
-                    // 2026-11-05：本轮真的结束了——记下用时，列表末尾落一行「✓ 本轮结束」。
-                    // 只有走到这里才算结束（工具循环中途 isLoading 一直是 true，不会误触发）。
-                    if let start = turnStartedAt {
-                        lastTurnSeconds = Date().timeIntervalSince(start)
-                        turnEnded = true
-                    }
+                    // 2026-11-05：只用来判定「这一轮确实跑过」——用时播报已交给
+                    // RunStatusStrip 自己记（见该 struct 的说明）。
+                    if turnStartedAt != nil { turnEnded = true }
                     turnStartedAt = nil
                     // 本轮过程中失败过的步骤（见 turnIssues 注释）。在这里算一次就够，
                     // 不要写成计算属性——那会让 body 每次重算都全量遍历一遍消息。
@@ -1067,20 +1118,71 @@ struct ChatView: View {
     /// 两边都没动，视口就停在原地甚至被夹到 0。现在统一走 `renderedAnchorIDs()`，
     /// 拿到的 id 一定和 `ForEach` 里的 `.id()` 对得上。
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        // 2026-11-05 **再修（send-blank）——从「一次 + 一帧后兜底一次」改成阶梯重试。**
+        //
+        // 为什么一次不够：`scrollTo` 只是告诉 LazyVStack「我需要这个锚点附近的 cell」，
+        // 而真正把 cell 建出来、把 contentSize 从「估算」更新成「真实」需要**若干帧**。
+        // 上一版只在本帧和下一帧各来一次，赶上内容多 / 手机忙的时候两帧都没建完，
+        // 桥接层随后就按仍然偏大的估算 contentSize 落位 → 又落到空白区。
+        //
+        // 2026-11-05 **调用起点必须先把吸附状态置回 true**。
+        //
+        // 这个函数被三个时机调用：用户自己发消息、打开会话、切换会话 —— 三者的语义
+        // 都是「现在必须停在最新处」。但 `scroll.isSticking` 可能还是 false：
+        // 用户上翻看了历史 → 发了条消息 → 我们这边还没收到桥接层的翻转通知。
+        // 若不清零，`attemptScrollToBottom` 第一行 guard 就把它挡掉，
+        // 一次都不滚 —— 又变成「发完消息停在上面的历史里 / 或停在空白」。
+        //
+        // 这里直接置 true 是安全的：下面立刻会 `requestStickToBottom()`，
+        // 桥接层收到后同样置 true，两边一致。真正要保护的是「用户在上滑」那种情况，
+        // 而那时桥接层的 didSet 会把 false 再推回来，guard 照样生效。
+        scroll.setSticking(true)
+        // 阶梯放在下一 runloop / 50ms / 150ms / 320ms：第一次覆盖正常情况（绝大多数会话
+        // 在第一帧就建好了，后面几次因为位置已到位而零成本）；后几次专门盯长会话和
+        // 卡顿时的情况。每次都会重新取锚点，所以期间新增的消息也能跟上。
+        // 每次执行前判一次 isSticking——用户中途手动上滑就停手，
+        // 不能把正在看历史的人反复拽回底部（见 attemptScrollToBottom 里的 guard）。
+        attemptScrollToBottom(proxy, remaining: 5)
+    }
+
+    /// `scrollToBottom` 的重试实现：递归排程，`remaining` 递减到 0 自然结束。
+    ///
+    /// 每次做两件事，缺一不可：
+    ///   ① `proxy.scrollTo(锚点, .bottom)` —— 逼 LazyVStack 为末尾建 cell；
+    ///   ② `scroll.requestStickToBottom()` —— 让桥接层按**当时最新**的 contentSize
+    ///      精确落位（不含插值、不与手势打架）。
+    ///
+    /// 注意这里**不能写 [weak self]**：ChatView 是 struct（值类型），
+    /// 'weak' 只能用于类/类约束协议 —— 编译期直接报错。
+    /// 也不需要：闭包按值捕获这个 struct（含 @ObservedObject 包装器与 ScrollViewProxy），
+    /// 执行完即释放，不会形成引用环。
+    private func attemptScrollToBottom(_ proxy: ScrollViewProxy, remaining: Int) {
+        guard remaining > 0 else { return }
+        // 用户中途自己上滑看历史 → 立刻停手，一次都不再拉。
+        //
+        // 这条判断是必须的：阶梯重试最长要往后延 320ms，而用户完全可能在这段时间里
+        // 上滑（AI 正在干活、他想翻上面的内容）。没有这个 guard 的话，那几次延时会
+        // 把他的屏幕硬生生拽回底部 —— 正是他之前抱怨的「滑上去又弹回去」。
+        //
+        // 判据用 `stickToBottom` 的镜像（scroll.state）而不是重新算一遍几何：
+        // 用户在拖动时桥接层已经把 stickToBottom 置 false 了，那是最权威的信号。
+        guard scroll.isSticking else { return }
         guard let anchor = renderedAnchorIDs().last else { return }
         proxy.scrollTo(anchor, anchor: .bottom)
-        // 落位交给桥接层分步完成（无动画、不与手势打架、不会落到未渲染区）。
         scroll.requestStickToBottom()
-        // 兜底：内容多时第一次 scrollTo 可能因锚点尚未创建而落空，下一帧再要一次。
-        // 注意这里**不能写 [weak self]**：ChatView 是 struct（值类型），
-        // 'weak' 只能用于类/类约束协议 —— 编译期直接报错。
-        // 也不需要：闭包按值捕获这个 struct（含 @ObservedObject 包装器与 ScrollViewProxy），
-        // 一次性执行完即释放，不会形成引用环。
-        DispatchQueue.main.async {
-            guard let anchor = ChatListGrouping.group(store.currentMessages).map({ $0.id }).last
-            else { return }
-            proxy.scrollTo(anchor, anchor: .bottom)
-            scroll.requestStickToBottom()
+        guard remaining > 1 else { return }
+        // 第 1 次重试走下一个 runloop（最快，也是最常命中的一次）；
+        // 之后逐步拉长间隔，给 SwiftUI 完整的布局轮次。
+        // 递减顺序：5→0（下一 runloop）→ 4→0.05 → 3→0.15 → 2→0.32 → 1 结束。
+        let delay: TimeInterval
+        switch remaining {
+        case 5: delay = 0
+        case 4: delay = 0.05
+        case 3: delay = 0.15
+        default: delay = 0.32
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            attemptScrollToBottom(proxy, remaining: remaining - 1)
         }
     }
 
@@ -1613,6 +1715,52 @@ struct ChatView: View {
         }
     }
 
+    /// 2026-11-05：把「从别的 App 分享进来」的文件放进输入框附件区。
+    ///
+    /// 图片走图片通道（转 dataURL + 缩略图，模型能直接看图），
+    /// 其余走文件通道（保留路径，发送时按现有 fileAtts 逻辑带路径给模型）。
+    ///
+    /// 幂等：IncomingFiles.take() 取完即清空，所以 onReceive 和 onAppear
+    /// 都调也不会重复塞（冷启动那条路径两者都会触发一次）。
+    private func attachIncomingFiles() {
+        let urls = IncomingFiles.shared.take()
+        guard !urls.isEmpty else { return }
+        var added = 0
+        for u in urls {
+            let ext = u.pathExtension.lowercased()
+            let isImage = ["jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp"]
+                .contains(ext)
+            if isImage, let d = Self.imageDataURL(for: u) {
+                pendingAttachments.append(PendingAttachment(
+                    kind: .image,
+                    displayName: u.lastPathComponent,
+                    dataURL: d,
+                    thumbnail: UIImage(contentsOfFile: u.path),
+                    bundleId: nil,
+                    fileURL: u
+                ))
+                added += 1
+            } else {
+                // 文件已在 IncomingFiles 里复制进沙盒（Documents/incoming），可直接读。
+                // 这里**不再**调 saveAttachmentToWorkspace：那样会再复制一份到
+                // uploads/，同一个文件在磁盘上出现两次（用户分享大 ipa 时很浪费）。
+                // 发送时若需要，现有逻辑会按 fileURL 正常读取。
+                pendingAttachments.append(PendingAttachment(
+                    kind: .file,
+                    displayName: u.lastPathComponent,
+                    dataURL: nil,
+                    thumbnail: nil,
+                    bundleId: nil,
+                    fileURL: u
+                ))
+                added += 1
+            }
+        }
+        if added > 0 {
+            showToast(L10n.t("i18n_1647", added))
+        }
+    }
+
     /// 选择完成：复制到工作区 uploads/（asCopy 已复制进沙盒，这里再落到 uploads 统一管理 + 防重名）
     private func handlePickedFiles(_ urls: [URL]) {
         for u in urls {
@@ -1976,12 +2124,11 @@ struct ThinkingPanel: View {
                 LiveTrailCard(steps: store.liveTrail)
                     .padding(.trailing, 16)
             }
-            if let status = store.statusText {
-                Text(status)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .padding(.trailing, 16)
-            }
+            // 2026-11-05：**这里原来还渲染一行 store.statusText**，与输入框上方那条
+            // RunStatusStrip 显示的是同一个字符串 —— 用户截图里同一个英文句子
+            // 在列表中间和底部各出现一次，就是这两个地方各画了一遍。
+            // 现在状态只由 RunStatusStrip 一处显示（它不随列表滚动，永远看得见），
+            // 这里不再重复。
             if store.requestRound > 0 {
                 // v4.3.71：无轮次上限 (requestRounds==0) 只显示"第 N 轮"
                 if store.requestRounds > 0 {
@@ -2008,38 +2155,113 @@ struct ThinkingPanel: View {
 /// 长得像结论，很容易被当成"整轮跑完了"（用户就是这么误判的）。
 /// 所以这里做一条不随列表滚动的常驻条：小菊花 + 当前动作 + 秒表，
 /// 只要 isLoading 就一直在，扫一眼就知道还在跑。
+///
+/// 2026-11-05 **用户定调（别再改）**：
+///   「让他的处理请求始终让我看见在操作就行了，让我知道完成了还是没完成，
+///     完成了就不提示了，没完成就一直提示着我」。
+///
+/// 所以这**一条**承担全部状态播报，别处不要再画第二份（列表里的
+/// ThinkingPanel 已去掉 statusText、ChatView 已去掉 WorkflowProgressView）：
+///   · 进行中：菊花转 + 当前动作 + 秒表，一直在，绝不隐藏；
+///   · 刚完成：短暂显示「✓ 完成 · 用时 m:ss」约 2 秒，然后自己消失；
+///   · 出错结束：显示「⚠️ 已停止 · 用时 m:ss」，同样 2 秒后消失。
+/// 三种状态共用同一条，位置固定，用户不用四处找。
 struct RunStatusStrip: View {
     @ObservedObject private var store = ConversationStore.shared
-    /// 本轮起始时间（ChatView 在 isLoading 翻转时写入；nil 时从 0 开始计）
-    let startedAt: Date?
+
+    /// 本轮开始时刻。**自己记，不接受外部传入**——理由：
+    /// ChatView 也在 `onChange(of: store.isLoading)` 里把 turnStartedAt 置 nil，
+    /// 两个 onChange 的触发顺序没有保证，从参数读会时而拿到 nil（完成播报就丢了用时）。
+    /// 本视图恒定挂在界面里（不在 if 分支内），@State 生命周期跟着页面走，自己记最稳。
+    @State private var startedAt: Date?
+    /// 刚结束时的收尾播报（nil = 不显示）。2 秒后自动清空。
+    @State private var finish: Finish?
+
+    private struct Finish: Equatable {
+        let text: String
+        let ok: Bool
+        let at: Date
+    }
 
     var body: some View {
-        if store.isLoading {
-            // TimelineView 每秒只刷新这一条，不会牵动消息列表
-            TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .scaleEffect(0.55)
-                        .frame(width: 14, height: 14)
-                    Text(title)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Spacer(minLength: 8)
-                    Text(Self.clock(ctx.date.timeIntervalSince(startedAt ?? ctx.date)))
-                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
-                        .foregroundColor(.secondary)
+        Group {
+            if store.isLoading {
+                // TimelineView 每秒只刷新这一条，不会牵动消息列表
+                TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                    row(spinner: true,
+                        text: title,
+                        ok: true,
+                        trailing: Self.clock(ctx.date.timeIntervalSince(startedAt ?? ctx.date)))
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 7)
-                .frame(maxWidth: .infinity)
-                .background(Color(.systemGray6).opacity(0.96))
+            } else if let f = finish {
+                row(spinner: false, text: f.text, ok: f.ok, trailing: nil)
+            }
+        }
+        // 2026-11-05：状态播报只在本视图内部处理（不牵动消息列表重算）。
+        // 首次出现时如果已经在跑（切会话 / 从别的页回来），onChange 不会触发，
+        // 这里补一次起点，否则秒表会一直从 0 开始数（每秒重置）。
+        .onAppear {
+            if store.isLoading, startedAt == nil { startedAt = Date() }
+        }
+        .onChange(of: store.isLoading) { loading in
+            if loading {
+                finish = nil
+                if startedAt == nil { startedAt = Date() }
+                return
+            }
+            // 结束：只有确实跑过一轮才播报（App 刚打开时的初始 false 不会进这里）
+            guard let s = startedAt else { return }
+            startedAt = nil
+            let secs = Date().timeIntervalSince(s)
+            let ok = !store.lastTurnHadError
+            // 用时太短（< 0.6 秒）基本是用户点发送又立刻点停止或被拒，
+            // 这种播报没有价值，直接不提示。
+            guard secs >= 0.6 else { return }
+            let f = Finish(text: ok
+                             ? L10n.t("status_turn_done", Self.clock(secs))
+                             : L10n.t("status_turn_stopped", Self.clock(secs)),
+                           ok: ok, at: Date())
+            finish = f
+            // 2 秒后自行消失（用户要求「完成了就不提示了」）。比对时间戳，
+            // 避免上一轮的延时把新一轮刚播的收尾又清掉。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                if let cur = self.finish, cur.at == f.at { self.finish = nil }
             }
         }
     }
 
-    /// 优先用 store 的实时状态（"正在请求模型 第 2 轮 · 调用 xxx"），
+    /// 三种状态共用同一行：左边图标（菊花 / ✓ / ⚠️）+ 文案 + 右边秒表
+    private func row(spinner: Bool, text: String, ok: Bool, trailing: String?) -> some View {
+        HStack(spacing: 8) {
+            if spinner {
+                ProgressView()
+                    .scaleEffect(0.55)
+                    .frame(width: 14, height: 14)
+            } else {
+                Image(systemName: ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(ok ? .green : .orange)
+                    .frame(width: 14, height: 14)
+            }
+            Text(text)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 8)
+            if let trailing {
+                Text(trailing)
+                    .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity)
+        .background(Color(.systemGray6).opacity(0.96))
+    }
+
+    /// 优先用 store 的实时状态（"请求中（第 2 轮） · 调用 xxx"），
     /// 没有就退回一句通用文案，别让条子空着——空着又变成"看不出在干嘛"。
     private var title: String {
         if let s = store.statusText, !s.isEmpty { return s }
@@ -2053,43 +2275,37 @@ struct RunStatusStrip: View {
     }
 }
 
-/// 2026-11-05：本轮结束标记（用户要求「需要加结束话语」）。
-/// 只有 isLoading 真的变回 false 才会出现，所以不会提前骗人说跑完了。
+/// 2026-11-05：本轮「过程中出错」清单（只有真出过错才出现）。
 ///
-/// 2026-11-05 追加：带上「过程中出错」清单。
 /// 用户原话：「在过程中如果出现什么错误他最后的总结报告里面就写一下就完了」——
-/// 工具卡已被折叠成一行，出错细节只剩这里能看到。所以只要本轮真出过错，
-/// 这行结束语下面就多出几行小字，一条一个失败，不用展开任何东西。
-struct TurnEndedNote: View {
-    let seconds: Double
-    /// 本轮失败过的步骤（人话，已去重截短）。空 = 全部顺利。
-    var issues: [String] = []
+/// 工具卡已被折叠成一行，出错细节只剩这里能看到。
+///
+/// 2026-11-05 **改版**：原来是「本轮结束 · 用时 X」+ 可展开的出错清单。
+/// 那句结束语现在合并到底部状态条了（一条不重复），这里只留清单本身：
+/// 默认一行「有 2 处没成」，点开铺开人话原因。
+struct TurnIssuesNote: View {
+    /// 本轮失败过的步骤（人话，已去重截短）。调用方保证非空。
+    let issues: [String]
     @State private var showIssues = false
 
     var body: some View {
         VStack(spacing: 4) {
             HStack(spacing: 5) {
-                Image(systemName: issues.isEmpty ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                Image(systemName: "exclamationmark.circle.fill")
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(issues.isEmpty ? .secondary : .orange)
-                Text(L10n.t("i18n_1621", RunStatusStrip.clock(seconds)))
-                    .font(.system(size: 11))
-                if !issues.isEmpty {
-                    // 可点：默认只显示"2 处没成"，点开才铺开，不占地方。
-                    Button(action: { withAnimation(.easeInOut(duration: 0.15)) { showIssues.toggle() } }) {
-                        HStack(spacing: 3) {
-                            Text(L10n.t("i18n_1643", issues.count))
-                                .font(.system(size: 11, weight: .medium))
-                            Image(systemName: showIssues ? "chevron.up" : "chevron.down")
-                                .font(.system(size: 8, weight: .semibold))
-                        }
-                        .foregroundColor(.orange)
+                    .foregroundColor(.orange)
+                Button(action: { withAnimation(.easeInOut(duration: 0.15)) { showIssues.toggle() } }) {
+                    HStack(spacing: 3) {
+                        Text(L10n.t("i18n_1643", issues.count))
+                            .font(.system(size: 11, weight: .medium))
+                        Image(systemName: showIssues ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 8, weight: .semibold))
                     }
-                    .buttonStyle(.plain)
+                    .foregroundColor(.orange)
                 }
+                .buttonStyle(.plain)
             }
-            .foregroundColor(issues.isEmpty ? .secondary.opacity(0.85) : .secondary)
-            if showIssues && !issues.isEmpty {
+            if showIssues {
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(Array(issues.enumerated()), id: \.offset) { _, line in
                         Text("· " + line)
@@ -2963,6 +3179,16 @@ struct MessageBubble: View, Equatable {
             // 模型误输出 DSML/antml 文本调用时，剥出工具段渲染为内联胶囊，
             // 工具调用绝不混进 AI 正文（原样文本只按代码块显示的旧行为废除）。
             let blocks = ContentBlocks.split(shown)
+            // 2026-11-05 **「未执行」卡片反复出现的第四个根因（渲染侧背锅）**：
+            //
+            // 这条消息如果已经挂着结构化 toolCalls —— 说明工具**真的执行过了**，
+            // 下面那些工具卡会显示真实的执行状态和结果。此时正文里再画一张
+            // 「未执行」的内联胶囊，是纯粹的自我矛盾：同一屏既有「运行了 1 个工具」
+            // 又有「未执行」，用户当然会觉得「总是这样提示」。
+            //
+            // 截图中就是这个组合。所以：只要 message.toolCalls 非空，
+            // 内联胶囊一律不画——正文里的 XML 段直接丢掉，只保留文字。
+            let hasRealToolCalls = !(message.toolCalls ?? []).isEmpty
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                     if block.kind == .text {
@@ -2997,7 +3223,10 @@ struct MessageBubble: View, Equatable {
                                 return .systemAction
                             })
                     } else {
-                        inlineToolCapsule(block)
+                        // 已有真实工具调用 → 不再画「未执行」胶囊（见上方注释）
+                        if !hasRealToolCalls {
+                            inlineToolCapsule(block)
+                        }
                     }
                 }
             }
@@ -3020,7 +3249,7 @@ struct MessageBubble: View, Equatable {
                     .foregroundColor(.primary)
                     .lineLimit(1)
                 Spacer()
-                Text(L10n.t("i18n_1259"))
+                Text(L10n.t("i18n_1648"))
                     .font(.caption2)
                     .foregroundColor(.orange)
             }

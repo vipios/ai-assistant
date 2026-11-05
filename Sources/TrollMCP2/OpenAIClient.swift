@@ -556,7 +556,7 @@ final class OpenAIClient {
                 if canFallback {
                     let next = chain[index + 1]
                     NetworkLog.shared.log("\(cfg.name) failed (code \(nsErr.code), \(String(describing: nsErr.localizedDescription.prefix(80)))) → fallback to \(next.name)")
-                    onStatus?("⚠️ \(cfg.name) failed, switching to backup model \(next.name)…")
+                    onStatus?(L10n.t("status_backup_model", cfg.name, next.name))
                     self?.attemptSend(chain: chain, index: index + 1, messages: messages, tools: tools,
                                       onStatus: onStatus, onDelta: onDelta, onThinking: onThinking, completion: completion)
                 } else {
@@ -997,7 +997,7 @@ final class OpenAIClient {
                     compacted[compacted.count - 1] = last
                 }
                 NetworkLog.shared.log("\(self.config.name) HTTP \(status) context overflow → reactive compact (keep last \(Self.reactiveLastKeep)), retrying L\(level)")
-                onStatus?("⚠️ context overflow → compacted to last \(Self.reactiveLastKeep) messages, retrying…")
+                onStatus?(L10n.t("status_ctx_overflow", Self.reactiveLastKeep))
                 self.attempt(level: level, isFirst: false, messages: compacted, tools: tools, onStatus: onStatus, onDelta: onDelta, onThinking: onThinking, avoidL5: avoidL5, completion: completion)
                 return
             }
