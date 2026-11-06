@@ -299,10 +299,19 @@ final class ProjectGenerateTweakTool: MCPTool {
         let bid = params["bundle_id"] as? String ?? ""
         let dir = Workspace.root.appendingPathComponent("projects/\(name)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // 2026-11-06 **架构必须跟着真机走，不能写死 arm64**。
+        //
+        // 真机实测：`dpkg --print-architecture` = `iphoneos-arm64e`（iOS 17.0.2 / A17 Pro）。
+        // 原来这里写死 `ARCHS = arm64`，于是：
+        //   · 编出来的 dylib 只有 arm64 切片，而 iOS 17 的系统进程（SpringBoard 等）是 arm64e，
+        //     dyld 加载时会因为架构不符直接拒绝 → 插件装上了但完全不生效；
+        //   · deb 的 control 里 Architecture 也跟着不对，Sileo 直接拒装。
+        // 所以改成按本机实际架构生成，arm64e 机器就出 arm64e。
+        let archs = Self.devicePackageArch()
         let makefile = """
         THEOS_PACKAGE_SCHEME=rootless
         TARGET = iphone:clang:latest:14.0
-        ARCHS = arm64
+        ARCHS = \(archs)
         INSTALL_TARGET_PROCESSES = SpringBoard
 
         TWEAK_NAME = \(name)
@@ -331,9 +340,57 @@ final class ProjectGenerateTweakTool: MCPTool {
         %end
         """
         try tweakX.write(to: dir.appendingPathComponent("Tweak.x"), atomically: true, encoding: .utf8)
-        AuditLog.shared.log("project.generate_tweak", detail: name)
+        // 2026-11-06 **顺带把 control 也生成出来，Architecture 用真机值**。
+        //   以前没生成 control，交给 CI 的兜底逻辑写，而 CI 那边是写死 iphoneos-arm64 的
+        //   —— 于是 Sileo 报「软件包体系结构(iphoneos-arm64)与本机系统体系结构(iphoneos-arm64e)不符」。
+        //   这里直接生成对的，CI 看到 control 已存在就不会覆盖（`[ ! -f control ]` 判断）。
+        let pkgArch = archs == "arm64e" ? "iphoneos-arm64e" : "iphoneos-arm64"
+        let control = """
+        Package: com.vipios.\(name.lowercased())
+        Name: \(name)
+        Version: 1.0.0
+        Architecture: \(pkgArch)
+        Description: built on device / CI
+        Maintainer: vipios
+        Section: Tweaks
+        Depends: mobilesubstrate
+        """
+        try control.write(to: dir.appendingPathComponent("control"), atomically: true, encoding: .utf8)
+        AuditLog.shared.log("project.generate_tweak", detail: "\(name) arch=\(archs) pkg=\(pkgArch)")
         return ["created": true, "path": "projects/\(name)", "name": name,
-                "files": ["Makefile", "Tweak.x", "\(name).plist"]]
+                "archs": archs, "package_architecture": pkgArch,
+                "files": ["Makefile", "Tweak.x", "\(name).plist", "control"]]
+    }
+
+    /// 2026-11-06 **按真机决定编译架构**。
+    ///
+    /// 判据优先级：
+    ///   1. 显式参数 `arch`（调用方知道自己在干什么时优先）；
+    ///   2. `dpkg --print-architecture` 的输出 —— 越狱机上这是最权威的（本机 = iphoneos-arm64e）；
+    ///   3. CPU 类型兜底：A12 及以后（含 A17 Pro）支持 arm64e，更老的只能 arm64。
+    ///
+    /// 为什么不无脑用 arm64e：arm64e 的指针带 PAC 签名，在 A11 及更老芯片上跑不起来。
+    /// 但用户这台是 iPhone16,2 (A17 Pro)，必须 arm64e，否则 tweak 注入系统进程不生效。
+    static func devicePackageArch() -> String {
+        if let e = ProcessInfo.processInfo.environment["TROLLAGENT_ARCH"], !e.isEmpty {
+            return e
+        }
+        // 2026-11-06 `BuildRunner` 是本工程已有的 posix_spawn 执行器（见 BuildTools.swift），
+        //   用它跑 dpkg 拿权威架构。注意：dpkg 必须在**真机根**上跑，
+        //   而 BuildRunner 直接 spawn 执行文件（不经 Alpine 容器），所以拿到的是真机 dpkg。
+        let r = BuildRunner.shared.run(executable: "/usr/bin/dpkg",
+                                       args: ["--print-architecture"],
+                                       timeout: 10)
+        if r.exitCode == 0 {
+            let out = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            if out.contains("arm64e") { return "arm64e" }
+            if out.contains("arm64") { return "arm64" }
+        }
+        // 兜底：iOS 16+ 的 A12 及以上芯片都支持 arm64e。
+        // 这里没法直接拿芯片代号，用系统版本粗判——比写死 arm64 安全得多，
+        // 因为写死 arm64 会在 iOS 17 上产出注入系统进程无效的 dylib。
+        if #available(iOS 16.0, *) { return "arm64e" }
+        return "arm64"
     }
 }
 

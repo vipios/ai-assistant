@@ -165,7 +165,7 @@ final class GitHubTriggerBuildTool: MCPTool {
             "source": "For source_mode=remote: repository URL",
             "inline_code": "For source_mode=inline: the full source code. Multiple files separated by lines '// ==== FILE: name.ext ====' (ObjC/C/Swift/Makefile all supported)",
             "project": "Alternative to inline_code: a tweak project name under workspace/projects/<name>; its files are collected and packed automatically (use this after project.generate_tweak)",
-            "arch": "For build-ios-dylib: arm64 (default) | arm64e",
+            "arch": "For build-ios-dylib: arm64e (default, required for iOS 17 system processes like SpringBoard/Siri) | arm64 (older devices only)",
             "min_ios": "For build-ios-dylib: minimum iOS version (default 15.0)",
             "tweak": "Legacy, only for build-tweak.yml: tweak project name",
             "ref": "Git branch (default main)"
@@ -213,7 +213,12 @@ final class GitHubTriggerBuildTool: MCPTool {
             inputs["source_mode"] = mode
             inputs["source"] = params["source"] as? String ?? ""
             inputs["inline_code"] = code
-            inputs["arch"] = params["arch"] as? String ?? "arm64"
+            // 2026-11-06 **默认架构改成 arm64e**。
+            //   用户手机 `dpkg --print-architecture` = iphoneos-arm64e（iOS 17.0.2 / A17 Pro）。
+            //   原来默认 arm64，模型不主动传 arch 时就会编出 arm64 的 dylib，
+            //   而 iOS 17 的系统进程（SpringBoard / Siri）是 arm64e，dyld 会拒绝加载
+            //   → 表现成「插件装上了但完全不生效」，比装不上更难查。
+            inputs["arch"] = params["arch"] as? String ?? "arm64e"
             inputs["min_ios"] = params["min_ios"] as? String ?? "15.0"
             // GitHub 单 input 上限 64KB，超了 dispatch 会 422 而报错信息很含糊。
             if code.utf8.count > 60000 {

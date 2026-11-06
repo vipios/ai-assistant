@@ -326,7 +326,11 @@ final class SystemPrompts {
     /// 环境探测的一次性快照（避免在一次拼装里反复读盘）。
     private static func envSnapshot() -> (jailbroken: Bool, hasDpkg: Bool, hasSileo: Bool, hasSubstrate: Bool) {
         let fm = FileManager.default
-        let jb = !DeviceProbe.jailbreakEvidence().isEmpty
+        // 2026-11-06 **必须调 DeviceProbe.isJailbroken() 这个统一入口**。
+        //   原来这里写 `!DeviceProbe.jailbreakEvidence().isEmpty`，和界面上 detect() 用的
+        //   是两套判据，已经实测分叉：界面显示"越狱"，而这里返回空 → AI 收到"非越狱"提示词。
+        //   收敛到单一入口后，两边不可能再打架。
+        let jb = DeviceProbe.isJailbroken()
         let dpkg = ["/usr/bin/dpkg", "/var/jb/usr/bin/dpkg", "/bin/dpkg"]
             .contains { fm.isExecutableFile(atPath: $0) }
         let sileo = ["/Applications/Sileo.app", "/var/jb/Applications/Sileo.app"]
@@ -339,13 +343,38 @@ final class SystemPrompts {
 
     private static var pathSection: String {
         let e = envSnapshot()
+        // 2026-11-06 **容器陷阱警告：无论越狱与否都要带上，这是最容易翻车的地方**。
+        //
+        // 实测事故：用户问"我这台越狱了吗"，AI 跑 `ls -l /usr/bin/dpkg` 看到 264800 字节
+        // root:root，又用 `apk info -W` 查出 "owned by dpkg-1.22.11-r0"、musl libc，
+        // 于是斩钉截铁判定"这是 Alpine 容器的 dpkg，不是手机的" → 结论「没越狱」。
+        // 而手机上真实的 /usr/bin/dpkg 是 **Mach-O 64-bit arm64、314688 字节 root:wheel**。
+        // 它每一步推理都对，唯一错在：**shell.exec 的 / 是容器根，不是手机根**。
+        // 这个坑不写进提示词，换成别的模型、别的问题还会再踩。
+        let containerTrap = """
+    - **CONTAINER TRAP — read this before any filesystem conclusion**:
+      `shell.exec` runs inside the bundled Alpine (TrollRuntime). Its `/` is the CONTAINER root,
+      NOT the phone's root. So `ls /Applications` or `ls /Library` there tells you NOTHING about the iPhone.
+      The container also has its own `/usr/bin/dpkg` (ELF, ~264KB, root:root, owned by apk package
+      `dpkg-1.22.11-r0`) — that is a Linux tool, it is NOT evidence about jailbreak status either way.
+      The phone's real dpkg is Mach-O (~314KB, root:wheel).
+      ⇒ To inspect the REAL device, never conclude from a bare path. Use one of:
+        (a) `system.exec_root` — runs a Mach-O binary on the iOS side (this is the real root);
+        (b) `device.probe` — returns authoritative `jailbroken` / package-manager facts, computed natively;
+        (c) `shell.exec` with `file <path>` — but ONLY to check the ELF-vs-Mach-O magic, not existence.
+      ⇒ `/ios_system` maps **only `/System`**, NOT the whole device root. `/Applications`, `/Library`,
+        `/basebin`, `/var/jb` are all OUTSIDE it — checking them under `/ios_system` always says "missing"
+        and that is a false negative, not evidence.
+      ⇒ If asked "is this device jailbroken / is X installed", call `device.probe` FIRST and quote its
+        answer. Never answer that question from a shell `ls`.
+    """
         if e.jailbroken {
             var tools: [String] = []
             if e.hasDpkg { tools.append("dpkg / dpkg-deb") }
             if e.hasSileo { tools.append("Sileo") }
             if e.hasSubstrate { tools.append("ElleKit(MobileSubstrate)") }
             let toolLine = tools.isEmpty ? "dpkg" : tools.joined(separator: " / ")
-            return """
+            return containerTrap + """
     - PATHS: **THIS DEVICE IS JAILBROKEN** (probe: \(toolLine) detected). A real filesystem exists —
       /usr/bin, /bin, /Library, /var/jb all work directly. Do NOT use the /ios_* auto-bind prefixes
       and do NOT set up alpine/iSH for file access; those are fallbacks for non-jailbroken devices only.
@@ -356,7 +385,7 @@ final class SystemPrompts {
       Re-spring needed after installing a tweak; `killall SpringBoard` is acceptable here.
     """
         }
-        return """
+        return containerTrap + """
     - PATHS: non-jailbroken has NO /bin/* — use app-bundled paths via auto-bind:
       Workspace→/ios_workspace(rw), /var/containers→/ios_containers(rw), /System→/ios_system(ro),
       appdata→/ios_appdata(ro), appgroups→/ios_appgroups(ro); bind_app <id>→/ios_data_<id> (ro) /

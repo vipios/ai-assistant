@@ -48,9 +48,9 @@ on:
         required: false
         default: ''
       arch:
-        description: '目标架构：arm64 / arm64e'
+        description: '目标架构：arm64 / arm64e。iOS 17 系统进程是 arm64e，注入 SpringBoard/Siri 之类必须选 arm64e'
         required: true
-        default: arm64
+        default: arm64e
       min_ios:
         description: '最低 iOS 版本'
         required: true
@@ -339,18 +339,43 @@ jobs:
           fi
           echo "===== 生成的 Makefile ====="
           cat Makefile
+          # 2026-11-06 **Architecture 必须跟着 ARCH 参数走，不能写死 iphoneos-arm64**。
+          #   这是「Sileo 说装不上」的直接原因：用户手机 `dpkg --print-architecture`
+          #   返回 `iphoneos-arm64e`，而这里写死 arm64 → Sileo 直接拒装并报
+          #   「软件包体系结构(iphoneos-arm64)与本机系统体系结构(iphoneos-arm64e)不符」。
+          #   之前 arch 参数已经传进来了（Makefile 的 ARCHS 用了它），但 control 里没跟上，
+          #   等于白传。现在按 ARCH 推导。
+          PKGARCH="iphoneos-arm64"
+          case "${ARCH}" in
+            arm64e) PKGARCH="iphoneos-arm64e" ;;
+            arm64)  PKGARCH="iphoneos-arm64" ;;
+            *)      PKGARCH="iphoneos-${ARCH}" ;;
+          esac
+          echo "package architecture -> ${PKGARCH} (from ARCH=${ARCH})"
           if [ ! -f control ]; then
             {
               echo "Package: com.vipios.${NAME}"
               echo "Name: ${NAME}"
               echo "Version: 1.0.0"
-              echo "Architecture: iphoneos-arm64"
+              echo "Architecture: ${PKGARCH}"
               echo "Description: built by CI"
               echo "Maintainer: vipios"
               echo "Section: Tweaks"
               echo "Depends: mobilesubstrate"
             } > control
+          else
+            # control 已存在（比如 App 端 project.generate_tweak 生成的），
+            # 但仍要确保架构正确——否则同样会被 Sileo 拒装。
+            if grep -q '^Architecture:' control; then
+              sed -i.bak "s/^Architecture:.*/Architecture: ${PKGARCH}/" control
+              echo "rewrote existing control Architecture -> ${PKGARCH}"
+            else
+              echo "Architecture: ${PKGARCH}" >> control
+              echo "appended Architecture: ${PKGARCH} to existing control"
+            fi
           fi
+          echo "===== control ====="
+          cat control
           # 没有 Filter plist 就补一个，tweak.mk 布局阶段需要它
           if ! ls *.plist >/dev/null 2>&1; then
             printf '{ Filter = { Bundles = ( "com.apple.springboard" ); }; }\n' > "${NAME}.plist"
@@ -361,7 +386,11 @@ jobs:
           # tail 只会截到末尾的无关内容，真正的 error 行被冲掉，
           # 于是「失败但看不到为什么」——这正是 deb 一直调不出来的体感来源。
           set +e
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless > /tmp/mk.log 2>&1
+          # 2026-11-06 **显式把 ARCHS 传给 make**，不要只依赖 Makefile 里那一行。
+          #   原因：Makefile 可能来自 App 端 `project.generate_tweak`（老版本写死 arm64），
+          #   也可能来自用户自己写的工程。命令行传入的变量优先级高于 Makefile 内部赋值，
+          #   所以这一句能保证「不管工程怎么写，最终编出来的架构都是 ARCH」。
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless ARCHS="${ARCH}" > /tmp/mk.log 2>&1
           MK=$?
           set -e
           echo "== make exit=$MK =="

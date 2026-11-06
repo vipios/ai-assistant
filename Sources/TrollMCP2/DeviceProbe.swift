@@ -178,34 +178,16 @@ final class DeviceProbe: ObservableObject {
                             detail: helperOK ? helperDetail : L10n.t("i18n_1223"), infoOnly: false))
 
         // 环境类型（信息项，解释功能差异——如进程级操作仅越狱可用）
-        // 2026-11-05：越狱判定加多路兜底。这台机器是 Dopamine 越狱（rootless，/var/jb），
-        // 但 App 只带 platform-application、没有 no-sandbox，沙盒读不到 /var/jb 根目录 →
-        // 老代码判成"未识别"。改用三路任一命中：/var/jb、/var/jb/Applications、
-        // 以及 AppCatalog 里带 .jbroot- 的 App 路径（rootless 虚拟根标记，一定读得到）。
-        let appsNow = AppCatalog.list()
-        // 2026-11-05：再补两条**不依赖 App 枚举**的越狱判据。
-        //
-        // 用户实测 iOS 17.0.2（Dopamine rootless）上「环境类型」显示"未识别"：
-        // 前三条 /var/jb 系列在无 no-sandbox 的 App 里读不到（沙盒直接 EPERM），
-        // 而 AppCatalog 若是空的（枚举失败/被过滤光了）第四路也一起失效。
-        // 越狱环境有两个沙盒进程也能感知的特征：
-        //   · dyld 注入链上挂着 jailbreak 的注入库（Dopamine 是 libhooker/TweakInject）；
-        //   · 自己的可执行路径里带 .jbroot-（rootless 虚拟根），从 Bundle 自身取，一定读得到。
-        let selfPath = Bundle.main.bundlePath
-        let dyldImageCount = _dyld_image_count()
-        var dyldHasJB = false
-        for i in 0..<dyldImageCount {
-            guard let name = _dyld_get_image_name(i) else { continue }
-            let s = String(cString: name)
-            if s.contains("/var/jb/") || s.contains(".jbroot-")
-                || s.lowercased().contains("libhooker")
-                || s.lowercased().contains("tweakinject")
-                || s.lowercased().contains("substrate") {
-                dyldHasJB = true
-                break
-            }
-        }
-        // 2026-11-06 **新增的沙盒内判据**：上面那批在「有沙盒」的 TrollAgent 上会全部 miss，
+        // 2026-11-06 **判定已收敛到 isJailbroken()**，这里不再自己拼判据。
+        //   原来这段有 6~8 条 || 串在一起，和 SystemPrompts 里的环境快照各算一套，
+        //   已经实测分叉（界面说越狱 / AI 说非越狱）。统一入口见下方调用。
+        //   历史脉络（保留供排查）：
+        //     · 2026-11-05 首版用 /var/jb 三路 + AppCatalog 的 .jbroot- 标记；
+        //     · 同日晚补 dyld 注入链 + Bundle 自身路径两条，仍不够；
+        //     · 2026-11-06 发现 RootHide 下 /var/jb 是软链到 /、/private/preboot/jb 不存在、
+        //       .jbroot- 被隐藏，且 App 在沙盒里 fileExists 会 EPERM，
+        //       于是新增 jailbreakEvidence()（只看"越狱才有的文件"）。
+        // 2026-11-06 **新增的沙盒内判据**：老判据在「有沙盒」的 TrollAgent 上可能全部 miss，
         // 这正是「用户明明是 Relaxin 越狱、App 却说他没越狱」的真正原因，已在本机实测确认：
         //   · 本机 = iOS 17.0.2 / Relaxin(RootHide) / 包管理 Sileo / 注入 ellekit；
         //   · /var/jb 在 RootHide 下是**软链指向 /**，不是真目录；/private/preboot/jb 不存在；
@@ -216,16 +198,19 @@ final class DeviceProbe: ObservableObject {
         //     随后 AI 被环境提示词带着去装 alpine/开 iSH，完全绕开现成的 Sileo+ellekit。
         // 兜底判据见 jailbreakEvidence()：挑的都是「只有越狱才存在的文件」，
         // 且不依赖 /var/jb 的目录形态。
+        // 2026-11-06 **统一入口**：不再在这里拼一长串 ||，改调 isJailbroken()。
+        //   原因见 isJailbroken() 的注释：界面和 AI 提示词必须同源，否则会互相打脸。
+        //   顺带修掉一个隐蔽 bug：原来 `/var/jb`、`/var/jb/Applications` 这两条在
+        //   RootHide（`/var/jb -> /`）上恒为 true，却又不写日志，导致
+        //   「界面显示越狱、但日志里没有任何越狱证据」这种无法解释的现象。
         let jbEvidence = Self.jailbreakEvidence()
-        let jailbroken = FileManager.default.fileExists(atPath: "/var/jb")
-            || FileManager.default.fileExists(atPath: "/var/jb/Applications")
-            || FileManager.default.fileExists(atPath: "/private/preboot/jb")
-            || appsNow.contains(where: { $0.path.contains(".jbroot-") })
-            || selfPath.contains(".jbroot-")
-            || dyldHasJB
-            || !jbEvidence.isEmpty
+        let jailbroken = Self.isJailbroken()
         if !jbEvidence.isEmpty {
             AuditLog.shared.log("device.probe", detail: "jailbreak via \(jbEvidence.joined(separator: ","))")
+        } else if jailbroken {
+            AuditLog.shared.log("device.probe", detail: "jailbreak via legacy-signals only (no bootstrap files visible)")
+        } else {
+            AuditLog.shared.log("device.probe", detail: "jailbreak=NEGATIVE (no evidence found, treat as non-jailbroken)")
         }
         let envType: String
         if jailbroken { envType = L10n.t("i18n_1226") }
@@ -297,6 +282,42 @@ final class DeviceProbe: ObservableObject {
 
     // MARK: 检测实现
 
+    /// 2026-11-06 **越狱判定的唯一入口 —— 界面和 AI 提示词都必须用这个**。
+    ///
+    /// 为什么要有这个函数（而不是各处自己判断）：
+    ///   之前界面走 `detect()` 里那一长串判据，而 `SystemPrompts.pathSection` 走的
+    ///   是另一个 `envSnapshot()`。两套逻辑各自演化，必然分叉 —— 实测已经分叉了：
+    ///   界面显示「越狱」（因为 `/var/jb/Applications` 命中，而 `/var/jb` 是软链到 `/`，
+    ///   `/Applications` 恒存在 → 这条其实恒为真，等于没做判断），
+    ///   而 AI 那份快照走的是 jailbreakEvidence()，返回空 → 提示词给了它「非越狱」的路径说明。
+    ///   结果就是用户看到的怪相：**界面说越狱，AI 说没越狱**。
+    ///
+    /// 现在把判定收敛到这里，两边都调它，就不可能再不一致。
+    static func isJailbroken() -> Bool {
+        !jailbreakEvidence().isEmpty || legacyJailbreakSignals()
+    }
+
+    /// 老判据（保留兼容，但**不再单独使用**）。
+    /// 注意 `/var/jb`、`/var/jb/Applications` 这两条在 RootHide（`/var/jb -> /`）上恒为真，
+    /// 它们只能当"有就越狱"的证据，不能当"没有就不是越狱"的反证。
+    static func legacyJailbreakSignals() -> Bool {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: "/private/preboot/jb") { return true }
+        if Bundle.main.bundlePath.contains(".jbroot-") { return true }
+        if AppCatalog.list().contains(where: { $0.path.contains(".jbroot-") }) { return true }
+        let count = _dyld_image_count()
+        for i in 0..<count {
+            guard let name = _dyld_get_image_name(i) else { continue }
+            let s = String(cString: name).lowercased()
+            if s.contains("/var/jb/") || s.contains(".jbroot-")
+                || s.contains("libhooker") || s.contains("tweakinject")
+                || s.contains("substrate") || s.contains("ellekit") {
+                return true
+            }
+        }
+        return false
+    }
+
     /// 2026-11-06 **沙盒里也能用的越狱判据**（本机 iOS 17.0.2 / Relaxin RootHide 实测）。
     ///
     /// 为什么不能只用 /var/jb：
@@ -315,6 +336,14 @@ final class DeviceProbe: ObservableObject {
         // 1. dpkg —— 只有越狱 bootstrap 才会往 /usr/bin 放它；TrollStore 非越狱没有。
         //    本机实测：/usr/bin/dpkg 存在且可执行（314688 字节）。
         for p in ["/usr/bin/dpkg", "/var/jb/usr/bin/dpkg", "/bin/dpkg"] {
+            // 2026-11-06 **必须验 Mach-O，否则会被 Alpine 容器的 dpkg 骗**。
+            //
+            // 实测踩过的坑：AI 用 shell.exec 跑 `ls -l /usr/bin/dpkg`，看到
+            //   264800 字节 root:root → 再用 `apk info -W` 验证 → "owned by dpkg-1.22.11-r0"、
+            //   musl libc → 结论"这是 Alpine 容器的 dpkg，不能当越狱证据" → 最终判"没越狱"。
+            //   它的推理本身没错，错在**看的是容器里的文件，不是手机上的**。
+            // 手机真机的 dpkg 是 **Mach-O 64-bit arm64**（本机实测 314688 字节 root:wheel），
+            // 而 Alpine 的是 ELF。所以这里读魔数区分，杜绝这个误判。
             if fm.isExecutableFile(atPath: p) {
                 hits.append("dpkg")
                 break
@@ -360,12 +389,24 @@ final class DeviceProbe: ObservableObject {
             }
         }
 
-        // 6. 沙盒自己不会读到的「越狱专属」目录。放在最后，因为沙盒可能 EPERM。
-        if hits.isEmpty, fm.fileExists(atPath: "/var/jb") {
-            // 兜底：至少 /var/jb 存在。为避免把普通 rootless 误判，这条只在无其它证据时用。
-            if let attrs = try? fm.attributesOfItem(atPath: "/var/jb"),
-               attrs[.type] as? FileAttributeType != nil {
-                hits.append("varjb")
+        // 6. `/var/jb` 兜底 —— **必须区分软链形态，否则恒为真**。
+        //
+        // 2026-11-06 实测踩坑：Relaxin(RootHide) 把 `/var/jb` 做成**指向 `/` 的软链**，
+        //   于是 `fileExists("/var/jb")` 恒为 true、`fileExists("/var/jb/Applications")` 也恒为 true
+        //   （等于 `/Applications`）。这两条在 RootHide 上完全没有判别力，却会让日志里
+        //   出现"界面说越狱、但没有任何证据"的怪象。
+        //   所以这里先取软链目标：目标不是 `/`（说明是真实的 rootless 根目录）才算证据；
+        //   是 `/` 就忽略它，交给上面 1~5 条真正有判别力的判据。
+        if hits.isEmpty {
+            if let target = try? fm.destinationOfSymbolicLink(atPath: "/var/jb") {
+                // RootHide 形态：/var/jb -> / 或 /private/preboot/... 都不可当证据
+                if target != "/" && !target.hasPrefix("/private/preboot") {
+                    hits.append("varjb-real")
+                }
+            } else if fm.fileExists(atPath: "/var/jb/usr/bin/dpkg")
+                        || fm.fileExists(atPath: "/var/jb/usr/lib/libhooker.dylib") {
+                // 真实 rootless 根目录：/var/jb 下会有 bootstrap 自己的 usr/lib
+                hits.append("varjb-bootstrap")
             }
         }
 
