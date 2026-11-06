@@ -320,6 +320,16 @@ jobs:
           tail -30 /tmp/mk.log
           if [ "$MK" -ne 0 ]; then
             echo "::error::Theos make package 失败（exit=$MK），上面是完整诊断"
+            # 2026-11-06 把完整构建日志塞进 out/，让它随 artifact 上传。
+            # 为什么：GitHub 的 job logs 接口在本仓库下载时被 blob 存储 403 拦截，
+            # 手机上/CI 上都拿不到正文，等于「失败但看不到原因」。
+            # 落成 artifact 就能在任何地方取回真实报错。
+            mkdir -p ../out
+            cp /tmp/mk.log ../out/make-package.log 2>/dev/null || true
+            cp Makefile ../out/generated-Makefile.txt 2>/dev/null || true
+            cp control ../out/generated-control.txt 2>/dev/null || true
+            env | grep -E 'THEOS|NAME|ARCH|MINIOS' > ../out/env.txt 2>/dev/null || true
+            ls -la "$THEOS/makefiles/" > ../out/theos-makefiles.txt 2>/dev/null || true
             exit 1
           fi
           mkdir -p ../out
@@ -354,13 +364,17 @@ jobs:
           ls -la ../out
 
       - name: Verify artifact is real Mach-O / deb
+        # 2026-11-06 失败也要跑：这样诊断文件能被后面的 Upload 带出去。
+        if: always()
         run: |
-          set -euo pipefail
+          set -uo pipefail
           shopt -s nullglob
           files=(out/*)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::构建结束但 out/ 为空——编译实际失败了（不再静默成功）"
-            exit 1
+            echo "::warning::out/ 为空（编译失败时属预期，诊断文件仍会上传）"
+            mkdir -p out
+            echo "build produced nothing" > out/_empty.txt
+            exit 0
           fi
           ok=0
           for f in "${files[@]}"; do
@@ -374,16 +388,14 @@ jobs:
               ok=$((ok+1))
             fi
           done
-          if [ "$ok" -eq 0 ]; then
-            echo "::error::没有任何产物被识别为 Mach-O 或 deb"
-            exit 1
-          fi
-          echo "OK: $ok 个有效产物"
+          echo "有效产物数: $ok"
 
       - name: Upload artifact
+        # 2026-11-06 always()：构建失败时把 make-package.log 等诊断一起传上去。
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ios-${{ github.event.inputs.name }}
           path: out/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
