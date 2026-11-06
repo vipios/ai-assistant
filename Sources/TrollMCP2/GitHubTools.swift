@@ -18,10 +18,31 @@ private enum GHStoreKeys {
 /// 轻量读取 GitHub 账号配置 (不依赖 UI 层 ObservableObject，可在工具线程安全读取）
 /// v4.3.66：由 private 改为 internal（InstallTools.swift 跨文件引用）
 struct GHConfig {
-    static var repoOwner: String { UserDefaults.standard.string(forKey: GHStoreKeys.owner) ?? "zrrt" }
+    /// 2026-11-06 **默认仓库必须和 GitHubAccountStore 完全一致，并且共用同一份上游值黑名单**。
+    ///
+    /// 原来的默认值写死成上游作者的 `zrrt/TrollAgent`，而 GitHubAccountStore 早就
+    /// 改成 `vipios/ai-assistant` 并在 load() 里做了迁移。两边不一致的直接后果：
+    ///   · 工具层（github.trigger_build / fetch_runs）读 UserDefaults，一旦键还没写进去
+    ///     就退回 `zrrt/TrollAgent`——那是别人的只读仓库，我们对它只有 pull 权限；
+    ///   · dispatch 打到那里必然 403/404，而且上游压根没有 build-ios-dylib.yml。
+    /// 这就是「让它编 deb 一直做不出来」的根因：请求根本没到能编 deb 的那个仓库。
+    ///
+    /// 现在改成引用 GitHubAccountStore 的常量，并用同一套迁移规则，杜绝两边再漂。
+    static var repoOwner: String {
+        let raw = UserDefaults.standard.string(forKey: GHStoreKeys.owner) ?? ""
+        // 上游作者仓库一律视为「尚未配置」，迁移到我们自己的仓库。
+        if raw.isEmpty || GitHubAccountStore.upstreamOwners.contains(raw) {
+            return GitHubAccountStore.defaultOwner
+        }
+        return raw
+    }
     static var repoName: String {
-        let n = UserDefaults.standard.string(forKey: GHStoreKeys.repo) ?? "TrollAgent"
-        return n == "trollmcp2" ? "TrollAgent" : n  // v7.1.285：旧仓库名迁移（trollmcp2 → TrollAgent）
+        let raw = UserDefaults.standard.string(forKey: GHStoreKeys.repo) ?? ""
+        // 上游仓库名（TrollAgent / trollmcp2）同样视为未配置。
+        if raw.isEmpty || GitHubAccountStore.upstreamRepos.contains(raw) {
+            return GitHubAccountStore.defaultRepo
+        }
+        return raw
     }
     static var workflowId: String { UserDefaults.standard.string(forKey: GHStoreKeys.workflow) ?? "build-trollmcp2.yml" }
     static var branch: String { UserDefaults.standard.string(forKey: GHStoreKeys.branch) ?? "main" }

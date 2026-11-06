@@ -58,7 +58,13 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # 2026-11-06 **必须是 macos-latest，绝不能再钉 macos-14**。
+    #   macos-14 已被 GitHub 退役，dispatch 之后 runner 分配不到，
+    #   run 会在 3 秒内变成 conclusion=cancelled 且 **一个 step 都没跑**，
+    #   日志一片空白——看起来像「触发了但什么都没发生」。
+    #   这正是「让它做 deb 一直做不出来」的真凶：请求发出去了，机器根本没起来。
+    #   build-trollmcp2.yml 一直用 macos-latest，所以它每次都能跑。
+    runs-on: macos-latest
     steps:
       - name: Checkout self
         if: ${{ github.event.inputs.source_mode == 'self' }}
@@ -131,10 +137,20 @@ jobs:
       - name: Install Theos (for tweak/deb builds)
         if: ${{ github.event.inputs.kind == 'deb' || steps.detect.outputs.logos == 'true' }}
         run: |
+          set -euo pipefail
           export THEOS="$RUNNER_TEMP/theos"
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
-          # 使用 Xcode 自带 SDK，避免下载私有 SDK
-          mkdir -p "$THEOS/sdks"
+          # 2026-11-06 **这里原来只 mkdir 了一个空的 sdks/ 就完事，是 deb 编不出来的第二个原因**：
+          #   · mkdir -p "$THEOS/sdks" 之后没有任何 SDK 进去 →
+          #     Theos 找不到 iPhoneOS SDK，common.mk 直接报 "Unable to locate iOS SDK"；
+          #   · 也没有安装 ldid/dpkg → tweak.mk 的签名与打包阶段命令不存在。
+          # build-tweak.yml 那两件事都做了，这个 workflow 漏了。
+          # 现在把 Xcode 自带 SDK 软链进去（免下载几 GB），并装 ldid + dpkg。
+          ln -sfn "$(xcrun --sdk iphoneos --show-sdk-path)" "$THEOS/sdks/iPhoneOS.sdk"
+          ls -l "$THEOS/sdks/"
+          ls -l "$THEOS/bin/dm.pl" || true
+          brew install ldid dpkg >/dev/null 2>&1 || brew install ldid
+          which ldid dpkg dpkg-deb || true
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
           echo "THEOS_MAKE_PATH=$THEOS/makefiles" >> "$GITHUB_ENV"
 
@@ -253,6 +269,11 @@ jobs:
           ${NAME}_FILES = \$(wildcard *.x *.xm *.m *.mm)
           ${NAME}_FRAMEWORKS = UIKit Foundation
           include \$(THEOS_MAKE_PATH)/tweak.mk
+          # 2026-11-06 **必须再加 package.mk，否则 `make package` 只编 dylib、根本不产 deb**。
+          # 原来这里只 include 了 tweak.mk —— 它负责把 Tweak 编成 dylib，
+          # 打包成 .deb 的规则在 package.mk 里。少这一行，make package 会「成功」结束，
+          # 接着 find 找不到 deb，报 "Theos 没产出 .deb"。
+          include \$(THEOS_MAKE_PATH)/package.mk
           EOF
           fi
           if [ ! -f control ]; then

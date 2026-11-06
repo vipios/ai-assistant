@@ -41,7 +41,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # 2026-11-06 macos-14 已退役，runner 分不到 → run 直接 cancelled、零步骤。
+    runs-on: macos-latest
     steps:
       - name: Checkout tool source
         uses: actions/checkout@v4
