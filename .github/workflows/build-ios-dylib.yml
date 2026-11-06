@@ -90,15 +90,39 @@ jobs:
           code = os.environ.get("INLINE_CODE", "")
           if not code.strip():
               raise SystemExit("inline_code 为空：source_mode=inline 时必须提供源码")
-          # 按 "// ==== FILE: xxx ====" 切分多文件；没有分隔符则视为单文件 main.m
+          # 按 "// ==== FILE: xxx ====" 切分多文件；没有分隔符则视为单文件
           parts = re.split(r'^//\s*====\s*FILE:\s*(.+?)\s*====\s*$', code, flags=re.M)
           if len(parts) == 1:
-              files = {"main.m": code}
+              # 2026-11-06 **这是 deb 一直编不出来的真正原因**。
+              #   原来无论内容是什么都写成 main.m。可 Logos 语法（%hook / %ctor / %end）
+              #   只有扩展名为 .x / .xm 时才会交给 Theos 的 Logos 预处理器；
+              #   .m 会被当作普通 ObjC 直接丢给 clang，于是报：
+              #       main.m:2:1: error: expected identifier or '('
+              #       2 | %hook SpringBoard
+              #   模型按工具说明传 kind=deb + 裸源码（不带 FILE 分隔行），
+              #   就 100% 撞这个错 —— 用户看到的「deb 一直做不出来」即此。
+              #   现在按内容自动选扩展名：含 Logos 指令 → main.x，否则维持 main.m。
+              logos_re = r'^[ \t]*%(hook|ctor|group|end|orig|new|property|subclass|config|dtor)\b'
+              is_logos = re.search(logos_re, code, flags=re.M) is not None
+              files = {"main.x" if is_logos else "main.m": code}
+              print("single-file mode ->", list(files)[0], "(logos=%s)" % is_logos)
           else:
               files = {}
               # parts = ['', name1, body1, name2, body2, ...]
               for i in range(1, len(parts) - 1, 2):
                   files[parts[i].strip()] = parts[i + 1]
+          # 2026-11-06 多文件模式也要纠正：名为 .m 但内容是 Logos 的，改成 .x。
+          #   否则模型自己写了 "// ==== FILE: Tweak.m ====" 一样会挂。
+          fixed = {}
+          for fn, body in files.items():
+              if fn.lower().endswith(".m"):
+                  logos_re2 = r'^[ \t]*%(hook|ctor|group|end|orig|new|property|subclass|config|dtor)\b'
+                  if re.search(logos_re2, body, flags=re.M):
+                      newfn = fn[:-2] + ".x"
+                      print("rename", fn, "->", newfn, "(contains Logos directives)")
+                      fn = newfn
+              fixed[fn] = body
+          files = fixed
           for fn, body in files.items():
               # 防目录穿越
               safe = fn.replace("..", "_").lstrip("/")
