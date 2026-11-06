@@ -3665,7 +3665,10 @@ final class ConversationStore: ObservableObject {
             consecutiveSameToolFailures = 1
         }
         lastFailedToolName = call.name
-        lastFailedToolArgs = Self.summarizeArgs(call.arguments)
+        // summarizeArgs 返回 String?（JSON 解析不出来就是 nil），字段是 String，
+        // 所以这里必须给默认值 —— 以前直接赋值，编译期就报
+        // "value of optional type 'String?' must be unwrapped to a value of type 'String'"。
+        lastFailedToolArgs = Self.summarizeArgs(call.arguments) ?? call.arguments
         lastFailedToolError = errorText
         toolFailuresThisTurn += 1
         diag("TOOL-FAIL: \(call.name) same=\(consecutiveSameToolFailures) total=\(toolFailuresThisTurn) err=\(errorText.prefix(160))")
