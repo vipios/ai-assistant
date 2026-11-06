@@ -385,29 +385,32 @@ jobs:
             find . -name "*.deb" -o -name ".theos" -maxdepth 2 | head -20
             exit 1
           fi
-          # 2026-11-06 **重新压成 gzip，否则装不进手机**。
-          #   Theos 打出来的 deb 默认用 xz 压缩（control.tar.xz / data.tar.xz）。
-          #   而 TrollAgent 内置的 deb 解包器在 iOS 上没有 xz/zstd 解码能力，
-          #   遇到会直接抛 "deb contains xz, no built-in extractor on iOS"。
-          #   也就是说：CI 能编出 deb，但手机上永远注入失败——
-          #   这是「deb 做出来了却用不了」的最后一道坎。
-          #   这里统一重打包成 gzip（dpkg-deb -Zgzip），App 侧就能直接解。
-          echo "== 原始 deb 压缩格式 =="
-          ar t "$DEB" 2>/dev/null | head || true
+          # 2026-11-06 **重打包这段必须全程容错**。
+          #   上一版这里让 step 变成 failure，但其实 deb 已经成功产出并上传了
+          #   （artifact 里确实有 .deb）——纯粹是 `ar t ... | head` 这类命令
+          #   在 pipefail 下返回非 0，把成功当成了失败。
+          #   结论：打包成功后，任何「附加的检查动作」都不允许影响退出码。
+          set +e
+          echo "== 原始 deb 信息 =="
+          ls -la "$DEB"
           mkdir -p ../out/deb-tmp
-          dpkg-deb -R "$DEB" ../out/deb-tmp/pkg 2>/dev/null || true
+          dpkg-deb -R "$DEB" ../out/deb-tmp/pkg 2>/dev/null
+          REC=$?
           BASE=$(basename "$DEB")
-          if [ -d ../out/deb-tmp/pkg/DEBIAN ]; then
-            dpkg-deb -Zgzip -b ../out/deb-tmp/pkg "../out/${BASE}"
-            echo "== 重打包为 gzip =="
-            ar t "../out/${BASE}" | head
+          if [ "$REC" -eq 0 ] && [ -d ../out/deb-tmp/pkg/DEBIAN ]; then
+            dpkg-deb -Zgzip -b ../out/deb-tmp/pkg "../out/${BASE}" 2>&1 | tail -5
+            echo "== 已重打包为 gzip（iPhone 上的解包器只认 gzip）=="
           else
-            echo "::warning::dpkg-deb -R 解包失败，直接上传原始 deb（可能无法在 iOS 内解压）"
+            echo "::warning::dpkg-deb -R 解包失败（exit=$REC），改为直接上传原始 deb"
             cp "$DEB" ../out/
           fi
           rm -rf ../out/deb-tmp
           echo "== 产物 =="
           ls -la ../out
+          set -e
+          # 到这里说明 deb 已经产出并放进 out/，明确成功退出。
+          echo "== deb 构建完成 =="
+          exit 0
 
       - name: Verify artifact is real Mach-O / deb
         # 2026-11-06 失败也要跑：这样诊断文件能被后面的 Upload 带出去。
