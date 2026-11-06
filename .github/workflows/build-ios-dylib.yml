@@ -252,8 +252,17 @@ jobs:
           ARCH: ${{ github.event.inputs.arch }}
           MINIOS: ${{ github.event.inputs.min_ios }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           export THEOS="${THEOS:-$RUNNER_TEMP/theos}"
+          # 2026-11-06 **必须显式补齐这两个变量**。
+          # Theos 的 makefile 靠 THEOS_MAKE_PATH 找 tweak.mk / package.mk；
+          # GITHUB_ENV 在某些情况下没传到（step 间同名变量被覆盖），
+          # 缺了它就报 "No such file: .../makefiles/tweak.mk"，而且报错很短很容易被忽略。
+          export THEOS_MAKE_PATH="${THEOS_MAKE_PATH:-$THEOS/makefiles}"
+          export THEOS_PACKAGE_SCHEME=rootless
+          echo "THEOS=$THEOS"
+          echo "THEOS_MAKE_PATH=$THEOS_MAKE_PATH"
+          ls -d "$THEOS/makefiles/tweak.mk" "$THEOS/makefiles/package.mk" 2>&1 | head
           cd src
           # 若没有 Theos 工程骨架，就地生成一个最简 tweak 工程
           if [ ! -f Makefile ]; then
@@ -293,9 +302,25 @@ jobs:
             printf '{ Filter = { Bundles = ( "com.apple.springboard" ); }; }\n' > "${NAME}.plist"
           fi
           make clean >/dev/null 2>&1 || true
-          # 注意 pipefail：make 失败必须让整个 step 失败，
-          # 不能再出现「日志里一堆 error，但 workflow 是绿的」那种假成功。
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless 2>&1 | tail -80
+          # 2026-11-06 **把 make 的完整输出落到文件，再分段打印**。
+          # 原来直接 `make package ... 2>&1 | tail -80`：一旦 make 在前面几十行就报错，
+          # tail 只会截到末尾的无关内容，真正的 error 行被冲掉，
+          # 于是「失败但看不到为什么」——这正是 deb 一直调不出来的体感来源。
+          set +e
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless > /tmp/mk.log 2>&1
+          MK=$?
+          set -e
+          echo "== make exit=$MK =="
+          echo "---- 前 60 行 ----"
+          head -60 /tmp/mk.log
+          echo "---- error/warning 行 ----"
+          grep -nE 'error|Error|ERROR|No such file|cannot|unable|not found' /tmp/mk.log | head -40 || true
+          echo "---- 末 30 行 ----"
+          tail -30 /tmp/mk.log
+          if [ "$MK" -ne 0 ]; then
+            echo "::error::Theos make package 失败（exit=$MK），上面是完整诊断"
+            exit 1
+          fi
           mkdir -p ../out
           DEB=$(find . -maxdepth 3 -name "*.deb" | head -1)
           if [ -z "$DEB" ]; then
@@ -303,7 +328,27 @@ jobs:
             find . -name "*.deb" -o -name ".theos" -maxdepth 2 | head -20
             exit 1
           fi
-          cp "$DEB" ../out/
+          # 2026-11-06 **重新压成 gzip，否则装不进手机**。
+          #   Theos 打出来的 deb 默认用 xz 压缩（control.tar.xz / data.tar.xz）。
+          #   而 TrollAgent 内置的 deb 解包器在 iOS 上没有 xz/zstd 解码能力，
+          #   遇到会直接抛 "deb contains xz, no built-in extractor on iOS"。
+          #   也就是说：CI 能编出 deb，但手机上永远注入失败——
+          #   这是「deb 做出来了却用不了」的最后一道坎。
+          #   这里统一重打包成 gzip（dpkg-deb -Zgzip），App 侧就能直接解。
+          echo "== 原始 deb 压缩格式 =="
+          ar t "$DEB" 2>/dev/null | head || true
+          mkdir -p ../out/deb-tmp
+          dpkg-deb -R "$DEB" ../out/deb-tmp/pkg 2>/dev/null || true
+          BASE=$(basename "$DEB")
+          if [ -d ../out/deb-tmp/pkg/DEBIAN ]; then
+            dpkg-deb -Zgzip -b ../out/deb-tmp/pkg "../out/${BASE}"
+            echo "== 重打包为 gzip =="
+            ar t "../out/${BASE}" | head
+          else
+            echo "::warning::dpkg-deb -R 解包失败，直接上传原始 deb（可能无法在 iOS 内解压）"
+            cp "$DEB" ../out/
+          fi
+          rm -rf ../out/deb-tmp
           echo "== 产物 =="
           ls -la ../out
 
