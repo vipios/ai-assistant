@@ -394,6 +394,213 @@ final class ProjectGenerateTweakTool: MCPTool {
     }
 }
 
+// MARK: - 2026-11-06 deb 打包（机制强制架构，不靠模型记）
+
+/// 把工作区里的一个目录打成 .deb，**Architecture 由代码从真机读，不让模型写**。
+///
+/// 为什么必须有这个工具（实测事故）：
+///   用户让 AI「先验证一下 deb 打包链路」，AI 用 `shell.exec` 手搓了一个包并宣布"链路跑通了"。
+///   它写的是 `Architecture: iphoneos-arm64`，而这台机器 `dpkg --print-architecture`
+///   是 **`iphoneos-arm64e`**（iOS 17.0.2 / A17 Pro，已实测两次）。
+///   结果是：包能编出来、`dpkg-deb -I` 也读得出，但 **Sileo 会直接拒装**，报
+///   「软件包体系结构(iphoneos-arm64)与本机系统体系结构(iphoneos-arm64e)不符」。
+///
+///   技术上空跑通了，实际一件事都干不成 —— 而 AI 会把这个结论当成"可以直接用了"继续往下走，
+///   等到装的时候才发现，中间白干。这类"看起来成功"比直接报错更浪费时间。
+///
+/// 所以：Architecture 这个字段**不允许由模型提供**。它可以不传（走真机探测），
+/// 传了也要先校验，不匹配就拒绝并把真机值告诉它 —— 宁可让它第一次就撞墙，也别让它错着往下走。
+final class DebBuildTool: MCPTool {
+    let definition = ToolDefinition(
+        name: "package.deb",
+        summary: """
+        Build a .deb from a staged directory. Use for: turn a built dylib + plist into an installable Sileo package, repack an existing deb's payload, verify packaging before handing to the user. Don't use for: compiling a dylib (that needs macOS/CI — use github.trigger_build), extracting an existing deb (that is archive.extract).
+        CRITICAL: the Architecture field is decided by the code from this real device (`dpkg --print-architecture`) — you must NOT hand-write it. Passing `arch` that disagrees with the device is rejected on purpose, because a mismatched package installs nowhere (Sileo: "package architecture (X) does not match system architecture (Y)").
+        Typical tweak payload layout inside stage_dir: Library/MobileSubstrate/DynamicLibraries/<Name>.dylib + <Name>.plist, plus any resources.
+        Returns the real .deb path, the control fields as written, and the exact `Architecture` used, so you can quote it back to the user instead of guessing.
+        Example: user says 'package this tweak' → package.deb stage_dir:"projects/MyTweak/stage" package:"com.vipios.mytweak" name:"MyTweak"
+        """,
+        parameters: [
+            "stage_dir": "REQUIRED: directory containing the payload tree as it should appear on the device (e.g. Library/... , usr/...). Relative paths resolve against the workspace root.",
+            "output": "Optional: output .deb path (relative to workspace, or absolute inside it). Default <stage_dir>/../<package>_<version>_<arch>.deb",
+            "package": "Optional: control Package field, e.g. com.vipios.mytweak. Default com.trollagent.unnamed",
+            "name": "Optional: control Name (display name). Default = last path component of stage_dir",
+            "version": "Optional: control Version. Default 1.0.0",
+            "description": "Optional: control Description. Default 'built on device'",
+            "maintainer": "Optional: control Maintainer. Default 'TrollAgent'",
+            "section": "Optional: control Section. Default 'Tweaks'",
+            "depends": "Optional: control Depends. Default 'mobilesubstrate'. Pass \"\" for none.",
+            "arch": "Optional but DISCOURAGED: asserting the package architecture. Leave empty to use the real device value. A value that disagrees with `dpkg --print-architecture` is rejected.",
+            "compression": "Optional: 'gzip' (default, safest for iOS) | 'xz' | 'none'",
+        ],
+        returns: [
+            "path": "absolute path of the produced .deb",
+            "size": "bytes",
+            "architecture": "the Architecture actually written into control",
+            "control": "the control file content as written",
+            "verified": "true when dpkg-deb -I read the package back successfully",
+        ],
+        verified: false, category: "build")
+
+    func invoke(_ params: [String: Any]) throws -> [String: Any] {
+        guard let stageRaw = params["stage_dir"] as? String,
+              !stageRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw MCPError.invalidParams("stage_dir required — pass the directory whose contents should land on the device (e.g. 'projects/MyTweak/stage')")
+        }
+
+        // ---- 1. 定位 stage 目录（相对路径按工作区解析，绝对路径必须在工作区内）----
+        let stage = Self.resolve(stageRaw)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: stage.path, isDirectory: &isDir), isDir.boolValue else {
+            throw MCPError.invalidParams("stage_dir not found or not a directory: \(stage.path). Create it and put the payload tree inside first.")
+        }
+        // 空目录打出来的包是废包，提前拦住（比事后 Sileo 报错好查）
+        let payloadCount = (try? FileManager.default.contentsOfDirectory(atPath: stage.path))?.count ?? 0
+        if payloadCount == 0 {
+            throw MCPError.invalidParams("stage_dir is empty: \(stage.path). A deb with no files installs nothing — put the dylib/plist/resources in first.")
+        }
+
+        // ---- 2. 架构：真机说了算 ----
+        let realArch = ProjectGenerateTweakTool.devicePackageArch()
+        let pkgArch = realArch.contains("arm64e") ? "iphoneos-arm64e"
+            : (realArch.contains("arm64") ? "iphoneos-arm64" : "iphoneos-\(realArch)")
+        if let claimed = params["arch"] as? String,
+           !claimed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           claimed != pkgArch {
+            // 刻意拒绝，而不是"帮它改掉"。要让它知道真机是什么，
+            // 否则它下次还会在别的地方（CI 的 control、手写 dpkg-deb）写错。
+            throw MCPError.invalidParams(
+                "refused: arch \"\(claimed)\" does not match this device. "
+                + "This device runs \(pkgArch) (dpkg --print-architecture). "
+                + "A deb built for \(claimed) is rejected by Sileo with \"package architecture (\(claimed)) does not match system architecture (\(pkgArch))\" — "
+                + "it builds fine but installs nowhere. Omit `arch` and let the tool use the real value."
+            )
+        }
+
+        // ---- 3. 组装 control ----
+        let pkg = (params["package"] as? String)?.trimmed ?? "com.trollagent.unnamed"
+        let displayName = (params["name"] as? String)?.trimmed
+            ?? stage.lastPathComponent
+        let version = (params["version"] as? String)?.trimmed ?? "1.0.0"
+        let desc = (params["description"] as? String)?.trimmed ?? "built on device"
+        let maint = (params["maintainer"] as? String)?.trimmed ?? "TrollAgent"
+        let section = (params["section"] as? String)?.trimmed ?? "Tweaks"
+        let dependsRaw = params["depends"] as? String
+        let depends = dependsRaw?.trimmed ?? "mobilesubstrate"
+
+        var controlLines = [
+            "Package: \(pkg)",
+            "Name: \(displayName)",
+            "Version: \(version)",
+            "Architecture: \(pkgArch)",
+            "Description: \(desc)",
+            "Maintainer: \(maint)",
+            "Section: \(section)",
+        ]
+        if !depends.isEmpty { controlLines.append("Depends: \(depends)") }
+        let controlContent = controlLines.joined(separator: "\n") + "\n"
+
+        // ---- 4. 交给容器里的 dpkg-deb 打包 ----
+        // 为什么用容器里的 dpkg-deb 而不是自己写 ar+tar：
+        //   · 工程里 ArReader 只能读不能写，Gzip 只有解压没有压缩，手写等于重造一套还得自己保证格式正确；
+        //   · 容器里的 dpkg-deb 是 Debian 官方实现（apk 包 dpkg-1.22.11-r0），产出格式天然正确；
+        //   · 用户实测过这条路能跑通（666 字节的测试包 dpkg-deb -I / -c 都读得出来）。
+        //   · 注意：这是 Linux 侧工具打的包，但 .deb 是纯归档格式、与宿主无关，iOS 上照样能装。
+        let compFlag: String
+        switch (params["compression"] as? String)?.trimmed.lowercased() ?? "gzip" {
+        case "xz": compFlag = "-Zxz"
+        case "none": compFlag = "-Znone"
+        default: compFlag = "-Zgzip"   // gzip 最保险：iOS 侧解压支持面最广
+        }
+
+        // stage 目录在容器里的可见路径：工作区被 bind 到 /ios_workspace
+        let workspacePath = Workspace.root.standardizedFileURL.path
+        let stagePath = stage.standardizedFileURL.path
+        guard stagePath.hasPrefix(workspacePath) else {
+            throw MCPError.invalidParams("stage_dir must live inside the workspace (\(workspacePath)) so the container can read it. Got: \(stagePath)")
+        }
+        let rel = String(stagePath.dropFirst(workspacePath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let containerStage = "/ios_workspace/\(rel)"
+
+        // control 写进 stage 的 DEBIAN 目录（dpkg-deb -b 的约定：DEBIAN/ 同级放 payload）。
+        // 注意不要手写 DEBIAN/debian-binary —— 那是**解开后的包**才有的文件，
+        // 交给 dpkg-deb 自己生成。手写反而可能让它当成 payload 打进去或直接报错。
+        let debianDir = stage.appendingPathComponent("DEBIAN", isDirectory: true)
+        try FileManager.default.createDirectory(at: debianDir, withIntermediateDirectories: true)
+        try controlContent.write(to: debianDir.appendingPathComponent("control"), atomically: true, encoding: .utf8)
+        // 用户可能把旧的 debian-binary 留在 DEBIAN 里（上次手工打包残留），清掉免得干扰
+        try? FileManager.default.removeItem(at: debianDir.appendingPathComponent("debian-binary"))
+
+        let outURL: URL = {
+            if let o = (params["output"] as? String)?.trimmed, !o.isEmpty {
+                return Self.resolve(o)
+            }
+            return stage.deletingLastPathComponent()
+                .appendingPathComponent("\(pkg)_\(version)_\(pkgArch).deb")
+        }()
+        // dpkg-deb 在容器里跑，输出路径也要用容器视角
+        let outPath = outURL.standardizedFileURL.path
+        guard outPath.hasPrefix(workspacePath) else {
+            throw MCPError.invalidParams("output must live inside the workspace so the container can write it. Got: \(outPath)")
+        }
+        let outRel = String(outPath.dropFirst(workspacePath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let containerOut = "/ios_workspace/\(outRel)"
+        try? FileManager.default.createDirectory(at: outURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // 覆盖前先删，否则 dpkg-deb 可能拒绝或留下旧文件
+        try? FileManager.default.removeItem(at: outURL)
+
+        // DEBIAN 就放在 stage 内，dpkg-deb -b 会正确剥离它、不把它打进 data.tar。
+        let cmd = "cd / && dpkg-deb \(compFlag) -b '\(containerStage)' '\(containerOut)' 2>&1"
+        AuditLog.shared.log("package.deb", detail: "arch=\(pkgArch) pkg=\(pkg) stage=\(containerStage) out=\(containerOut)")
+        let (out, code, timedOut) = TrollRuntimeEngine.exec(cmd, timeout: 120)
+        if timedOut {
+            throw MCPError.failed("dpkg-deb timed out after 120s building \(containerStage)")
+        }
+        guard code == 0 else {
+            throw MCPError.failed("dpkg-deb failed (exit \(code)): \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        guard FileManager.default.fileExists(atPath: outPath) else {
+            throw MCPError.failed("dpkg-deb reported success but no file at \(outPath). Output: \(out.prefix(500))")
+        }
+
+        // ---- 5. 回读校验：确认包真的能读、架构真的是对的 ----
+        // 不做这一步就等于"以为成功了"。用户这次踩的正是这个坑：
+        // 包编出来了，但架构是错的，谁都没发现。
+        let verify = TrollRuntimeEngine.exec("dpkg-deb -I '\(containerOut)' 2>&1 | head -30", timeout: 30)
+        let info = verify.output
+        let archOK = info.contains("Architecture: \(pkgArch)")
+        let size = (try? FileManager.default.attributesOfItem(atPath: outPath)[.size] as? Int) ?? 0
+
+        var result: [String: Any] = [
+            "ok": true,
+            "path": outPath,
+            "size": size,
+            "architecture": pkgArch,
+            "control": controlContent,
+            "verified": archOK,
+            "dpkg_info": String(info.prefix(1500)),
+        ]
+        if !archOK {
+            // 走到这里说明产出与预期不符——宁可报错，也不要让 AI 把错包交给用户
+            result["warning"] = "Architecture readback mismatch: expected \(pkgArch) but dpkg-deb -I did not show it. Do NOT hand this package to the user — inspect dpkg_info."
+            AuditLog.shared.log("package.deb", detail: "ARCH READBACK MISMATCH expected=\(pkgArch) info=\(info.prefix(300))")
+        }
+        result["note"] = "Install with Sileo (or `dpkg -i`) on this device. Architecture \(pkgArch) matches this device's dpkg — no mismatch error expected."
+        return result
+    }
+
+    /// 相对路径按工作区解析；绝对路径原样返回（后面再校验是否在工作区内）。
+    private static func resolve(_ p: String) -> URL {
+        let t = p.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.hasPrefix("/") { return URL(fileURLWithPath: t).standardizedFileURL }
+        return Workspace.root.appendingPathComponent(t).standardizedFileURL
+    }
+}
+
+private extension String {
+    var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
+}
+
 final class ModelConfigTool: MCPTool {
     let definition = ToolDefinition(name: "model.config", summary: "View LLM model configurations (which AI models are available). Use for: check what AI models are configured, see current default model. Don't use for: change model (use model.update), system overview (use tools.audit). Example: user says 'which model am I using' → show model config.",
         parameters: ["action": "list (all configs) or default (current default)"], verified: true)

@@ -205,7 +205,11 @@ final class GitHubAccountStore: ObservableObject {
         let cid = clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? Self.defaultClientID
             : clientID.trimmingCharacters(in: .whitespacesAndNewlines)
-        var req = URLRequest(url: URL(string: "\(loginBase)/login/device/code")!, timeoutInterval: 30)
+        // 2026-11-06：超时 30s → 12s。
+        //   用户报「点『在浏览器中登录』没反应」，而 GitHub 端点本身在本机实测
+        //   1.4s 就返回 200。手机上要 30 秒才失败，这 30 秒里界面完全没反馈
+        //   = 在用户看来就是「按钮坏了」。缩短后失败更快暴露、也更快能重试。
+        var req = URLRequest(url: URL(string: "\(loginBase)/login/device/code")!, timeoutInterval: 12)
         setHTTPMethod("POST", on: &req)
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -217,8 +221,19 @@ final class GitHubAccountStore: ObservableObject {
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 if let err = err {
-                    self.lastError = L10n.t("i18n_807", err.localizedDescription)
-                    completion(nil, self.lastError)
+                    // 2026-11-06：超时/断网必须说清是**网络**问题、且给出可操作方向。
+                    //   以前只显示 "网络错误: The request timed out."，用户不知道
+                    //   该去查代理还是查 GitHub。
+                    let ns = err as NSError
+                    let isTimeout = ns.domain == NSURLErrorDomain
+                        && (ns.code == NSURLErrorTimedOut || ns.code == NSURLErrorCannotConnectToHost
+                            || ns.code == NSURLErrorNotConnectedToInternet
+                            || ns.code == NSURLErrorNetworkConnectionLost)
+                    let detail = isTimeout
+                        ? "网络错误: 连不上 github.com（\(ns.code)）。若开着 VPN/代理/分流规则，请让 github.com 直连或走可用节点；也可改用下方「手动 TOKEN」登录。"
+                        : L10n.t("i18n_807", err.localizedDescription)
+                    self.lastError = detail
+                    completion(nil, detail)
                     return
                 }
                 let status = (resp as? HTTPURLResponse)?.statusCode ?? 0

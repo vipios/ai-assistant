@@ -2065,7 +2065,7 @@ final class ShellStopTool: MCPTool {
 final class SystemExecRootTool: MCPTool {
     let definition = ToolDefinition(
         name: "system.exec_root",
-        summary: "Execute a Mach-O binary on the iOS system side (root posix_spawn, NOT the Linux container) — ONLY for iOS-native Mach-O tools; NEVER for normal commands (ls/cat/grep/ps/df/tar and ELF/scripts go to shell.exec, they are rejected here) — RED LINE: non-jailbroken (TrollStore-only) devices have NO /var/jb, so /bin/* and /usr/bin/* DO NOT EXIST (/bin/ls, /bin/ps, /usr/bin/find all fail) — locate the app-bundled Mach-O tool first with shell.exec \"find /ios_containers -name <tool>\" (also try /ios_system, /ios_workspace), then pass that real path; jailbroken devices use /var/jb/usr/bin/<tool> directly — Use for: run jailbreak-native Mach-O tools from jroot — /var/jb/usr/bin/ldid, clang, dpkg-deb, theos binaries — which the container shell.exec CANNOT execute (TrollRuntime Alpine kernel is Linux/ELF, rejects Apple Mach-O with ENOEXEC format error) — Also fine for bundled ldid — Don't use for: normal commands (use shell.exec), apk-installed Linux tools (they are ELF, run in shell.exec), scripts or ELF files (will be rejected — they belong in shell.exec) — Example: jailbroken sign → system.exec_root path:/var/jb/usr/bin/ldid args:[\"-S\",\"/path/file\"]; TrollStore sign → first find the bundled ldid (shell.exec find), then system.exec_root path:<that path> args:[\"-S\",\"/path/file\"] — exit=0 means success, nonzero means the tool itself failed (read its error) — stdout/stderr returned separately; binary stdout (ldid -e bplist) → raw_base64.",
+        summary: "Execute a Mach-O binary on the iOS system side (root posix_spawn, NOT the Linux container) — ONLY for iOS-native Mach-O tools; NEVER for normal commands (ls/cat/grep/ps/df/tar and ELF/scripts go to shell.exec, they are rejected here) — This is the ONLY way to touch the real device filesystem; shell.exec's / is the container root and tells you nothing about iOS paths — If a path is missing here, that means the path or tool is missing, NOT that the device lacks a jailbreak (call device.probe for jailbreak status) — Use for: run jailbreak-native Mach-O tools from jroot — /var/jb/usr/bin/<tool> (ldid, clang, dpkg, dpkg-deb, theos binaries) — which the container shell.exec CANNOT execute (TrollRuntime Alpine kernel is Linux/ELF, rejects Apple Mach-O with ENOEXEC format error) — Also fine for app-bundled Mach-O (find it with shell.exec \"find /ios_containers -name <tool>\") — Don't use for: normal commands (use shell.exec), apk-installed Linux tools (they are ELF, run in shell.exec), scripts or ELF files (will be rejected — they belong in shell.exec) — Example: jailbroken sign → system.exec_root path:/var/jb/usr/bin/ldid args:[\"-S\",\"/path/file\"]; armlist → system.exec_root path:/usr/bin/dpkg args:[\"--print-architecture\"] — exit=0 means success, nonzero means the tool itself failed (read its error) — stdout/stderr returned separately; binary stdout (ldid -e bplist) → raw_base64.",
         parameters: [
             "path": "Absolute path of the Mach-O binary to execute (required). Must exist and be a real Mach-O (elf/script → rejected with a hint to use shell.exec)",
             "args": "Optional array of argument strings (default empty)",
@@ -2220,16 +2220,33 @@ final class SystemExecRootTool: MCPTool {
             guard kind == "EXEC" else {
                 // v7.2.2：/bin/、/usr/ 前缀 = 越狱专属系统路径——非越狱(TrollStore)设备根本不存在，
                 // 给 AI 专门引导，避免反复拿 /bin/ls、/usr/bin/find 试错死循环
+                //
+                // 2026-11-06 **改：不能再无条件断言「本机没越狱」**。
+                //   原来这里写死 "non-jailbroken (TrollStore) devices have NO /var/jb"，
+                //   于是一旦路径不存在，AI 就直接把它当成本机没越狱的**证据** ——
+                //   用户这台明明是越狱机（/var/jb、Sileo、/basebin 都在），
+                //   只因为某条路径拼错或工具没装，就被它反推成"没越狱"，整条链路绕开。
+                //   路径不存在 ≠ 没越狱。这句话必须拆成两件事：先给权威事实，再给排查方向。
+                let jb = DeviceProbe.isJailbroken()
+                let arch = ProjectGenerateTweakTool.devicePackageArch()
+                let verdict = jb
+                    ? "device.probe says THIS DEVICE IS JAILBROKEN (architecture \(arch)) — so /var/jb should exist; the path you passed is simply wrong or that tool is not installed."
+                    : "device.probe says this device is NOT jailbroken (TrollStore only, architecture \(arch)) — /var/jb does not exist here."
                 if path.hasPrefix("/bin/") || path.hasPrefix("/usr/") || path.hasPrefix("/sbin/") {
-                    throw MCPError.invalidParams("\(path) is a jailbreak-only system path — non-jailbroken (TrollStore) devices have NO /var/jb, so /bin/* and /usr/bin/* DO NOT EXIST. If you need a normal command (ls/cat/grep/ps/df/tar), use shell.exec (Alpine container has them all). If you need an iOS-side Mach-O tool, first locate the app-bundled binary with shell.exec \"find /ios_containers -name <tool>\" (try /ios_system, /ios_workspace), then pass that real path.")
+                    throw MCPError.invalidParams("\(path) is not executable on this device. \(verdict) If you need a normal command (ls/cat/grep/ps/df/tar), use shell.exec (the Alpine container has them all). If you need an iOS-side Mach-O tool, locate the real binary first (jailbroken: `ls /var/jb/usr/bin`; otherwise shell.exec \"find /ios_containers -name <tool>\"), then pass that exact path. Do NOT conclude anything about jailbreak status from this error — call device.probe for that.")
                 }
-                throw MCPError.invalidParams("path not found: \(path) — if this device is non-jailbroken (TrollStore only), /var/jb does not exist; locate the app-bundled tool first with shell.exec \"find /ios_containers -name ldid\" (try /ios_system, /ios_workspace too) and pass the real path. If jailbroken, confirm the path with shell.exec \"ls\".")
+                throw MCPError.invalidParams("path not found: \(path) — \(verdict) Confirm the path exists before passing it (jailbroken: check with shell.exec \"ls /var/jb/usr/bin\" then run the same path through system.exec_root; do not test jailbreak paths inside the Alpine container — its / is not the phone's /).")
             }
         } else {
             // 1) 文件必须存在（沙箱可见区，FileManager 视角正确）
             var isDirCB: ObjCBool = false
             guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirCB) else {
-                throw MCPError.invalidParams("path not found: \(path) — if this device is non-jailbroken (TrollStore only), /var/jb does not exist; locate the app-bundled tool first with shell.exec \"find /ios_containers -name ldid\" (try /ios_system, /ios_workspace too) and pass the real path. If jailbroken, confirm the path with shell.exec \"ls\".")
+                // 2026-11-06：同上面那处——不再用"非越狱"当默认解释。
+                let jb = DeviceProbe.isJailbroken()
+                let verdict = jb
+                    ? "device.probe says THIS DEVICE IS JAILBROKEN — the path is wrong or the tool isn't there."
+                    : "device.probe says this device is NOT jailbroken (TrollStore only)."
+                throw MCPError.invalidParams("path not found: \(path) — \(verdict) Do not infer jailbreak status from this error; call device.probe for that. If you don't know where the tool lives, search first: shell.exec \"find /ios_containers -name ldid\" (or /ios_workspace), then pass the exact path returned.")
             }
             isDir = isDirCB.boolValue
             if isDir {

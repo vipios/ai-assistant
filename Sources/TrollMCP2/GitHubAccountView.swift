@@ -294,7 +294,11 @@ struct AddGitHubAccountView: View {
     @Environment(\.presentationMode) var presentationMode
     @StateObject private var store = GitHubAccountStore.shared
     @State private var token = ""
-    @State private var errorMsg: String?
+    @State private var errorMsg: String?      // 手动 TOKEN 登录的错误
+    // 2026-11-06：网页登录的错误单独存一份。
+    //   以前两处共用 errorMsg，导致网页登录失败时同一条红字会同时出现在
+    //   「网页登录」和「手动 TOKEN」两个 Section 里 —— 看着像是两处都出错了。
+    @State private var webErrorMsg: String?
     @State private var loading = false
     // Device Flow 状态
     @State private var deviceCode: GitHubAccountStore.DeviceCode?
@@ -302,9 +306,18 @@ struct AddGitHubAccountView: View {
     @State private var safariURL: URL?
     @State private var showSafari = false
     @State private var copied = false   // 验证码已自动复制
+    // 2026-11-06：点「在浏览器中登录」后立刻翻成「正在连接」。
+    //   以前这里没有任何过渡态：请求最长 30s（timeoutInterval），失败或卡住时
+    //   界面**一动不动**，用户看到的就是「点了没反应」。实测 GitHub 端点本身正常
+    //   （本机 curl 返回 200 + device_code，1.4s），所以必须把等待和失败都显示出来。
+    @State private var isStartingDeviceFlow = false
 
     var body: some View {
-        
+        // 2026-11-06 **必须包 NavigationView**。
+        //   这个视图是用 `.sheet` 弹出来的，外部没有 NavigationStack，
+        //   于是下面 `.navigationTitle` / `.toolbar` 全是空转 —— 截图里顶部
+        //   既没有「添加账号」标题、也没有关闭按钮，就是这个原因。
+        NavigationView {
             Form {
                 webLoginSection
                 patLoginSection
@@ -312,6 +325,10 @@ struct AddGitHubAccountView: View {
             .navigationTitle(L10n.t("i18n_1129"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    // 补上关闭按钮：以前没有它，弹出来只能靠下滑手势退出。
+                    Button(L10n.t("cancel")) { presentationMode.wrappedValue.dismiss() }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     if loading {
                         ProgressView().scaleEffect(0.8)
@@ -338,6 +355,7 @@ struct AddGitHubAccountView: View {
                     }
                 }
             }
+        }
     }
 
     @ViewBuilder private var webLoginSection: some View {
@@ -350,6 +368,36 @@ struct AddGitHubAccountView: View {
                     color: .black
                 ) {
                     startDeviceFlow()
+                }
+                // 2026-11-06 **等待态**。以前这里什么都没有：点了按钮之后，
+                //   请求在后台要 1~30 秒，界面上半个像素都不动 —— 用户只能认为「没反应」。
+                if isStartingDeviceFlow {
+                    HStack(spacing: 8) {
+                        ProgressView().scaleEffect(0.8)
+                        Text("正在向 GitHub 申请设备码…").font(.caption).foregroundColor(.secondary)
+                    }
+                }
+                // 2026-11-06 **错误必须显示在这个 Section 里**。
+                //   这是「点了没反应」的真正原因：startDeviceFlow 的失败只写进 errorMsg，
+                //   而 errorMsg 以前只在下方「手动 TOKEN」那个 Section 里渲染 ——
+                //   可那个 Section 在屏幕外（截图里要往下滚才看得到），且用户根本没往下看。
+                //   → 失败信息 100% 被吞掉，界面看起来就是「点了没反应」。
+                if let err = webErrorMsg {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(err)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button {
+                            webErrorMsg = nil
+                            startDeviceFlow()
+                        } label: {
+                            Text("重试")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .buttonStyle(BorderlessButtonStyle())
+                    }
+                    .padding(.vertical, 2)
                 }
             } else if deviceStep == 1, let dc = deviceCode {
                 VStack(alignment: .leading, spacing: 8) {
@@ -432,9 +480,17 @@ struct AddGitHubAccountView: View {
     // MARK: - Device Flow
 
     private func startDeviceFlow() {
-        errorMsg = nil
+        // 2026-11-06：防连点 + 立刻给出等待反馈。
+        //   以前这里没有 guard 也没有等待态：点两下会起两条并发的轮询 timer，
+        //   其中一条先成功、另一条继续跑到 expires_in 结束才停（899 秒），
+        //   期间 isDevicePolling 一直是 true，界面卡在「等待授权」。
+        guard !isStartingDeviceFlow else { return }
+        webErrorMsg = nil
         deviceStep = 0
+        isStartingDeviceFlow = true
         store.startDeviceFlow { code, err in
+            // store 内部已切主线程回调（DispatchQueue.main.async），这里可以直接改状态
+            self.isStartingDeviceFlow = false
             if let code = code {
                 self.deviceCode = code
                 self.deviceStep = 1
@@ -452,13 +508,16 @@ struct AddGitHubAccountView: View {
                             presentationMode.wrappedValue.dismiss()
                         }
                     } else {
-                        errorMsg = msg ?? L10n.t("i18n_563")
+                        webErrorMsg = msg ?? L10n.t("i18n_563")
                         deviceStep = 0
                         showSafari = false   // 失败也自动关掉浏览器
                     }
                 }
             } else {
-                errorMsg = err ?? L10n.t("i18n_564")
+                // 2026-11-06：失败一定要有可见、可操作的出口。
+                //   文案里带上「点重试」的动作指引，因为以前失败就是一片沉默。
+                let base = err ?? L10n.t("i18n_564")
+                self.webErrorMsg = base.contains("重试") ? base : "\(base)\n点下面「重试」，或改用下方「手动 TOKEN」登录。"
             }
         }
     }
@@ -469,9 +528,21 @@ struct AddGitHubAccountView: View {
     }
 
     private func openVerification(_ uri: String) {
-        if let url = URL(string: uri) {
-            safariURL = url
-            showSafari = true
+        guard let url = URL(string: uri) else { return }
+        // 2026-11-06 **改成优先系统浏览器**。
+        //   原因：本视图本身就是用 `.sheet` 弹出来的，这里的 `showSafari` 又要在
+        //   它内部再 present 一个 SFSafariViewController（sheet 套 sheet）。
+        //   UIKit 对这种嵌套 present 的限制很多，失败时是**静默**的 ——
+        //   正是用户说的「点了没反应」，而且连一点报错都看不到。
+        //   系统 Safari 走 openURL，不受 present 链限制，一定能弹出来。
+        //   同时仍然设置 safariURL/showSafari 作兜底（万一 open 失败用户还能手动点
+        //   那一行「打开授权页」），但不再作为首选路径。
+        safariURL = url
+        UIApplication.shared.open(url, options: [:]) { ok in
+            if !ok {
+                // 系统拒绝打开（极少数配置）→ 退回内嵌 Safari。
+                DispatchQueue.main.async { self.showSafari = true }
+            }
         }
     }
 

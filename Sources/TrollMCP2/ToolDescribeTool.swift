@@ -59,7 +59,7 @@ final class ToolDescribeTool: MCPTool {
             }
         }
         guard let tool = resolved else {
-            throw MCPError.invalidParams("tool not found: \(name). Call tools.audit to see the exact tool names.")
+            throw MCPError.invalidParams(Self.notFoundMessage(for: name))
         }
 
         let d = tool.definition
@@ -163,7 +163,7 @@ final class ToolUnloadTool: MCPTool {
             }
         }
         guard let tool = resolved else {
-            throw MCPError.invalidParams("tool not found: \(name). Call tools.audit to see the exact tool names.")
+            throw MCPError.invalidParams(Self.notFoundMessage(for: name))
         }
 
         let d = tool.definition
@@ -186,5 +186,30 @@ final class ToolUnloadTool: MCPTool {
             "reload": "call tool.describe name:\"\(d.name)\" to reload it, use the settings toggle, or start a new conversation (tool state resets there)",
             "scope": "this conversation — switching conversations keeps or resets tool state per the session model; the global toggle in settings is unchanged",
         ]
+    }
+
+    // MARK: - 2026-11-06 工具名纠错（治「名字差一个后缀就整轮试错」）
+
+    /// 把「模型写的名字」映射到「真实注册的工具名」候选。
+    ///
+    /// 实测事故：模型写 `system`（真实是 `system.exec_root`）、写 `inject`（真实是 `injection.*`），
+    /// 原来只回一句 "tool not found"，模型要么去调 tools.audit 整份列表翻一遍，
+    /// 要么换着写法反复试 —— 用户看到的是连续好几张红色错误卡。
+    ///
+    /// 2026-11-06：实现已搬到 `ToolRegistry.suggestToolNames`（dispatch 也要用它，
+    ///   放两处必然分叉）。这里只做转发，保留这个入口是因为工具内部有若干调用点。
+    static func suggestToolNames(for name: String) -> [String] {
+        ToolRegistry.shared.suggestToolNames(for: name)
+    }
+
+    /// 统一的「找不到工具」错误文案。
+    private static func notFoundMessage(for name: String) -> String {
+        let candidates = suggestToolNames(for: name)
+        if candidates.isEmpty {
+            return "tool not found: \(name). Call tools.audit to see the exact tool names."
+        }
+        return "tool not found: \(name). Did you mean: \(candidates.joined(separator: " / "))? "
+            + "Use one of those EXACT names (they are really registered) — do not invent variations. "
+            + "Only if none fits, call tools.audit for the full list."
     }
 }

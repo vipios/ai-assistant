@@ -485,6 +485,51 @@ public final class ToolRegistry: ObservableObject {
         return tools.keys.sorted()
     }
 
+    // MARK: - 2026-11-06 工具名纠错（唯一实现在这里）
+    //
+    // 实测事故（用户 2026-11-06 截图）：模型写 `system`（真实注册名是 `system.exec_root`），
+    // 原来 dispatch 只抛一句 `unknown tool: system`，模型拿到这句得不到任何方向，
+    // 要么去调 `tools.audit` 把整份工具表拉一遍（一次大请求，白烧上下文），
+    // 要么换着写法反复试 —— 用户看到的就是连续好几张红色错误卡，而且"出错了它还没停止工作"。
+    //
+    // 所以纠错逻辑只写一份，放在 dispatch 所在的类里：
+    //   · `dispatch` 找不到工具时直接用它生成候选；
+    //   · `ToolDescribeTool` 转发到它（原来是两份，迟早分叉）。
+    public func suggestToolNames(for name: String) -> [String] {
+        // 把下划线和点统一，避免 shell_exec / shell.exec 因为写法差异匹配不上
+        let qNorm = name.lowercased().replacingOccurrences(of: "_", with: ".")
+        var scored: [(String, Int)] = []
+        for n in tools.keys {
+            let lnNorm = n.lowercased().replacingOccurrences(of: "_", with: ".")
+            var score = 0
+            if lnNorm == qNorm {
+                score = 100                      // 归一化后完全相等，直接最优先
+            } else if lnNorm.hasPrefix(qNorm + ".") || lnNorm.hasPrefix(qNorm + "_") {
+                score = 90                       // 前缀：system → system.exec_root
+            } else if lnNorm.hasSuffix("." + qNorm) {
+                score = 85                       // 后缀：fetch → web.fetch
+            } else if lnNorm.contains("." + qNorm + ".") {
+                score = 70                       // 中间段：net → web.net.x
+            } else if lnNorm.contains(qNorm), qNorm.count >= 3 {
+                score = 50                       // 包含
+            } else if qNorm.count >= 4 {
+                // 词干：去掉常见英文后缀后互为前缀（inject → injection）
+                let stem = qNorm
+                    .replacingOccurrences(of: "ion", with: "")
+                    .replacingOccurrences(of: "ing", with: "")
+                    .replacingOccurrences(of: "s", with: "")
+                if stem.count >= 3 && lnNorm.hasPrefix(stem) {
+                    score = 40
+                }
+            }
+            if score > 0 { scored.append((n, score)) }
+        }
+        return scored
+            .sorted { a, b in a.1 == b.1 ? a.0 < b.0 : a.1 > b.1 }
+            .prefix(5)
+            .map { $0.0 }
+    }
+
     public func tool(named name: String) -> MCPTool? {
         // v3.0.90：去掉锁——只读操作
         return tools[name]
@@ -516,6 +561,9 @@ public final class ToolRegistry: ObservableObject {
         "bind_app", "bind_app_write", "app_write_file",
         // v4.3.66：GitHub CI 工具（tool.install 触发 CI 后的查进度/取产物闭环）
         "github",
+        // 2026-11-06：deb 打包。必须默认启用——用户当前的主线任务就是
+        //   「做成 deb 插件用 Sileo 装，对原版 Siri 强化」，这个工具是那条链路的最后一步。
+        "package.deb",
 
 
         // v7.2.5-fix60：原生工具能力探测（AI 不确定时查 py3-native/node-native/jtool2 等可用性与用法；iOS 侧 bin/ 非 Alpine PATH）
@@ -1044,7 +1092,23 @@ public final class ToolRegistry: ObservableObject {
             }
         }
         // v3.0.90：去掉 lock.unlock()，因为已经去掉了 lock.lock()
-        guard let t = tool else { throw MCPError.unknownTool(name) }
+        //
+        // 2026-11-06 改：找不到工具时**必须给候选名**，不能只抛 `unknown tool: xxx`。
+        //   实测模型写 `system`（真名 `system.exec_root`）时，裸错误让它去调 tools.audit
+        //   把整份工具表拉一遍，或换着写法反复试 —— 就是用户截图里那串红色错误卡。
+        //   注意这里用 `invalidParams` 而不是 `unknownTool`：engine 会把 unknownTool
+        //   归到另一条分支，而 invalidParams 的文本会原样带给模型，候选才到得了它眼前。
+        guard let t = tool else {
+            let cands = suggestToolNames(for: name)
+            if cands.isEmpty {
+                throw MCPError.unknownTool(name)
+            }
+            throw MCPError.invalidParams(
+                "tool not found: \(name). Did you mean: \(cands.joined(separator: " / "))? "
+                    + "Use one of those EXACT names — they are really registered, do not invent variations. "
+                    + "Only if none of them fits, call tools.audit for the full list."
+            )
+        }
         // v1.0.35：授权票据剥离。
         // policy.confirm 批准后模型会把 `_confirm_token` 塞进目标工具的参数里；
         // 这里先摘掉再往下走，否则 shell.exec / app 这类工具会把它当成多余参数报错。
@@ -1678,6 +1742,11 @@ public final class ToolRegistry: ObservableObject {
         // v4.3.66：注册 github 大工具（CI 触发/查进度/下载产物）——tool.install 触发 CI 后，
         // AI 需按提示调 github.fetch_runs / github.download_artifact 取产物；此前该工具漏注册导致后续断链
         register(GitHubExecTool())
+        // 2026-11-06：deb 打包工具。**必须存在**——此前没有任何打包工具，全靠模型用
+        //   shell.exec 手写 control 再调 dpkg-deb，架构写错（写成 iphoneos-arm64 而非
+        //   真机的 iphoneos-arm64e）没人拦，包能编出来但 Sileo 拒装。
+        //   有了这个工具，Architecture 由代码从真机读，模型无从写错。
+        register(DebBuildTool())
         // v3.7.7c: 移除 ish.bind 注册——bind mount 已由 autoBind 全自动（命令引用 iOS 路径自动挂载+改写），
         // 手动 bind 工具对 AI 是误导（会以为要手动挂载）。类定义保留供开发者调试/真机验证。
         AuditLog.shared.log("core", detail: "Registered \(definitions.count) tools")

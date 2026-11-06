@@ -145,6 +145,48 @@ struct ScrollGeometryBridge: UIViewRepresentable {
         /// 上一次上报的 contentOffset.y（2026-11-05 jump-top：用于识别「布局重建导致掉回顶部」）
         private var lastOffsetY: CGFloat = 0
 
+        // 2026-11-06 **修「滑到底以后内容还在跳」**。
+        //
+        // 用户现象（两次反馈，措辞不同但同一件事）：
+        //   ·「他运行工具的时候我上下滑动，文字内容还是跳动」
+        //   ·「滑动到底以后聊天内容还是跳动」
+        //
+        // 这条不是「追不上底部」，而是**追得太勤**。完整因果链：
+        //
+        //   ① 用户拖到底松手 → decelObs 触发 → stickToBottom = isAtBottom() = true
+        //      （因为在 24pt 容差内，算"在底部"）；
+        //   ② 此时 SwiftUI 的 LazyVStack 还在补渲染末尾 cell。工具卡是动态高度的，
+        //      contentSize 在几十毫秒内会连续变好几次（估算高度→真实高度的收敛过程）；
+        //   ③ 每次 contentSize 变化 → contentSizeObs → pinToBottom()；
+        //   ④ pinToBottom 里 `guard distance > 0.5 else { return }`，但 LazyVStack 的
+        //      估算误差常常在 24~60pt 之间 —— 换算下来每次都能通过这个闸门；
+        //   ⑤ 于是 offset 被一次次 setContentOffset 硬拽到底，同时 contentSize 继续收敛，
+        //      两者互相追赶，用户看到的就是「到底了还在跳」。
+        //
+        //   关键点：用户此时**已经到底了**，他要的是"别再动"。所有 pin 都是多余的。
+        //   而现有闸门（stickToBottom / userIsScrolling / pinning）都没覆盖
+        //   「用户刚放开手、已到底、内容还在收敛」这个窗口。
+        //
+        // 修法：加一个**静默期**。用户主动滚动（拖拽/惯性）结束且已到底之后，
+        // 在 settleWindow 内不响应 contentSize 触发的 pin —— 让 LazyVStack 自己收敛完。
+        // 只在「内容又变长了、且用户确实在底部」时才重新参与，避免把新消息漏掉。
+        /// 静默期到期时刻（CFAbsoluteTime）。0 = 不在静默期。
+        private var settleUntil: CFAbsoluteTime = 0
+        /// 静默期时长。0.45s 的依据：LazyVStack 对动态高度内容的高度收敛通常在
+        /// 2~3 帧内完成（约 33~50ms），加上一次 layout pass 的余量，0.45s 足够覆盖。
+        /// 再长会让「AI 新消息到达」的跟随出现可感知的延迟。
+        private let settleWindow: CFAbsoluteTime = 0.45
+        /// 静默期内最后一次见到的 contentSize.height，用于判断「是真的变长了」还是「只是收敛」。
+        private var settledContentHeight: CGFloat = 0
+
+        /// 当前是否处于「用户刚放开手」的静默期。
+        private func inSettleWindow() -> Bool {
+            guard settleUntil > 0 else { return false }
+            if CFAbsoluteTimeGetCurrent() < settleUntil { return true }
+            settleUntil = 0
+            return false
+        }
+
         override func didMoveToWindow() {
             super.didMoveToWindow()
             if window != nil {
@@ -243,6 +285,9 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                     // 用户在拖/惯性滚 → 立即解除吸附（上滑看历史绝不被拽回），
                     // 并通知上层「这是用户操作」才允许把正文降级为轻量 Text。
                     self.stickToBottom = false
+                    // 2026-11-06：用户重新开始操作 → 静默期立刻作废。
+                    // 否则用户快速"滑到底→立刻再拖"时，新的拖动会被上一轮的静默窗拖住。
+                    self.settleUntil = 0
                     // 2026-11-05 jump-top：用户滚过的位置同样要记进 lastOffsetY。
                     // 否则它会一直停在「用户开始滚之前」的旧值，等用户滚上去、
                     // 再点 ↓ 回底时，那一跳的位移会被算成"掉回顶部"而误判。
@@ -308,6 +353,26 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                     self.scheduleOvershootFix(sv)
                     return
                 }
+                // 2026-11-06 **静默期：让 LazyVStack 先把高度收敛完，别追**。
+                //
+                // 这是「滑到底之后还在跳」的主修点。判据分两种：
+                //   · 内容高度**没变**（只是收敛过程中的抖动，或根本没变）→ 直接不动。
+                //     这类变化在用户已到底时完全没有意义，pin 一次就抖一下。
+                //   · 内容高度**真的变长了**（新消息 / 流式追加 / 工具卡展开）→ 说明有新内容
+                //     要跟随，这时候要放行，否则「AI 回完消息看不到」的旧毛病会回来。
+                // 静默期过后 settleUntil 自动清零（inSettleWindow 内部处理），一切照旧。
+                if self.inSettleWindow() {
+                    // 阈值取 2pt 而不是 8pt：宁可多放行几次，也不要漏掉「只长了一点点」的新内容。
+                    // 漏掉的表现是「AI 回了消息但停在屏幕外」，比多抖一下严重得多。
+                    // 纯收敛抖动通常表现为**高度变小或基本不变**，所以 2pt 足够区分。
+                    let grew = sv.contentSize.height > self.settledContentHeight + 2
+                    if !grew {
+                        // 只是估算→真实的收敛，不是新内容 → 不碰 offset。
+                        return
+                    }
+                    // 真变长了：提前结束静默期，正常跟随。
+                    self.settleUntil = 0
+                }
                 // 内容变高（流式追加 / 新 cell 渲染）且用户没在操作 → 钉到底，无动画。
                 self.pinToBottom(sv)
             }
@@ -341,10 +406,22 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                 // 只差个位数到几十 pt，却还要走三步 —— 视觉上就是「松开手抖两下」。
                 // 这里直接一次 setContentOffset（无动画），不会有可见的中间态。
                 if self.stickToBottom {
-                    let m = self.maxOffset(sv)
-                    if m > 0, abs(sv.contentOffset.y - m) > 0.5 {
+                    // 2026-11-06：改走 safeBottomTarget —— 用户松手时若 LazyVStack 还把
+                    //   contentSize 估大了，按 maxOffset 补这一下就会把他推进空白区。
+                    //   这正是「滑到底→松手→屏幕空了」的其中一条路径。
+                    let m = self.safeBottomTarget(sv)
+                    if abs(sv.contentOffset.y - m) > 0.5 {
                         sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: m), animated: false)
                     }
+                    // 2026-11-06 **补完这最后一下之后立刻进入静默期**。
+                    //
+                    // 为什么：上面这次 setContentOffset 会把视口钉到底，但同一时刻
+                    // LazyVStack 可能还在把「估算高度」换成「真实高度」，
+                    // contentSize 紧接着还会跳几次。每一次跳都会经 contentSizeObs
+                    // 再触发一次 pinToBottom —— 用户看到的就是「到底了还在跳」。
+                    // 记下此刻的内容高度 + 开静默窗，让这段时间里的收敛不再拽 offset。
+                    self.settledContentHeight = sv.contentSize.height
+                    self.settleUntil = CFAbsoluteTimeGetCurrent() + self.settleWindow
                 }
             }
 
@@ -429,11 +506,109 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom
         }
 
+        /// 2026-11-06 **「真实内容底边」——它比 maxOffset 小，且不会撒谎。**
+        ///
+        /// `contentSize.height` 对 LazyVStack 未渲染的部分是**估算**（通常偏大），
+        /// 而 UIKit 实际建出来的 cell 的 frame 是**实的**。目标位置若超过真实内容底边，
+        /// 落点就是一片空白 —— 这就是用户「自己变空白」的物理来源。
+        ///
+        /// 取所有真实内容子视图 frame 的最大 maxY 作为内容底边。若一个都没有
+        /// （或全在视口之外），返回 nil，表示「量不出来，别用这个约束」。
+        ///
+        /// 递归两层：SwiftUI 的 ScrollView 内容不一定直接挂在第一层，
+        /// 只看一层在部分 iOS 版本上会恒返回 nil，等于这条保护失效。
+        private func realContentBottom(_ sv: UIScrollView) -> CGFloat? {
+            var maxY: CGFloat = 0
+            var found = false
+            collectBottom(in: sv, sv: sv, depth: 0, maxY: &maxY, found: &found)
+            return found ? maxY : nil
+        }
+
+        private func collectBottom(in view: UIView, sv: UIScrollView, depth: Int,
+                                   maxY: inout CGFloat, found: inout Bool) {
+            guard depth <= 2 else { return }
+            for sub in view.subviews {
+                if sub is UIImageView && sub.bounds.width < 8 { continue }   // 跳过滚动指示器
+                guard sub.bounds.height > 1, !sub.isHidden, sub.alpha > 0.01 else { continue }
+                // 换算到 sv 的内容坐标系后取底边
+                let rect = sub.convert(sub.bounds, to: sv)
+                if rect.height > 1 {
+                    if rect.maxY > maxY { maxY = rect.maxY; found = true }
+                }
+                collectBottom(in: sub, sv: sv, depth: depth + 1, maxY: &maxY, found: &found)
+            }
+        }
+
         /// 是否已在底部（含容差）
         private func isAtBottom(_ sv: UIScrollView) -> Bool {
             let m = maxOffset(sv)
             guard m > 0 else { return true }   // 内容比视口短 = 天然在底部
             return sv.contentOffset.y >= m - stickTolerance
+        }
+
+        // MARK: - 2026-11-06 **「屏幕真的空白」检测（不信 contentSize，看真实子视图）**
+
+        /// 视口里到底有没有「真内容」。
+        ///
+        /// 为什么不能只靠 `contentSize` 判断空白 —— 这是用户这次现象的根因闭环：
+        ///
+        ///   用户原话：「我都没动屏幕他自己变空白了，我在往上滑几次才能看到对话框」。
+        ///   截图特征：整屏白、↑↓ 两个按钮同时在（= 既不在顶也不在底）、状态条显示
+        ///   「请求中（第 39 轮）」—— 说明是 AI 连续干活时程序自己把视口推到了空白区。
+        ///
+        ///   失效链（三个环节互相掩护，谁都不报错）：
+        ///     ① `LazyVStack` 对**尚未渲染**的内容一律把高度**往大了估**；
+        ///     ② `maxOffset` 按这份膨胀的 contentSize 算出一个偏大的目标；
+        ///     ③ `pinToBottom` 忠实跳到那个目标 —— 那一片一个 cell 都没有，整屏白；
+        ///     ④ `overshootSide` 拿**同一个膨胀的 contentSize** 判断"视口在不在内容里"，
+        ///        自然得出"在内容里" → 认定没越界 → **不给修正**；
+        ///     ⑤ 此后 contentOffset 不再变化，KVO 不再触发 → 空白永久留着。
+        ///   手指一动，SwiftUI 才重算可见范围把 cell 建出来 —— 正是「上滑几次才出来」。
+        ///
+        /// 所以判据必须是**与 contentSize 无关**的事实：滚动视图里那几个真实的子视图
+        /// （cell 容器）到底覆盖不覆盖当前视口。子视图是 UIKit 建的实体，不会跟着
+        /// LazyVStack 的估算膨胀 —— 没有 cell 就是没有 cell，这个不会撒谎。
+        ///
+        /// 返回 true = 视口确实被真实内容覆盖（正常）；false = 整屏或近乎整屏是空的。
+        private func viewportHasRealContent(_ sv: UIScrollView) -> Bool {
+            let visible = CGRect(origin: sv.contentOffset, size: sv.bounds.size)
+            guard visible.height > 1 else { return true }
+            // 至少要有这么多高度被真实子视图盖住，才算"有内容"。
+            // 取视口高度的 1/3：既能容忍顶部/底部留白、气泡间距，
+            // 又能在"整屏空"（覆盖 0）时准确判负。
+            let needed = visible.height / 3
+            var covered: CGFloat = 0
+            // 递归找真实内容视图 —— SwiftUI 的 ScrollView 层级不保证内容就在第一层
+            // （不同 iOS 版本里出现过内容包在中间层容器里的情况），只看一层可能永远是 0
+            // 覆盖 → 误判"空白" → 每帧都夹位置 → 反而抖。所以往下走两层，
+            // 并把每个叶子视图的 frame 换算到**滚动视图坐标**再判交集。
+            collectCoverage(in: sv, visible: visible, sv: sv, depth: 0, covered: &covered, needed: needed)
+            return covered >= needed
+        }
+
+        /// 递归累计「真实内容视图」对视口的覆盖高度（换算到 sv 坐标系）。
+        private func collectCoverage(in view: UIView, visible: CGRect, sv: UIScrollView,
+                                     depth: Int, covered: inout CGFloat, needed: CGFloat) {
+            if covered >= needed { return }
+            guard depth <= 2 else { return }
+            for sub in view.subviews {
+                if covered >= needed { return }
+                // 跳过滚动指示器（iOS 15+ 是 UIImageView/私有视图，没有真实内容高度语义）
+                if sub is UIImageView && sub.bounds.width < 8 { continue }
+                guard !sub.isHidden, sub.alpha > 0.01, sub.bounds.height > 1 else { continue }
+                // 换算到滚动视图坐标系（contentOffset 与 subviews 的 frame 同属 sv 的内容坐标系）
+                let rect = sub.convert(sub.bounds, to: sv)
+                let inter = rect.intersection(visible)
+                if !inter.isNull, inter.height > 0 {
+                    covered += inter.height
+                    if covered >= needed { return }
+                }
+                // 这一层已经盖住不少，就不必再往下探（避免重复累加父子面积）。
+                if inter.isNull || inter.height <= 0 {
+                    collectCoverage(in: sub, visible: visible, sv: sv, depth: depth + 1,
+                                    covered: &covered, needed: needed)
+                }
+            }
         }
 
         /// 视口落在内容区域的哪一侧之外（nil = 落在内容里，正常）
@@ -490,6 +665,20 @@ struct ScrollGeometryBridge: UIViewRepresentable {
         /// 那种情况是程序自己滚过头（估算落位），夹回底部是恢复正确的跟随，
         /// 用户看不到任何跳变（本来就在底部附近）。
         private func shouldFixOvershoot(_ sv: UIScrollView) -> Bool {
+            // 2026-11-06 **最高优先级：屏幕真的空了就必修**，不管 contentSize 怎么说。
+            //
+            // 这条必须在 overshootSide 之前、并且独立于它 —— 因为 overshootSide 完全
+            // 建立在 contentSize 上，而 contentSize 正是会撒谎的那个。
+            // 用户「没动屏幕自己变空白、上滑几次才出来」就是被这个假象困住的。
+            // 手指还在拖/惯性滚动时不动手（那是系统在管，插手只会打架）。
+            //
+            // ⚠️ 只在「确实有内容可回」时才启用：contentSize 为 0 或极小时
+            // （会话刚打开、消息被清空），屏幕本来就该是空的，此时夹取毫无意义，
+            // 反而会在首帧反复 setContentOffset 造成抖动。
+            if !userIsScrolling(sv), sv.contentSize.height > sv.bounds.height,
+               !viewportHasRealContent(sv) {
+                return true
+            }
             if overshootSide(sv) != nil { return true }
             guard stickToBottom, !userIsScrolling(sv) else { return false }
             let m = maxOffset(sv)
@@ -529,13 +718,15 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                     return
                 }
                 let top = -sv.adjustedContentInset.top
-                let m = self.maxOffset(sv)
+                let m = self.safeBottomTarget(sv)
                 switch side {
                 case .below:
                     // ⚠️ 内容比视口还短时 maxOffset 是负的。以前这里 `guard m > 0` 直接
                     // return —— 那正是「内容塌陷后整屏空白永不恢复」的最后一道漏洞。
                     // 这种情况正确的落点就是顶部。
-                    let dest = m > 0 ? m : top
+                    // 2026-11-06：改走 safeBottomTarget —— 它已内含 "contentSize 为负则取 top"
+                    // 的处理，且额外保证不越过真实内容底边。
+                    let dest = m
                     sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: dest), animated: false)
                     // 落到真实底部 = 语义上就是「跟随底部」，恢复吸附没有副作用。
                     self.stickToBottom = true
@@ -561,6 +752,37 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             }
         }
 
+        /// 2026-11-06 **安全落点：贴底目标绝不超过「真实内容底边」。**
+        ///
+        /// 这是切断「自己变空白」失效环的最后一步，也是最关键的一步。
+        /// 前面的 `viewportHasRealContent` 是**事后**发现空白，这个函数是**事前**不跳进空白。
+        ///
+        /// 逻辑：
+        ///   · `maxOffset` 按 contentSize 算 —— 可能偏大（LazyVStack 估算）；
+        ///   · `realContentBottom` 按真实子视图 frame 算 —— 只会偏小，不会偏大；
+        ///   · 取两者较小值作为可到达的最远位置。
+        ///
+        /// 为什么取较小值而不是"只信真实的"：真实子视图可能只建了一部分
+        /// （懒加载还没铺到底），此时真实底边会**偏小**，直接用它贴底就贴不到底。
+        /// 所以：
+        ///   · 真实底边 >= maxOffset → 说明 cell 已经建全，用 maxOffset（正常贴底）；
+        ///   · 真实底边 <  maxOffset → contentSize 里有"空气"，只能用真实底边，
+        ///     否则一定落进空白。差值就是那片没被渲染的空白高度。
+        private func safeBottomTarget(_ sv: UIScrollView) -> CGFloat {
+            let top = -sv.adjustedContentInset.top
+            let rawM = maxOffset(sv)
+            let bySize = rawM > 0 ? rawM : top
+            guard let realBottom = realContentBottom(sv) else { return bySize }
+            // 真实内容可滚到的最大值（底边贴住视口下沿）
+            let byReal = realBottom - sv.bounds.height + sv.adjustedContentInset.bottom
+            // byReal 可能因为 cell 未建全而偏小；只在它明显小于 bySize 时才收紧，
+            // 避免"刚打开会话"这种真实底边还没铺开的情况被误收紧到很上面。
+            if byReal < bySize - 1 {
+                return max(byReal, top)
+            }
+            return bySize
+        }
+
         /// 无动画钉到底部。用 setContentOffset(animated: false) 而不是 UIView.animate，
         /// 避免与用户手势、与 SwiftUI 自身布局动画互相插值 —— 那正是「跳」的来源。
         ///
@@ -584,6 +806,14 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             //   2) 用户正在操作（拖拽/惯性）→ 不动，否则手指会被系统判定为手势冲突
             //   3) 上一帧排的 pin 还没执行 → 不重复排
             guard stickToBottom, !userIsScrolling(sv) else { return }
+            // 2026-11-06 **静默期总闸**：用户刚放手、且已经到底时，任何 pin 都是多余的。
+            //
+            // 上面 contentSizeObs 里已经拦了一道，但 pin 还能从 frame / offset /
+            // 分步收尾等多个入口进来。统一在这里再拦一次，避免漏网 —— 只要在
+            // 静默期内直接返回，LazyVStack 就有完整的一个窗口把高度收敛干净。
+            // 注意：这里不判断"内容是否变长"，因为变长的情况在 contentSizeObs 里
+            // 已经提前把 settleUntil 清零了；能走到这里说明没有新内容，纯收敛抖动。
+            if inSettleWindow() { return }
             // pinning 卡死兜底：超过 1.5 秒说明那次分步流程中途被丢弃了，
             // 强制放行，否则贴底会永久失效（见 pinningStuck 的说明）。
             if pinningStuck() { pinning = false }
@@ -591,9 +821,10 @@ struct ScrollGeometryBridge: UIViewRepresentable {
             // 2026-11-05：内容比视口短时 maxOffset 是负的（甚至 contentSize 塌陷到 0），
             // 上一版 `guard m > 0 else { return }` 在这里直接放弃 —— 而「文本变短导致
             // 视口落在空白上」正是这时候发生的。目标位置此时就是顶部。
+            // 2026-11-06：目标改走 safeBottomTarget —— 绝不超过真实内容底边，
+            //   否则就会落到 LazyVStack 还没建 cell 的那片空白里（用户这次的现象）。
             let top = -sv.adjustedContentInset.top
-            let rawM = maxOffset(sv)
-            let m = rawM > 0 ? rawM : top
+            let m = safeBottomTarget(sv)
             let distance = abs(sv.contentOffset.y - m)
             guard distance > 0.5 else { return }   // 已到底，不重复设
             pinning = true
@@ -611,8 +842,9 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                         self.pinning = false
                         return
                     }
-                    let rawMM = self.maxOffset(sv)
-                    let mm = rawMM > 0 ? rawMM : -sv.adjustedContentInset.top
+                    // 2026-11-06：这一步是真正 setContentOffset 的地方，必须用安全落点。
+                    //   原来按 maxOffset（可能偏大）直接落位，就是「自己变空白」的物理动作。
+                    let mm = self.safeBottomTarget(sv)
                     if abs(sv.contentOffset.y - mm) > 0.5 {
                         sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: mm), animated: false)
                     }
@@ -640,10 +872,10 @@ struct ScrollGeometryBridge: UIViewRepresentable {
                 }
                 // 目标要重新算：这一帧里 LazyVStack 可能又建出了几个 cell，
                 // contentSize 已经变大，用上一帧的旧目标会「差一点到底」。
-                let rawM = self.maxOffset(sv)
-                // 内容比视口短（或正塌陷）时目标就是顶部 —— 不能直接 return，
-                // 否则这一帧就停在空白上再也回不来。
-                let m = rawM > 0 ? rawM : -sv.adjustedContentInset.top
+                // 2026-11-06：走 safeBottomTarget，保证每步落点都在真实内容范围内。
+                //   分步移动本来就是为了「每一步都不落进未渲染区」，如果目标本身是
+                //   按膨胀的 contentSize 算的，分几步都一样会走进空白。
+                let m = self.safeBottomTarget(sv)
                 let cur = sv.contentOffset.y
                 let dest = remaining <= 1 ? m : cur + (m - cur) / CGFloat(remaining)
                 if abs(dest - cur) > 0.5 {

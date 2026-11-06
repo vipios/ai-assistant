@@ -9,6 +9,12 @@ struct RemoteControlView: View {
     @State private var isChecking = false
     @State private var appInfo: String = ""
     @State private var keepAliveOn = UserDefaults.standard.bool(forKey: "trollagent.keepalive")
+    // 2026-11-06：把「为什么未连接」和「该干什么」显示出来。
+    //   以前这页只有一行灰字「未连接」，用户不知道这是坏了还是正常的、
+    //   也不知道下一步点哪里 —— 实际上「未连接」在**没注入过任何 App 时**
+    //   是完全正常的状态，不是故障。
+    @State private var lastHint: String = ""
+    @State private var hasChecked = false
 
     var body: some View {
         PageContainer {
@@ -70,6 +76,34 @@ struct RemoteControlView: View {
                             Text(appInfo)
                                 .font(.caption)
                                 .foregroundColor(.primary)
+                        }
+                    }
+                    // 2026-11-06：未连接时给出**原因 + 下一步**，别只留一行「未连接」让人猜。
+                    //   关键事实：这个「未连接」只在说「现在没有任何 App 跑着 ControlAgent」，
+                    //   不等于功能坏了 —— 没注入过 App 时它本来就该是未连接。
+                    if !isChecking, connectionStatus != L10n.t("status_connected") {
+                        Divider()
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(hasChecked
+                                 ? "没有任何 App 正在运行控制代理 —— 这是**正常状态**，不是坏了。"
+                                 : "还没检测。点右上「检查连接」看看有没有 App 已注入。")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("要用这个功能：① 让 AI 注入某个 App（如「给小红书注入控制代理」）→ ② 手动打开那个 App → ③ 再回来点「检查连接」，就会变「已连接」。")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("另外：不注入也能「盲点击」。sys.launch / sys.tap / sys.swipe 走系统级 HID，直接对当前前台 App 点按滑动，只是读不到界面树（拿不到按钮文字和坐标，得靠截图估位置）。")
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if !lastHint.isEmpty {
+                                Text("底层返回：\(lastHint)")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
                     }
                     Divider()
@@ -163,6 +197,14 @@ struct RemoteControlView: View {
         }
         .navigationTitle(L10n.t("page_remote"))
         .navigationBarTitleDisplayMode(.inline)
+        // 2026-11-06：进页面自动探一次。
+        //   以前从不自动检测，只有手动点「检查连接」才动 —— 于是每次进来都先看到
+        //   一个恒定的「未连接」，看着像坏了。自动探一次能立刻反映真实状态。
+        .onAppear {
+            if !hasChecked && !isChecking {
+                checkConnection()
+            }
+        }
     }
 
     private var statusColor: Color {
@@ -241,12 +283,17 @@ struct RemoteControlView: View {
             let result = ControlAgentTools.shared.status()
             DispatchQueue.main.async {
                 isChecking = false
+                hasChecked = true
                 if result["connected"] as? Bool == true {
                     connectionStatus = L10n.t("status_connected")
                     appInfo = (result["app"] as? String) ?? (result["app_name"] as? String) ?? ""
+                    lastHint = ""
                 } else {
                     connectionStatus = L10n.t("status_disconnected")
                     appInfo = ""
+                    // 2026-11-06：把底层 error 留下来展示。以前这里把它丢了，
+                    //   于是用户只能看到「未连接」三个字，完全没有线索。
+                    lastHint = (result["error"] as? String) ?? ""
                 }
             }
         }

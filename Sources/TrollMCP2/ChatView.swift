@@ -815,29 +815,25 @@ struct ChatView: View {
                                     .id(ChatListGrouping.Item.tools(msgs).id)
                             }
                         }
-                        // 2026-11-05 **关键修复（fix-freeze-1）**：把「思考中」面板抽成独立子视图。
+                        // 2026-11-06 **ThinkingPanel 已移出滚动区，改由 overlay 固定在底部**。
                         //
-                        // 原来这段直接内联在 ChatView.body 里，读的是 store.liveTrail /
-                        // store.statusText / store.requestRound —— 这三个都是 @Published，
-                        // AI 干活时每执行一步就写一次（工具开始/结束/换轮次）。
+                        // 用户现象（两次反馈）：
+                        //   ·「他运行工具的时候我上下滑动，文字内容还是跳动」
+                        //   ·「滑动到底以后聊天内容还是跳动」
                         //
-                        // 后果（用户实测：「发完我说的话就卡死了，屏幕点什么都没反应」）：
-                        // 每写一次 → ChatView.body 全量重算 → LazyVStack 里**所有**
-                        // MessageBubble 重新求值 → 每条消息的 ContentBlocks.split、
-                        // MarkdownBlocks.parse、coloredBody 正则全部重跑。
-                        // 用户那条指令粘了几千字（截图里可见），单次 parse 就要几毫秒，
-                        // 几十条消息叠加 = 主线程被占满 = 点哪都没反应。
+                        // 根因不在滚动逻辑，而在这个面板**住在 LazyVStack 里面**：
+                        //   ThinkingPanel → LiveTrailCard → ForEach(steps) → TrailRow。
+                        //   AI 每执行一步工具，liveTrail 就多一条 → 卡片多一行 →
+                        //   **contentSize 直接变高** → ScrollGeometryBridge 的 contentSizeObs 收到
+                        //   → pinToBottom → offset 被重设 → 视觉上就是内容在跳。
                         //
-                        // 抽成 ThinkingPanel 后，这些 @Published 只在**它自己**内部读，
-                        // 刷新范围收缩到这一小块，消息列表不再被牵连。
-                        if store.isLoading {
-                            ThinkingPanel()
-                        }
-                        // 2026-11-05：这里原来是「本轮结束 · 用时 X」的结束语。
-                        // 它和底部状态条的「完成 · 用时 X」是同一件事的两次播报，
-                        // 用户明确要求「一条就够，完成了就不提示了」。
-                        // 现在结束语统一由 RunStatusStrip 播（2 秒后自动消失），
-                        // 这里只保留**出错清单**——那是列表里唯一还需要的补充信息。
+                        //   而这不是"估算误差"，是**真实的、每次几十 pt 的增长**，
+                        //   一秒能来好几次（工具开始/结束/换轮次）。用户明明已经滑到底、
+                        //   甚至正在看历史，都会被这个不断长高的面板推着走。
+                        //
+                        //   治标（调容差、加静默期）治不了：内容确实在变高，pin 也是对的。
+                        //   治本只有一个办法：**让它不在滚动内容里**。挪到 ScrollView 外层
+                        //   做 overlay，它长高就往上吃空间，但不改变 contentSize，滚动区纹丝不动。
                         if turnEnded, !store.isLoading, !turnIssues.isEmpty {
                             TurnIssuesNote(issues: turnIssues)
                         }
@@ -871,6 +867,32 @@ struct ChatView: View {
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
                 .allowsHitTesting(true)
+            }
+            // 2026-11-06 **ThinkingPanel 从 LazyVStack 内部挪到这里**。
+            //
+            // 用户反馈（两次，措辞不同、同一件事）：
+            //   ·「他运行工具的时候我上下滑动，文字内容还是跳动」
+            //   ·「滑动到底以后聊天内容还是跳动」
+            //
+            // 根因：面板住在滚动内容里，而它读 store.liveTrail，
+            // LiveTrailCard 又用 ForEach(steps) 一行一个步骤渲染。
+            // AI 每跑一步工具 → liveTrail 多一条 → 卡片长高一行 →
+            // **contentSize 真实增长几十 pt** → ScrollGeometryBridge 的
+            // contentSizeObs 判为「内容变高，该跟」，于是 pinToBottom 拽一次 offset。
+            // 一秒能来好几次（工具开始/结束/换轮次），用户已经到底了还被推着跳。
+            //
+            // 注意这不是估算误差 —— 是真实增长，所以调容差、加静默期都治不了根。
+            // 唯一有效的办法就是让它**不参与滚动内容的高度计算**。
+            // 挂在 ZStack 上做 bottom overlay：长高时向上吃掉空间，但 contentSize 不变。
+            // allowsHitTesting(false) 确保不挡气泡点击和手势。
+            .overlay(alignment: .bottom) {
+                if store.isLoading {
+                    ThinkingPanel()
+                        .padding(.horizontal, 4)
+                        .padding(.bottom, 4)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
             }
             .onChange(of: store.currentMessages.count) { _ in
                 // 2026-11-05 **重写（fix-jitter-3）**——这里是「AI 回复一直上下跳动」的直接来源。

@@ -308,13 +308,23 @@ final class SystemPrompts {
     - iOS MACH-O / TWEAK BUILD on a JAILBROKEN device — read carefully, two different things:
       ① **dylib 编译**：仍必须有 iOS SDK + clang 的 Mach-O 后端（只在 macOS 上），
          本机做不到 → 走 `github.trigger_build`（build-ios-dylib.yml，kind=dylib|deb）让 CI 编。
-      ② **deb 打包**：本机可以做。CI 回来的 .deb 或用现成 .dylib 手搓包，都可以用
-         `dpkg-deb -b <stage_dir> out.deb` 在本机完成，不需要 mac。
-      ③ **架构必须写对**：`dpkg --print-architecture` 这台机器是 `iphoneos-arm64e`。
-         deb 的 control 里 Architecture 必须与此一致，否则 Sileo 直接拒装
-         （报「软件包体系结构(X)与本机系统体系结构(Y)不符」）。dylib 也要 arm64e，
-         因为 iOS 17 系统进程跑的是 arm64e。
+      ② **deb 打包**：本机可以做，而且**必须用 `package.deb` 工具**，不要手写 control 再调 dpkg-deb。
+         2026-11-06 实测事故：用户让「验证一下 deb 打包链路」，助手用 shell.exec 手搓了一个包，
+         写了 `Architecture: iphoneos-arm64`，宣布"链路跑通了"——而这台机器是 **iphoneos-arm64e**。
+         包能编出来、`dpkg-deb -I` 也读得出，但 **Sileo 直接拒装**：
+         「软件包体系结构(iphoneos-arm64)与本机系统体系结构(iphoneos-arm64e)不符」。
+         技术上跑通、实际上装不上，还让用户以为可以往下走了。
+         ⇒ `package.deb` 的 Architecture 由代码从 `dpkg --print-architecture` 读，你不需要也不该传 arch。
+            传了不匹配会**直接拒绝**并把真机值告诉你 —— 那是故意的，别绕过它手写 dpkg-deb。
+         ⇒ 包打好后它会把 Architecture 回读一遍（verified 字段），确认了再告诉用户"能装"。
+      ③ **架构事实（本机）**：`dpkg --print-architecture` = `iphoneos-arm64e`。
+         deb 的 control 里 Architecture 必须与此一致。dylib 也要 arm64e，
+         因为 iOS 17 系统进程跑的是 arm64e。arm64 的 dylib 注入系统进程会被 dyld 拒绝，
+         表现成「插件装上了但完全不生效」——比装不上更难查。
       ④ 装完 tweak 的位置：/Library/MobileSubstrate/DynamicLibraries/，同名 .plist 做 Filter。
+      ⑤ **装完必须真验证**，不能只看 dpkg 退出码：用 `device.probe` 或 system.exec_root 确认
+         dylib 真的落到了 DynamicLibraries 下、且架构是 arm64e（`file` 或 `jtool2 -h`）。
+         光说"装好了"而没看落点，等于把问题推给用户去发现。
     """
         }
         return base + """
@@ -367,6 +377,18 @@ final class SystemPrompts {
         and that is a false negative, not evidence.
       ⇒ If asked "is this device jailbroken / is X installed", call `device.probe` FIRST and quote its
         answer. Never answer that question from a shell `ls`.
+      ⇒ **DO NOT let a container error talk you into "this device is non-jailbroken".**
+        Real事故 2026-11-06：AI 想跑 `/var/jb/usr/bin/dpkg`，在**容器里**不存在 → 直接宣布
+        「本机非越狱，没有 jroot」→ 于是整条越狱链路都被它绕开了。
+        实际情况：这台机器越狱完整（/var/jb、Sileo、/basebin 都在，真机 dpkg 是 Mach-O）。
+        容器里看不到 /var/jb 是**必然的**（容器根不是手机根），它是零信息，不是反证。
+        ⇒ 越狱与否只有一个权威来源：`device.probe` 的 `jailbroken` 字段。容器报的任何
+          "No such file or directory" 都不能推翻它。要跑真机路径就用 `system.exec_root`，
+          不要因为容器里没有就改口说设备没越狱。
+      ⇒ 同理，**不要因为容器里有 dpkg 就说"用容器的 dpkg-deb 打 iOS 的包就够了"**。
+        容器 dpkg-deb 确实能打出格式正确的 .deb（这点上它是对的），但它不知道这台机器的
+        Architecture 是 iphoneos-arm64e —— 架构必须从**真机** `dpkg --print-architecture` 读。
+        打 iOS 包请用 `package.deb` 工具，它内部做这件事。
     """
         if e.jailbroken {
             var tools: [String] = []

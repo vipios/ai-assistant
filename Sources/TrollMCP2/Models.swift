@@ -1353,6 +1353,29 @@ final class ConversationStore: ObservableObject {
     /// 判据改成：**同样的调用重复出现才算卡死**。只要签名在变，就允许一直兜底下去，
     /// 不管兜了多少轮（模型本来就这脾气，兜底是我们的能力，不该被当成错误累计）。
     private var lastTextualCallSignature: String = ""
+    /// 2026-11-06 **工具连续失败熔断**。
+    ///
+    /// 用户实测（原话「现在有二个出错了，但是他还没停止工作呢」）：
+    /// 界面连出两张红色错误卡（`tool_describe` 传 `system`、`web.fetch` 超时），
+    /// AI 却继续往下跑，越跑越偏 —— 因为 `processToolCalls` 里**根本没有失败计数**，
+    /// 失败只是变成一条 error tool 消息回给模型，模型于是换个写法接着试。
+    /// 已有的 `CircuitBreaker`（failureThreshold=4）只管**网络请求**，管不到工具调用。
+    ///
+    /// 设计（刻意保守，避免重演 1.0.34 那种「活儿在正常推进却被整轮砍掉」的误停）：
+    ///   · 只在**同一个工具 + 同一份参数**上计数（签名相同才算一次「同样的失败」）；
+    ///   · 换个工具 / 换个参数 / 成功一次 → 立刻清零。正常干活不受任何影响。
+    ///   · 连续 3 次同样失败才停手，并且**明说卡在哪 + 建议下一步**，不静默停。
+    private var lastFailedToolSignature: String = ""
+    /// 同一个「工具名 + 参数」连续失败的次数（成功/换目标即清零）。
+    private var consecutiveSameToolFailures = 0
+    /// 最近一次失败的工具名 / 参数摘要 / 错误文本——熔断收尾时要用。
+    /// 单独存而不是靠传参：并行批要等所有结果合并后才统一判断。
+    private var lastFailedToolName: String = ""
+    private var lastFailedToolArgs: String = ""
+    private var lastFailedToolError: String = ""
+    /// 本轮累计失败数（不分工具）——只用来在提示词里提醒模型「你已经错很多次了」，
+    /// 不据此停手（停手只看上面的同签名连续失败）。
+    private var toolFailuresThisTurn = 0
     /// v3.1.70：活动请求绑定的会话 ID——请求由哪个会话发起就写回哪个会话。
     /// 修复"请求进行中切换会话，AI 输出错位/写错会话" (用户实测：老会话未暂停，切换新会话后输出仍乱）。
     private var activeConvId: UUID?
@@ -1743,6 +1766,13 @@ final class ConversationStore: ObservableObject {
         pendingEmptyReplyCorrection = nil
         // 2026-11-03：重置文本式工具调用自动纠正计数（新任务从零计，别被上轮计数拦住）
         textualToolCallCorrections = 0
+        // 2026-11-06：重置工具失败熔断状态（新任务从零计）
+        lastFailedToolSignature = ""
+        consecutiveSameToolFailures = 0
+        lastFailedToolName = ""
+        lastFailedToolArgs = ""
+        lastFailedToolError = ""
+        toolFailuresThisTurn = 0
         var msg = ChatMessage(role: "user", content: text)
         if let imgs = imageDataURLs, !imgs.isEmpty {
             msg.imageDataURLs = imgs
@@ -3177,6 +3207,16 @@ final class ConversationStore: ObservableObject {
         if index >= calls.count {
             // v3.4.1：工具气泡已在 handleDispatchResult 逐条实时上屏（对齐 OpenMinis 逐步展示），
             // 不再攒批到最后统一追加 —— 边做边说更接近"直播"。
+            //
+            // 2026-11-06 **熔断检查必须在这里做，不能在单条结果里 return**。
+            //   API 协议要求「assistant 的 N 条 toolCalls 必须配 N 条 tool 结果」，
+            //   在 index < calls.count 时 return 会留下半截序列 → 下一轮请求直接被拒，
+            //   用户看到的是「莫名报错/整段对话卡死」，比原来的无限重试更难查。
+            //   到这里时全部结果都已按原序回填 → 序列完整 → 停手安全。
+            if self.consecutiveSameToolFailures >= 3 {
+                self.stopForRepeatedToolFailure()
+                return
+            }
             let merged = Array(Set(disclosed + newlyDisclosed))
             self.runLoop(config: config, tools: tools, disclosed: merged, depth: depth + 1, reasoningLevel: reasoningLevel, personaPrompt: personaPrompt)
             return
@@ -3357,6 +3397,14 @@ final class ConversationStore: ObservableObject {
                         next = self.applyParallelResult(r, call: call, toolMessages: next,
                                                         toolDuration: entry?.duration ?? 0, thinkText: thinkText)
                     }
+                    // 2026-11-06 **熔断检查放在这里**，不放 applyParallelResult 里面。
+                    // 原因：并行批在 API 协议上要求「assistant 的 N 条 toolCalls 必须配 N 条
+                    // tool 结果」，中途 return 会留下半截序列，请求直接被拒。
+                    // 现在所有结果都已按原序回填 → 序列完整 → 此时停手是安全的。
+                    if self.consecutiveSameToolFailures >= 3 {
+                        self.stopForRepeatedToolFailure()
+                        return
+                    }
                     let merged = Array(Set(disclosed + newlyDisclosed))
                     self.runLoop(config: config, tools: tools, disclosed: merged, depth: depth + 1,
                                  reasoningLevel: reasoningLevel, personaPrompt: personaPrompt)
@@ -3417,6 +3465,8 @@ final class ConversationStore: ObservableObject {
             next.append(toolMsg)
             self.resolvePendingTool(callId: call.id, content: content, toolDuration: toolDuration, isError: false, narration: toolMsg.toolNarration)
             self.trailStep(.done(.result, call.name, detail: Self.trailSummary(rawContent), ok: true))
+            // 2026-11-06：并行路径也要记成功（否则一批里先失败后成功会把失败计数留住）
+            self.registerToolSuccess(call: call)
             return next
         case .failure(let err as MCPError):
             var next = toolMessages
@@ -3433,6 +3483,8 @@ final class ConversationStore: ObservableObject {
             next.append(failMsg)
             self.resolvePendingTool(callId: call.id, content: content, toolDuration: toolDuration, isError: true, narration: nil)
             self.trailStep(.done(.result, call.name, detail: Self.trailSummary(content), ok: false))
+            // 2026-11-06：登记失败（不在这里停——停机判断在本批全部结果合并后统一做）
+            _ = self.registerToolFailure(call: call, errorText: err.description)
             return next
         case .failure(let err):
             var next = toolMessages
@@ -3467,6 +3519,8 @@ final class ConversationStore: ObservableObject {
             next.append(errMsg)
             self.resolvePendingTool(callId: call.id, content: Self.jsonString(errBody), toolDuration: toolDuration, isError: true, narration: nil)
             self.trailStep(.done(.result, call.name, detail: "❌ \(err.localizedDescription.prefix(200))", ok: false))
+            // 2026-11-06：登记失败（停机判断在本批合并后统一做）
+            _ = self.registerToolFailure(call: call, errorText: err.localizedDescription)
             return next
         }
     }
@@ -3509,6 +3563,8 @@ final class ConversationStore: ObservableObject {
             self.trailStep(.done(.result, call.name,
                                  detail: Self.trailSummary(rawContent),
                                  ok: true))
+            // 2026-11-06：成功一次就说明没卡死 → 工具失败熔断状态清零
+            self.registerToolSuccess(call: call)
             var nextDisclosed = newlyDisclosed
             // v3.1.66：tool_search 已删除，全量加载所有工具，无需披露机制。
             self.processToolCalls(calls, index: index + 1, toolMessages: next, newlyDisclosed: nextDisclosed,
@@ -3536,6 +3592,9 @@ final class ConversationStore: ObservableObject {
             self.trailStep(.done(.result, call.name,
                                  detail: Self.trailSummary(Self.jsonString(failureBody)),
                                  ok: false))
+            // 2026-11-06：登记失败。**这里不停手**——停机统一在「批耗尽出口」判断，
+            // 否则会中断本批剩余调用，留下 toolCalls/结果不配对的非法序列。
+            _ = self.registerToolFailure(call: call, errorText: err.description)
             self.processToolCalls(calls, index: index + 1, toolMessages: next, newlyDisclosed: newlyDisclosed,
                                   config: config, tools: tools, disclosed: disclosed, depth: depth, reasoningLevel: reasoningLevel,
                                   thinkText: thinkText, personaPrompt: personaPrompt)
@@ -3577,10 +3636,91 @@ final class ConversationStore: ObservableObject {
             self.trailStep(.done(.result, call.name,
                                  detail: "❌ \(err.localizedDescription.prefix(200))",
                                  ok: false))
+            // 2026-11-06：同上——只登记，停机统一在「批耗尽出口」判断（保住序列配对）
+            _ = self.registerToolFailure(call: call, errorText: err.localizedDescription)
             self.processToolCalls(calls, index: index + 1, toolMessages: next, newlyDisclosed: newlyDisclosed,
                                   config: config, tools: tools, disclosed: disclosed, depth: depth, reasoningLevel: reasoningLevel,
                                   thinkText: thinkText, personaPrompt: personaPrompt)
         }
+    }
+
+    /// 2026-11-06 工具失败登记 —— 返回 true 表示「同一个动作已经连续失败到该停手」。
+    ///
+    /// 用户实测的一句话是「现在有二个出错了，但是他还没停止工作呢」：
+    /// 界面连出两张红卡，模型还在往下跑。根因是这里**根本没有失败计数**：
+    /// 失败只是变成一条 error tool 消息回模型，模型换个写法继续试，
+    /// 于是错误卡一张接一张，而整轮永远不会自己停。
+    ///
+    /// 为什么不按「本轮失败总数」停：会误伤。
+    /// 实测过的正常场景——模型先调 `device.probe` 失败、再换 `shell.exec` 失败、
+    /// 第三把用 `system.exec_root` 成功。三次「失败两次」，但活儿在推进。
+    /// 所以只认**同一个工具 + 同一份参数**的连续失败：换了目标就清零，成功更清零。
+    /// 这样「正常试错」永远够不着阈值，只有真正在原地撞墙才会触发。
+    private func registerToolFailure(call: ToolCall, errorText: String) -> Bool {
+        let sig = call.name + "|" + call.arguments
+        if sig == lastFailedToolSignature {
+            consecutiveSameToolFailures += 1
+        } else {
+            lastFailedToolSignature = sig
+            consecutiveSameToolFailures = 1
+        }
+        lastFailedToolName = call.name
+        lastFailedToolArgs = Self.summarizeArgs(call.arguments)
+        lastFailedToolError = errorText
+        toolFailuresThisTurn += 1
+        diag("TOOL-FAIL: \(call.name) same=\(consecutiveSameToolFailures) total=\(toolFailuresThisTurn) err=\(errorText.prefix(160))")
+        return consecutiveSameToolFailures >= 3
+    }
+
+    /// 工具成功 → 熔断状态清零（任何一次成功都说明它没卡死）。
+    private func registerToolSuccess(call: ToolCall) {
+        if !lastFailedToolSignature.isEmpty {
+            diag("TOOL-OK: \(call.name) → failure streak reset (was \(consecutiveSameToolFailures))")
+        }
+        lastFailedToolSignature = ""
+        consecutiveSameToolFailures = 0
+    }
+
+    /// 熔断收尾：说清「卡在哪 / 试了几次 / 为什么停 / 下一步怎么办」，然后结束本轮。
+    /// 刻意不用静默 return —— 用户 2026-11-03 就抱怨过「不知道怎么就停止了，也没有原因」。
+    ///
+    /// 用存下来的 lastFailed* 而不是传参：并行批要等所有结果合并后才统一判断
+    /// （中途 return 会留下「assistant 带了 N 条 toolCalls 却只有部分 tool 结果」的非法序列）。
+    private func stopForRepeatedToolFailure() {
+        let n = consecutiveSameToolFailures
+        let toolName = lastFailedToolName.isEmpty ? "该工具" : lastFailedToolName
+        let errorText = lastFailedToolError
+        let argsPreview = lastFailedToolArgs
+        trailStep(.done(.note, "已停止：同一动作反复失败",
+                        detail: "\(toolName) 连续 \(n) 次同样失败，参数一字未改", ok: false))
+        Self.reportStop(
+            to: self,
+            title: "AI 停下了：同一个工具反复失败",
+            body: """
+            它连续 \(n) 次调用 **\(toolName)**，参数一字未改，每次都是同样的错误，\
+            所以停在这里 —— 再试下去只会重复烧掉额度。
+
+            最后一次的错误：
+            \(errorText.trimmingCharacters(in: .whitespacesAndNewlines).prefix(400))
+
+            参数：
+            \(argsPreview.isEmpty ? "（无）" : argsPreview)
+
+            这通常意味着：
+            1. 工具名或参数写错了（工具名必须一字不差，可以问我「有哪些工具」）
+            2. 这件事本机确实做不到（比如缺某个系统权限、或目标 App 没开）
+            3. 网络/服务端问题（超时、取不到文件）
+
+            建议直接说一句「别试了，说说你卡在哪」，它会把卡点讲出来；
+            或者换个说法把要求讲得更具体一点再发一次。
+            """,
+            reason: "工具 \(toolName) 连续 \(n) 次同样失败")
+        lastFailedToolSignature = ""
+        consecutiveSameToolFailures = 0
+        lastFailedToolName = ""
+        lastFailedToolArgs = ""
+        lastFailedToolError = ""
+        activeConvId = nil
     }
 
     /// v3.5.10：工具结果回来后，原地更新"启动即上屏"的 running 步骤卡（同一张卡变完成/出错）。
