@@ -253,6 +253,26 @@ jobs:
           MINIOS: ${{ github.event.inputs.min_ios }}
         run: |
           set -uo pipefail
+          # 2026-11-06 **每一条命令都打到日志里**（set -x）。
+          #   诊断 artifact 一直是空的，说明脚本在 make 之前就挂了；
+          #   不开 trace 根本看不出挂在哪一行。日志多几十行，但换来能定位。
+          set -x
+          # 2026-11-06 **兜底：不管从哪一行退出，都先把现场存到 out/**。
+          #   之前诊断文件一直是空的（artifact 里只有 _empty.txt），
+          #   说明脚本在 cp 那几行之前就退出了。trap 覆盖所有退出路径。
+          DBG="$GITHUB_WORKSPACE/out"
+          mkdir -p "$DBG"
+          dump_diag() {
+            {
+              echo "=== pwd ==="; pwd
+              echo "=== step env ==="; env | grep -E 'THEOS|NAME=|ARCH|MINIOS' | sort
+              echo "=== theos makefiles ==="; ls -la "$THEOS/makefiles/" 2>&1 | head -30
+              echo "=== src listing ==="; ls -la "$GITHUB_WORKSPACE/src" 2>&1 | head -30
+              echo "=== mk.log (last 200) ==="; tail -200 /tmp/mk.log 2>&1
+              echo "=== mk.log errors ==="; grep -nE 'error|Error|ERROR|No such|cannot|unable' /tmp/mk.log 2>&1 | head -40
+            } > "$DBG/diag.txt" 2>&1
+          }
+          trap 'dump_diag' EXIT
           export THEOS="${THEOS:-$RUNNER_TEMP/theos}"
           # 2026-11-06 **必须显式补齐这两个变量**。
           # Theos 的 makefile 靠 THEOS_MAKE_PATH 找 tweak.mk / package.mk；
@@ -318,18 +338,20 @@ jobs:
           grep -nE 'error|Error|ERROR|No such file|cannot|unable|not found' /tmp/mk.log | head -40 || true
           echo "---- 末 30 行 ----"
           tail -30 /tmp/mk.log
+          # 2026-11-06 **无条件先把诊断落到 out/**，再判断成功失败。
+          #   上一版把 cp 写在 if 分支里，一旦 make 之前就出错（比如 /tmp 不可写、
+          #   WORKDIR 不是预期），诊断文件根本没机会生成，artifact 里只剩 _empty.txt。
+          #   现在挪到判断之前，无论怎么挂都能拿到现场。
+          mkdir -p ../out
+          cp /tmp/mk.log ../out/make-package.log 2>/dev/null || true
+          cp Makefile ../out/generated-Makefile.txt 2>/dev/null || true
+          cp control ../out/generated-control.txt 2>/dev/null || true
+          env | grep -E 'THEOS|NAME|ARCH|MINIOS|PWD' > ../out/env.txt 2>/dev/null || true
+          pwd > ../out/pwd.txt 2>/dev/null || true
+          ls -la "$THEOS/makefiles/" > ../out/theos-makefiles.txt 2>/dev/null || true
+          ls -la ../out > ../out/out-list.txt 2>/dev/null || true
           if [ "$MK" -ne 0 ]; then
-            echo "::error::Theos make package 失败（exit=$MK），上面是完整诊断"
-            # 2026-11-06 把完整构建日志塞进 out/，让它随 artifact 上传。
-            # 为什么：GitHub 的 job logs 接口在本仓库下载时被 blob 存储 403 拦截，
-            # 手机上/CI 上都拿不到正文，等于「失败但看不到原因」。
-            # 落成 artifact 就能在任何地方取回真实报错。
-            mkdir -p ../out
-            cp /tmp/mk.log ../out/make-package.log 2>/dev/null || true
-            cp Makefile ../out/generated-Makefile.txt 2>/dev/null || true
-            cp control ../out/generated-control.txt 2>/dev/null || true
-            env | grep -E 'THEOS|NAME|ARCH|MINIOS' > ../out/env.txt 2>/dev/null || true
-            ls -la "$THEOS/makefiles/" > ../out/theos-makefiles.txt 2>/dev/null || true
+            echo "::error::Theos make package 失败（exit=$MK），诊断已随 artifact 上传"
             exit 1
           fi
           mkdir -p ../out
