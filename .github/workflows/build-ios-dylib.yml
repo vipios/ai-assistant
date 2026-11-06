@@ -286,20 +286,23 @@ jobs:
           #   说明脚本在 cp 那几行之前就退出了。trap 覆盖所有退出路径。
           DBG="$GITHUB_WORKSPACE/out"
           mkdir -p "$DBG"
+          # 2026-11-06 **用状态文件记录成败，不依赖 shell 退出码**。
+          #   连续两版都是「deb 明明产出成功、artifact 也传了，step 却报 failure」。
+          #   根因是 EXIT trap 与 exit code 交互太脆：trap 里任何一条命令返回非 0，
+          #   都会覆盖掉前面的 exit 0。
+          #   现在 trap 只负责 dump，真正的成败由 BUILD_OK 文件判断，
+          #   并在脚本最后显式 exit。
+          echo building > /tmp/build.state
           dump_diag() {
             {
+              echo "=== state ==="; cat /tmp/build.state 2>&1
               echo "=== pwd ==="; pwd
               echo "=== step env ==="; env | grep -E 'THEOS|NAME=|ARCH|MINIOS' | sort
               echo "=== theos makefiles ==="; ls -la "$THEOS/makefiles/" 2>&1 | head -30
               echo "=== src listing ==="; ls -la "$GITHUB_WORKSPACE/src" 2>&1 | head -30
+              echo "=== out listing ==="; ls -la "$GITHUB_WORKSPACE/out" 2>&1 | head -30
               echo "=== mk.log (last 200) ==="; tail -200 /tmp/mk.log 2>&1
-              echo "=== mk.log errors ==="; grep -nE 'error|Error|ERROR|No such|cannot|unable' /tmp/mk.log 2>&1 | head -40
             } > "$DBG/diag.txt" 2>&1
-            # 2026-11-06 **trap 必须以 true 结尾**。
-            #   trap 函数里最后一条命令的退出码会成为整个函数（进而 EXIT trap）的退出码。
-            #   上面那条 grep 在没有匹配时返回 1 → 整个 step 被判 failure，
-            #   即使 deb 已经成功产出、artifact 也传上去了。
-            #   这就是「deb 明明做出来了，CI 却报红」的原因。
             true
           }
           trap 'dump_diag' EXIT
@@ -381,23 +384,21 @@ jobs:
           ls -la "$THEOS/makefiles/" > ../out/theos-makefiles.txt 2>/dev/null || true
           ls -la ../out > ../out/out-list.txt 2>/dev/null || true
           if [ "$MK" -ne 0 ]; then
+            echo failed > /tmp/build.state
             echo "::error::Theos make package 失败（exit=$MK），诊断已随 artifact 上传"
             exit 1
           fi
-          mkdir -p ../out
           DEB=$(find . -maxdepth 3 -name "*.deb" | head -1)
           if [ -z "$DEB" ]; then
+            echo failed > /tmp/build.state
             echo "::error::Theos 没产出 .deb（看上面的 make 输出）"
             find . -name "*.deb" -o -name ".theos" -maxdepth 2 | head -20
             exit 1
           fi
-          # 2026-11-06 **重打包这段必须全程容错**。
-          #   上一版这里让 step 变成 failure，但其实 deb 已经成功产出并上传了
-          #   （artifact 里确实有 .deb）——纯粹是 `ar t ... | head` 这类命令
-          #   在 pipefail 下返回非 0，把成功当成了失败。
-          #   结论：打包成功后，任何「附加的检查动作」都不允许影响退出码。
+          # 2026-11-06 **重打包这段全程容错**：deb 已经成功了，
+          # 任何附加检查（ar / dpkg-deb -R）都不允许把结果拉成 failure。
           set +e
-          echo "== 原始 deb 信息 =="
+          echo "== 原始 deb =="
           ls -la "$DEB"
           mkdir -p ../out/deb-tmp
           dpkg-deb -R "$DEB" ../out/deb-tmp/pkg 2>/dev/null
@@ -413,10 +414,16 @@ jobs:
           rm -rf ../out/deb-tmp
           echo "== 产物 =="
           ls -la ../out
-          set -e
-          # 到这里说明 deb 已经产出并放进 out/，明确成功退出。
-          echo "== deb 构建完成 =="
-          exit 0
+          # 确认 out/ 里真的有 deb，才记为成功
+          if ls ../out/*.deb >/dev/null 2>&1; then
+            echo ok > /tmp/build.state
+            echo "== deb 构建完成（out/ 已就绪）=="
+            exit 0
+          else
+            echo failed > /tmp/build.state
+            echo "::error::out/ 里没有 .deb"
+            exit 1
+          fi
 
       - name: Verify artifact is real Mach-O / deb
         # 2026-11-06 失败也要跑：这样诊断文件能被后面的 Upload 带出去。
