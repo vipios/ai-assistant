@@ -295,6 +295,12 @@ jobs:
               echo "=== mk.log (last 200) ==="; tail -200 /tmp/mk.log 2>&1
               echo "=== mk.log errors ==="; grep -nE 'error|Error|ERROR|No such|cannot|unable' /tmp/mk.log 2>&1 | head -40
             } > "$DBG/diag.txt" 2>&1
+            # 2026-11-06 **trap 必须以 true 结尾**。
+            #   trap 函数里最后一条命令的退出码会成为整个函数（进而 EXIT trap）的退出码。
+            #   上面那条 grep 在没有匹配时返回 1 → 整个 step 被判 failure，
+            #   即使 deb 已经成功产出、artifact 也传上去了。
+            #   这就是「deb 明明做出来了，CI 却报红」的原因。
+            true
           }
           trap 'dump_diag' EXIT
           export THEOS="${THEOS:-$RUNNER_TEMP/theos}"
