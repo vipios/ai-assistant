@@ -266,36 +266,37 @@ jobs:
           cd src
           # 若没有 Theos 工程骨架，就地生成一个最简 tweak 工程
           if [ ! -f Makefile ]; then
-            cat > Makefile <<EOF
-          # 2026-11-03：rootless 是现在越狱的主流形态（Dopamine / palera1n rootless）。
-          # 不加这一行打出来的 deb 装到 rootless 设备上会被判「不兼容」。
-          THEOS_PACKAGE_SCHEME = rootless
-          TARGET := iphone:clang:latest:${MINIOS}
-          ARCHS := ${ARCH}
-          include \$(THEOS)/makefiles/common.mk
-
-          TWEAK_NAME = ${NAME}
-          ${NAME}_FILES = \$(wildcard *.x *.xm *.m *.mm)
-          ${NAME}_FRAMEWORKS = UIKit Foundation
-          include \$(THEOS_MAKE_PATH)/tweak.mk
-          # 2026-11-06 **必须再加 package.mk，否则 `make package` 只编 dylib、根本不产 deb**。
-          # 原来这里只 include 了 tweak.mk —— 它负责把 Tweak 编成 dylib，
-          # 打包成 .deb 的规则在 package.mk 里。少这一行，make package 会「成功」结束，
-          # 接着 find 找不到 deb，报 "Theos 没产出 .deb"。
-          include \$(THEOS_MAKE_PATH)/package.mk
-          EOF
+            # 2026-11-06 **不再用 here-doc**。
+            #   YAML 的 run: | 只剥掉「所有行共有的最小缩进」，脚本内部仍有层级缩进；
+            #   here-doc 的结束符要求顶格，一旦夹在 if 里就无法正确书写，
+            #   之前 Makefile 就是这么被写坏的（make 一解析就语法错误，11 秒内挂掉）。
+            #   改成 printf 逐行追加，完全不受缩进影响。
+            {
+              echo "THEOS_PACKAGE_SCHEME = rootless"
+              echo "TARGET := iphone:clang:latest:${MINIOS}"
+              echo "ARCHS := ${ARCH}"
+              echo "include \$(THEOS)/makefiles/common.mk"
+              echo ""
+              echo "TWEAK_NAME = ${NAME}"
+              echo "${NAME}_FILES = \$(wildcard *.x *.xm *.m *.mm)"
+              echo "${NAME}_FRAMEWORKS = UIKit Foundation"
+              echo "include \$(THEOS_MAKE_PATH)/tweak.mk"
+              echo "include \$(THEOS_MAKE_PATH)/package.mk"
+            } > Makefile
           fi
+          echo "===== 生成的 Makefile ====="
+          cat Makefile
           if [ ! -f control ]; then
-            cat > control <<EOF
-          Package: com.vipios.${NAME}
-          Name: ${NAME}
-          Version: 1.0.0
-          Architecture: iphoneos-arm64
-          Description: built by CI
-          Maintainer: vipios
-          Section: Tweaks
-          Depends: mobilesubstrate
-          EOF
+            {
+              echo "Package: com.vipios.${NAME}"
+              echo "Name: ${NAME}"
+              echo "Version: 1.0.0"
+              echo "Architecture: iphoneos-arm64"
+              echo "Description: built by CI"
+              echo "Maintainer: vipios"
+              echo "Section: Tweaks"
+              echo "Depends: mobilesubstrate"
+            } > control
           fi
           # 没有 Filter plist 就补一个，tweak.mk 布局阶段需要它
           if ! ls *.plist >/dev/null 2>&1; then
