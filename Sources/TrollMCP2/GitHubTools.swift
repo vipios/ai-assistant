@@ -286,27 +286,186 @@ private extension URL {
 final class GitHubFetchRunsTool: MCPTool {
     let definition = ToolDefinition(
         name: "github.fetch_runs",
-        summary: "Query recent CI build run status and conclusion",
-        parameters: ["limit": "Max results (default 5)"], verified: true, category: "build")
+        // 2026-11-06 **summary 重写**：原来只写「查状态和结论」，模型就真的只读结论，
+        // 然后对着一个 "failure" 干瞪眼，只能靠猜。必须明说它现在能拿到失败原因。
+        summary: "Query CI build runs. Returns status/conclusion PLUS, for failed runs, the actual failing log lines (auto-fetched). Use for: find out WHY a build failed, not just that it failed. Don't use for: trigger a build (github.trigger_build) or fetch outputs (github.download_artifact). Example: build failed → call this to read the real compiler error.",
+        parameters: [
+            "limit": "Max results (default 5)",
+            "run_id": "Optional: inspect one specific run in detail (pulls its job logs)",
+            "log_lines": "How many tail lines of the failing log to return (default 80, max 400)",
+        ], verified: true, category: "build")
     func invoke(_ params: [String: Any]) throws -> [String: Any] {
         guard let token = GHConfig.activeToken else {
             throw MCPError.failed("not logged in to GitHub")
         }
         let limit = params["limit"] as? Int ?? 5
+        let logLines = min(max(params["log_lines"] as? Int ?? 80, 10), 400)
         let owner = GHConfig.repoOwner
         let repo = GHConfig.repoName
+
+        // 指定了 run_id → 直接深挖这一个 run 的日志
+        if let rid = params["run_id"] as? Int {
+            return Self.inspect(runID: rid, owner: owner, repo: repo,
+                                token: token, logLines: logLines)
+        }
+
         let (code, json, _) = GHAPI.get("\(GHConfig.apiBase)/repos/\(owner)/\(repo)/actions/runs?per_page=\(limit)&event=workflow_dispatch", token: token)
         guard code == 200, let arr = json?["workflow_runs"] as? [[String: Any]] else {
             return ["http_status": code, "error": (json?["message"] as? String) ?? "query failed"]
         }
-        return ["runs": arr.map { d -> [String: Any] in
-            [
-                "id": d["id"] as? Int ?? 0,
+
+        var runs: [[String: Any]] = []
+        for d in arr {
+            let rid = d["id"] as? Int ?? 0
+            let conclusion = d["conclusion"] as? String ?? ""
+            var entry: [String: Any] = [
+                "id": rid,
                 "status": d["status"] as? String ?? "unknown",
-                "conclusion": d["conclusion"] as? String ?? "",
+                "conclusion": conclusion,
                 "display_title": d["display_title"] as? String ?? "run",
+                "head_sha": (d["head_sha"] as? String).map { String($0.prefix(10)) } ?? "",
             ]
-        }]
+            // 2026-11-06 **失败的 run 自动带上原因**。这是整个修复的核心：
+            // 之前只返回 conclusion=failure，模型等于被蒙着眼修编译错误。
+            // 这里对最新的失败 run 自动拉日志，把 error 行直接放进返回值。
+            if conclusion == "failure" {
+                let detail = Self.failureDigest(runID: rid, owner: owner, repo: repo,
+                                                token: token, logLines: logLines)
+                if !detail.isEmpty {
+                    entry["failure_reason"] = detail
+                    entry["hint"] = "This is the REAL compiler/toolchain error. Fix the cause, not the symptom. For a full log call github.fetch_runs with run_id=\(rid) and log_lines=400."
+                }
+            }
+            runs.append(entry)
+        }
+        return ["runs": runs]
+    }
+
+    /// 拉一个 run 的 job 日志，抽出能说明问题的行。
+    static func failureDigest(runID: Int, owner: String, repo: String,
+                              token: String, logLines: Int) -> String {
+        guard let jobID = firstJobID(runID: runID, owner: owner, repo: repo, token: token) else {
+            return ""
+        }
+        guard let raw = jobLog(jobID: jobID, owner: owner, repo: repo, token: token) else {
+            return ""
+        }
+        return extractErrors(from: raw, maxLines: logLines)
+    }
+
+    static func inspect(runID: Int, owner: String, repo: String,
+                        token: String, logLines: Int) -> [String: Any] {
+        let (code, json, _) = GHAPI.get("\(GHConfig.apiBase)/repos/\(owner)/\(repo)/actions/runs/\(runID)/jobs", token: token)
+        guard code == 200, let jobs = json?["jobs"] as? [[String: Any]] else {
+            return ["run_id": runID, "http_status": code,
+                    "error": (json?["message"] as? String) ?? "cannot read jobs"]
+        }
+        var out: [[String: Any]] = []
+        for j in jobs {
+            let jid = j["id"] as? Int ?? 0
+            var job: [String: Any] = [
+                "job_id": jid,
+                "name": j["name"] as? String ?? "job",
+                "conclusion": j["conclusion"] as? String ?? "",
+                "steps": (j["steps"] as? [[String: Any]] ?? []).compactMap { s -> [String: Any]? in
+                    let c = s["conclusion"] as? String ?? ""
+                    // 只列非 success 的步骤，省的模型在 13 个绿步骤里找红的
+                    guard c != "success", !c.isEmpty else { return nil }
+                    return ["number": s["number"] as? Int ?? 0,
+                            "name": s["name"] as? String ?? "",
+                            "conclusion": c]
+                },
+            ]
+            if let raw = jobLog(jobID: jid, owner: owner, repo: repo, token: token) {
+                job["log_tail"] = extractErrors(from: raw, maxLines: logLines)
+            }
+            out.append(job)
+        }
+        return ["run_id": runID, "jobs": out]
+    }
+
+    /// 取 run 里第一个 job 的 id。
+    private static func firstJobID(runID: Int, owner: String, repo: String, token: String) -> Int? {
+        let (code, json, _) = GHAPI.get("\(GHConfig.apiBase)/repos/\(owner)/\(repo)/actions/runs/\(runID)/jobs", token: token)
+        guard code == 200, let jobs = json?["jobs"] as? [[String: Any]], let first = jobs.first else {
+            return nil
+        }
+        return first["id"] as? Int
+    }
+
+    /// 2026-11-06 **下载 job 日志必须自己处理 302**。
+    ///
+    /// GitHub 的 /actions/jobs/<id>/logs 不会直接返回文本，而是 302 跳到 Azure Blob，
+    /// 那个预签名 URL 里已经带了 SAS 签名。如果重定向时仍带着 `Authorization: Bearer <token>`，
+    /// Azure 会因为「同时出现两种认证方式」而返回：
+    ///     401 Server failed to authenticate the request
+    /// 本机实测确认过这个 401（run 42173261066）。所以在重定向回调里把 Authorization 摘掉。
+    private static func jobLog(jobID: Int, owner: String, repo: String, token: String) -> String? {
+        guard let url = URL(string: "\(GHConfig.apiBase)/repos/\(owner)/\(repo)/actions/jobs/\(jobID)/logs") else {
+            return nil
+        }
+        final class NoAuthOnRedirect: NSObject, URLSessionTaskDelegate {
+            func urlSession(_ session: URLSession, task: URLSessionTask,
+                            willPerformHTTPRedirection response: HTTPURLResponse,
+                            newRequest request: URLRequest,
+                            completionHandler: @escaping (URLRequest?) -> Void) {
+                var r = request
+                r.setValue(nil, forHTTPHeaderField: "Authorization")
+                completionHandler(r)
+            }
+        }
+        var req = URLRequest(url: url, timeoutInterval: 60)
+        setHTTPMethod("GET", on: &req)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+
+        let delegate = NoAuthOnRedirect()
+        let cfg = URLSessionConfiguration.ephemeral
+        let session = URLSession(configuration: cfg, delegate: delegate, delegateQueue: nil)
+        var data: Data?
+        var status = 0
+        let sem = DispatchSemaphore(value: 0)
+        session.dataTask(with: req) { d, resp, _ in
+            status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            data = d
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 65)
+        session.finishTasksAndInvalidate()
+
+        guard status == 200, let raw = data, !raw.isEmpty else { return nil }
+        return String(data: raw, encoding: .utf8)
+    }
+
+    /// 从完整日志里挑出「有用的行」：错误行 + 上下文。
+    private static func extractErrors(from log: String, maxLines: Int) -> String {
+        let lines = log.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        // 明显是噪音的前缀，直接跳过
+        let noise = ["##[group]", "##[endgroup]", "Cleaning up orphan processes",
+                     "Post job cleanup", "##[command]"]
+        var picked: [Int] = []
+        let patterns = ["error:", "error ", "Error:", "ERROR", "fatal", "Fatal",
+                        "cannot ", "Cannot ", "unable to", "Unable to",
+                        "No such file", "not found", "command not found",
+                        "undefined symbol", "expected identifier", "failed",
+                        "Failed", "!!", "::error::", "ld: ", "clang: "]
+        for (i, line) in lines.enumerated() {
+            if noise.contains(where: { line.contains($0) }) { continue }
+            if patterns.contains(where: { line.contains($0) }) {
+                // 带上下一行，编译器报错经常把源码位置放第二行
+                picked.append(i)
+                if i + 1 < lines.count { picked.append(i + 1) }
+            }
+        }
+        if picked.isEmpty {
+            // 没有明显错误行（比如 runner 没分配、被取消）→ 退回末尾若干行
+            let tail = lines.suffix(min(maxLines, lines.count))
+            return "no explicit error line found; tail:\n" + tail.joined(separator: "\n")
+        }
+        var seen = Set<Int>()
+        let ordered = picked.filter { seen.insert($0).inserted }.sorted()
+        let capped = ordered.suffix(maxLines)
+        return capped.map { lines[$0] }.joined(separator: "\n")
     }
 }
 
@@ -363,7 +522,7 @@ final class GitHubDownloadArtifactTool: MCPTool {
         _ = sem.wait(timeout: .now() + 65)
 
         guard status == 200, let zipData = data else {
-            return ["downloaded": false, "error": "download failed (HTTP \(status), artifact may be expired or deleted"]
+            return ["downloaded": false, "error": "download failed (HTTP \(status)), artifact may be expired or deleted"]
         }
 
         // 4. 写入工作区 downloads 并解压

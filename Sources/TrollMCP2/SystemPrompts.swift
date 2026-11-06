@@ -272,7 +272,100 @@ final class SystemPrompts {
     """
 
     /// Slimmed: one authoritative definition per rule type, others reference it; de-duplicated, de-audited, unified naming.
-    static let environmentPrompt = """
+    /// 2026-11-06 **环境提示词从 `static let` 改为按真机探测结果动态生成**。
+    ///
+    /// 原来的写法把 "non-jailbroken has NO /bin/*" 写死进常量，等于告诉每一台机器
+    /// 「你是非越狱环境」。在用户那台 Relaxin 越狱 + Sileo + ellekit 的机器上，后果是：
+    /// AI 认定了没有 /bin/*，于是全程绕道 —— 装 alpine、开 iSH、写 Python 服务，
+    /// 从来不去用现成的 dpkg/Sileo/ellekit，也从来没想过「装个 deb」这条路。
+    ///
+    /// 现在 PATH 段和 BUILD CHAIN 段由环境探测结果拼出来：
+    ///   · 越狱机  → 明确告知有 /usr/bin、dpkg、Sileo、MobileSubstrate，装东西优先走 dpkg/Sileo
+    ///   · 非越狱  → 保留原来的 auto-bind 说明
+    static var environmentPrompt: String {
+        promptTemplate
+            .replacingOccurrences(of: "%%PATH_SECTION%%", with: pathSection)
+            .replacingOccurrences(of: "%%BUILD_CHAIN_SECTION%%", with: buildChainSection)
+    }
+
+    /// 2026-11-06 **BUILD CHAIN 段同样改成按真机条件生成**。
+    ///
+    /// 原文把「Theos / clang 交叉编译 iOS Mach-O 不可用」写死，这在越狱机上是**过时的**：
+    /// 越狱机装了 dpkg，可以直接装 Theos，也能用 dpkg-deb 在本机打包；
+    /// 而「编 dylib」这一步在纯越狱机上受 SDK 限制，仍建议走 GitHub CI —— 这点保留，
+    /// 但要说清「deb 可以在本机打包」与「dylib 需要 macOS 编译」是两件不同的事，
+    /// 否则模型会以为连 deb 都得从头搭环境。
+    private static var buildChainSection: String {
+        let e = envSnapshot()
+        let base = """
+    - BUILD CHAIN (Linux/ELF 侧): gcc / g++ / make / cmake / pkgconf / autoconf / automake /
+      libtool / patch / binutils 已预装，无需 apk add。典型用法（一条 shell.exec 跑完）:
+      gcc -O2 -o /ios_workspace/a a.c && /ios_workspace/a; make -C proj -j2。
+      pip 装带 C 扩展的包可直接编译。
+    """
+        if e.jailbroken && e.hasDpkg {
+            return base + """
+    - iOS MACH-O / TWEAK BUILD on a JAILBROKEN device — read carefully, two different things:
+      ① **dylib 编译**：仍必须有 iOS SDK + clang 的 Mach-O 后端（只在 macOS 上），
+         本机做不到 → 走 `github.trigger_build`（build-ios-dylib.yml，kind=dylib|deb）让 CI 编。
+      ② **deb 打包**：本机可以做。CI 回来的 .deb 或用现成 .dylib 手搓包，都可以用
+         `dpkg-deb -b <stage_dir> out.deb` 在本机完成，不需要 mac。
+      ③ **架构必须写对**：`dpkg --print-architecture` 这台机器是 `iphoneos-arm64e`。
+         deb 的 control 里 Architecture 必须与此一致，否则 Sileo 直接拒装
+         （报「软件包体系结构(X)与本机系统体系结构(Y)不符」）。dylib 也要 arm64e，
+         因为 iOS 17 系统进程跑的是 arm64e。
+      ④ 装完 tweak 的位置：/Library/MobileSubstrate/DynamicLibraries/，同名 .plist 做 Filter。
+    """
+        }
+        return base + """
+    - iOS MACH-O / TWEAK BUILD: Theos / iOS SDK / clang 交叉编译 iOS Mach-O 需要 macOS 工具链，
+      本机做不到 —— 要产出 .ipa/.dylib 走 GitHub Actions（github.trigger_build），本机只做 Linux/ELF 侧编译。
+    """
+    }
+
+    /// 环境探测的一次性快照（避免在一次拼装里反复读盘）。
+    private static func envSnapshot() -> (jailbroken: Bool, hasDpkg: Bool, hasSileo: Bool, hasSubstrate: Bool) {
+        let fm = FileManager.default
+        let jb = !DeviceProbe.jailbreakEvidence().isEmpty
+        let dpkg = ["/usr/bin/dpkg", "/var/jb/usr/bin/dpkg", "/bin/dpkg"]
+            .contains { fm.isExecutableFile(atPath: $0) }
+        let sileo = ["/Applications/Sileo.app", "/var/jb/Applications/Sileo.app"]
+            .contains { fm.fileExists(atPath: $0) }
+        let sub = ["/Library/MobileSubstrate/DynamicLibraries",
+                   "/var/jb/Library/MobileSubstrate/DynamicLibraries"]
+            .contains { fm.fileExists(atPath: $0) }
+        return (jb, dpkg, sileo, sub)
+    }
+
+    private static var pathSection: String {
+        let e = envSnapshot()
+        if e.jailbroken {
+            var tools: [String] = []
+            if e.hasDpkg { tools.append("dpkg / dpkg-deb") }
+            if e.hasSileo { tools.append("Sileo") }
+            if e.hasSubstrate { tools.append("ElleKit(MobileSubstrate)") }
+            let toolLine = tools.isEmpty ? "dpkg" : tools.joined(separator: " / ")
+            return """
+    - PATHS: **THIS DEVICE IS JAILBROKEN** (probe: \(toolLine) detected). A real filesystem exists —
+      /usr/bin, /bin, /Library, /var/jb all work directly. Do NOT use the /ios_* auto-bind prefixes
+      and do NOT set up alpine/iSH for file access; those are fallbacks for non-jailbroken devices only.
+      Workspace→/var/mobile/Containers/Data/Application/<this app>/Documents/Workspace (already rw).
+    - INSTALLING THINGS: prefer `dpkg -i <file>.deb` or hand the .deb to Sileo. `apk add` is the LAST
+      resort — it only makes sense for Linux/ELF tooling, never for iOS tweaks.
+      Tweaks live in /Library/MobileSubstrate/DynamicLibraries/ (.dylib + same-name .plist filter).
+      Re-spring needed after installing a tweak; `killall SpringBoard` is acceptable here.
+    """
+        }
+        return """
+    - PATHS: non-jailbroken has NO /bin/* — use app-bundled paths via auto-bind:
+      Workspace→/ios_workspace(rw), /var/containers→/ios_containers(rw), /System→/ios_system(ro),
+      appdata→/ios_appdata(ro), appgroups→/ios_appgroups(ro); bind_app <id>→/ios_data_<id> (ro) /
+      bind_app_write (rw, auto-backup). /var/mobile itself NOT auto-bound; auto-bind rewrites CLI paths only —
+      in scripts use /ios_* explicitly. No notifyutil/uicache/sbreload/idevice_id/swift — don't expect them.
+    """
+    }
+
+    private static let promptTemplate = """
     === ENVIRONMENT PROMPT (system layer, always loaded, not selectable) ===
     PRIORITY (when anything conflicts): this ENVIRONMENT PROMPT > shared core rules >
     the active mode's role content > individual tool descriptions.
@@ -345,26 +438,17 @@ final class SystemPrompts {
     - ROUTE BY FILE TYPE: shell.exec runs ELF/Linux tools (Alpine: ls/cat/grep/tar/git/python3/sqlite3/curl/ps/df/apk);
       system.exec_root runs iOS-native Mach-O (jroot/app-bundled: ldid/jtool2/plutil/py3-native/node-native/optool).
       Wrong executor → ENOEXEC/rejected. Mach-O analysis: Alpine binutils/llvm-objdump or jtool2.
-    - PATHS: non-jailbroken has NO /bin/* — use app-bundled paths via auto-bind:
-      Workspace→/ios_workspace(rw), /var/containers→/ios_containers(rw), /System→/ios_system(ro),
-      appdata→/ios_appdata(ro), appgroups→/ios_appgroups(ro); bind_app <id>→/ios_data_<id> (ro) /
-      bind_app_write (rw, auto-backup). /var/mobile itself NOT auto-bound; auto-bind rewrites CLI paths only —
-      in scripts use /ios_* explicitly. No notifyutil/uicache/sbreload/idevice_id/swift — don't expect them.
+
+    %%PATH_SECTION%%
+
     - iOS-native prefixes run INSIDE shell.exec: `py3-native` (heavy numpy/pandas) / `node-native` (heavy node+npm) /
       `plutil` / `sqlite3 <db>` / `jtool2` (Mach-O parse) — exact invocation: `native.tools` (deep probe);
       ldid/optool/insert_dylib/ct_bypass are invoked internally by MCP tools — don't run them directly.
     - PROCESSES: ps sees only container — iOS-side listing: `inject list`. `ls /usr/bin` undercounts — use `command -v`.
     - TOOLS: git/wget/curl preinstalled; whitelisted commands auto-install on "command not found"; else explicit
       `apk add` (60-240s; check df -h first).
-    - BUILD CHAIN (2026-11-03 起完整内置，离线可用): gcc / g++ / make / cmake / pkgconf / autoconf / automake /
-      libtool / patch / binutils 已**预装进 rootfs**，无需 apk add 即可直接编译。
-      -dev 头文件也已预装：zlib-dev / openssl-dev / libffi-dev / readline-dev / sqlite-dev / ncurses-dev。
-      典型用法（一条 shell.exec 跑完）: gcc -O2 -o /ios_workspace/a a.c && /ios_workspace/a;
-      make -C /ios_workspace/proj -j2; cmake -S proj -B build && cmake --build build -j2。
-      pip 装带 C 扩展的包时可直接编译（不会因缺 gcc 失败）。
-      仍**不可用**: Theos / iOS SDK / clang 交叉编译 iOS Mach-O（需 macOS 工具链）——
-      要产出 .ipa/.dylib 走 GitHub Actions，本机只做 Linux/ELF 侧编译。
     - Availability check: `native.tools` (iOS side) / `command -v` (Alpine). Env limits → `skills.read "Shell & Env Boundaries"`.
+    %%BUILD_CHAIN_SECTION%%
 
     === REVERSE / BINARY ANALYSIS (authoritative) ===
     - INJECTION SAFETY (hard): modify only unencrypted Mach-O inside Frameworks/ — never the main binary (an

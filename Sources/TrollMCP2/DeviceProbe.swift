@@ -205,17 +205,48 @@ final class DeviceProbe: ObservableObject {
                 break
             }
         }
+        // 2026-11-06 **新增的沙盒内判据**：上面那批在「有沙盒」的 TrollAgent 上会全部 miss，
+        // 这正是「用户明明是 Relaxin 越狱、App 却说他没越狱」的真正原因，已在本机实测确认：
+        //   · 本机 = iOS 17.0.2 / Relaxin(RootHide) / 包管理 Sileo / 注入 ellekit；
+        //   · /var/jb 在 RootHide 下是**软链指向 /**，不是真目录；/private/preboot/jb 不存在；
+        //     RootHide 还把 .jbroot- 标记隐藏了 → 上面几条一起失效；
+        //   · 而 WebKit 需要数据容器，所以 no-sandbox 已被移除（见 Support/TrollAgent.entitlements
+        //     里 A/B 两难的注释），App 此时在沙盒里，fileExists 对部分系统路径被 EPERM；
+        //   · 结果 trollStore=true 命中、jailbroken=false → 界面显示成「TrollStore 非越狱」，
+        //     随后 AI 被环境提示词带着去装 alpine/开 iSH，完全绕开现成的 Sileo+ellekit。
+        // 兜底判据见 jailbreakEvidence()：挑的都是「只有越狱才存在的文件」，
+        // 且不依赖 /var/jb 的目录形态。
+        let jbEvidence = Self.jailbreakEvidence()
         let jailbroken = FileManager.default.fileExists(atPath: "/var/jb")
             || FileManager.default.fileExists(atPath: "/var/jb/Applications")
             || FileManager.default.fileExists(atPath: "/private/preboot/jb")
             || appsNow.contains(where: { $0.path.contains(".jbroot-") })
             || selfPath.contains(".jbroot-")
             || dyldHasJB
+            || !jbEvidence.isEmpty
+        if !jbEvidence.isEmpty {
+            AuditLog.shared.log("device.probe", detail: "jailbreak via \(jbEvidence.joined(separator: ","))")
+        }
         let envType: String
         if jailbroken { envType = L10n.t("i18n_1226") }
         else if trollStore { envType = L10n.t("i18n_1225") }
         else { envType = L10n.t("i18n_1227") }
         checks.append(Check(label: L10n.t("i18n_1224"), passed: true, detail: envType, infoOnly: true))
+
+        // 2026-11-06：把包管理器和注入框架也报出来。用户装了 Sileo 却让 AI 去 apk add，
+        // 就是因为 AI 手上没有任何「本机已有 Sileo/dpkg/ellekit」的事实。
+        if jailbroken {
+            var envBits: [String] = []
+            if jbEvidence.contains("dpkg") { envBits.append("dpkg") }
+            if jbEvidence.contains("sileo") { envBits.append("Sileo") }
+            if jbEvidence.contains("mobilesubstrate") { envBits.append("ElleKit") }
+            if !envBits.isEmpty {
+                checks.append(Check(label: L10n.t("i18n_1224") + " · 包管理",
+                                    passed: true,
+                                    detail: envBits.joined(separator: " / "),
+                                    infoOnly: true))
+            }
+        }
 
         // v2.9.156：ready 不再依赖 taskForPid——静态injected (insert_dylib+ct_bypass 重签名）
         // 与进程端口无关；TrollStore 非越狱拿不到其他进程端口是常态，不应导致"环境异常"
@@ -265,6 +296,83 @@ final class DeviceProbe: ObservableObject {
     }
 
     // MARK: 检测实现
+
+    /// 2026-11-06 **沙盒里也能用的越狱判据**（本机 iOS 17.0.2 / Relaxin RootHide 实测）。
+    ///
+    /// 为什么不能只用 /var/jb：
+    ///   · RootHide 把 /var/jb 做成**指向 /** 的软链，`/var/jb/usr` 这类子路径形态和普通
+    ///     rootless 不一样；`/private/preboot/jb` 根本不存在；.jbroot- 标记被隐藏。
+    ///   · App 为了 WebKit 子进程能用而移除了 no-sandbox，处于沙盒中，
+    ///     fileExists 对部分系统路径会 EPERM（返回 false 但文件其实在）。
+    /// 所以这里挑「只有越狱才存在、且在沙盒里 fileExists 能穿透」的落点，
+    /// 每条都同时做存在性 + 可读性确认，避免误报。
+    ///
+    /// 全部 miss 就返回空数组（= 不是越狱），不会把普通 TrollStore 机器误判成越狱。
+    static func jailbreakEvidence() -> [String] {
+        let fm = FileManager.default
+        var hits: [String] = []
+
+        // 1. dpkg —— 只有越狱 bootstrap 才会往 /usr/bin 放它；TrollStore 非越狱没有。
+        //    本机实测：/usr/bin/dpkg 存在且可执行（314688 字节）。
+        for p in ["/usr/bin/dpkg", "/var/jb/usr/bin/dpkg", "/bin/dpkg"] {
+            if fm.isExecutableFile(atPath: p) {
+                hits.append("dpkg")
+                break
+            }
+        }
+
+        // 2. Sileo / Zebra / Cydia —— 越狱才有的包管理器 App。
+        let pkgMgr = ["/Applications/Sileo.app",
+                      "/var/jb/Applications/Sileo.app",
+                      "/Applications/Zebra.app",
+                      "/Applications/Cydia.app"]
+        if pkgMgr.contains(where: { fm.fileExists(atPath: $0) }) {
+            hits.append("sileo")
+        }
+
+        // 3. 注入框架目录 —— ElleKit / libhooker / CydiaSubstrate 都住这儿。
+        //    非越狱的 TrollStore 机器不会有这个目录。
+        for d in ["/Library/MobileSubstrate/DynamicLibraries",
+                  "/var/jb/Library/MobileSubstrate/DynamicLibraries",
+                  "/usr/lib/ellekit",
+                  "/usr/lib/libhooker"] {
+            if fm.fileExists(atPath: d) {
+                hits.append("mobilesubstrate")
+                break
+            }
+        }
+
+        // 4. 越狱 bootstrap 自己的痕迹。
+        //    /.installed_relaxin 是 Relaxin 的安装标记（本机内容为 "2"）；
+        //    /.procursus_strapped 是 Procursus bootstrap 标记。
+        for f in ["/.installed_relaxin", "/.procursus_strapped", "/var/jb/.procursus_strapped"] {
+            if fm.fileExists(atPath: f) {
+                hits.append("bootstrap")
+                break
+            }
+        }
+
+        // 5. jailbreakd / basebin —— 越狱 daemon，非越狱机器没有。
+        for f in ["/basebin/jailbreakd", "/usr/libexec/jailbreakd", "/basebin/jbctl"] {
+            if fm.fileExists(atPath: f) {
+                hits.append("jailbreakd")
+                break
+            }
+        }
+
+        // 6. 沙盒自己不会读到的「越狱专属」目录。放在最后，因为沙盒可能 EPERM。
+        if hits.isEmpty, fm.fileExists(atPath: "/var/jb") {
+            // 兜底：至少 /var/jb 存在。为避免把普通 rootless 误判，这条只在无其它证据时用。
+            if let attrs = try? fm.attributesOfItem(atPath: "/var/jb"),
+               attrs[.type] as? FileAttributeType != nil {
+                hits.append("varjb")
+            }
+        }
+
+        // 去重但保序
+        var seen = Set<String>()
+        return hits.filter { seen.insert($0).inserted }
+    }
 
     private func detectTrollStore() -> Bool {
         if getenv("TROLLSTORE") != nil { return true }
